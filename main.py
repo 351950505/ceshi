@@ -7,6 +7,7 @@ import random
 import pandas as pd
 import logging
 import traceback
+import pytz  # 新增
 
 import database as db
 import notifier
@@ -23,6 +24,11 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s',
     encoding='utf-8'
 )
+
+# ------------------------
+# 时区设置
+# ------------------------
+china_tz = pytz.timezone("Asia/Shanghai")
 
 # ------------------------
 # 获取Cookie
@@ -46,10 +52,10 @@ def get_header():
 # 判断是否工作时间（中国周一~周五 9~19）
 # ------------------------
 def is_work_time():
-    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    now = datetime.datetime.now(china_tz)
     weekday = now.weekday()  # 0=周一
     hour = now.hour
-    return weekday < 5 and 9 <= hour < 16
+    return weekday < 5 and 9 <= hour < 19
 
 # ------------------------
 # 获取视频信息
@@ -148,8 +154,8 @@ def start_monitoring(header):
             seen = init_seen_comments(oid, header)
             last_video_check = time.time()
             while True:
-                now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                logging.info("当前中国时间: %s", now)
+                now = datetime.datetime.now(china_tz)
+                logging.info("当前中国时间: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
                 # 工作时间评论检测
                 if is_work_time():
                     replies = fetch_comments(oid, header)
@@ -195,4 +201,6 @@ def start_monitoring(header):
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
+    logging.info("B站监控程序已启动，后台运行中...")
+    print("B站监控程序已启动，后台运行中，请查看 bili_monitor.log")
     start_monitoring(header)
