@@ -1,4 +1,3 @@
-现在代码层面有问题了，只检测主评论，评论下面的回复没信息
 import sys
 import requests
 import time
