@@ -8,6 +8,8 @@ import pandas as pd
 import logging
 import traceback
 import pytz
+import hashlib
+import urllib.parse
 import database as db
 import notifier
 
@@ -23,6 +25,9 @@ logging.basicConfig(
 )
 
 china_tz = pytz.timezone("Asia/Shanghai")
+
+def md5(text):
+    return hashlib.md5(text.encode('utf-8')).hexdigest()
 
 def get_header():
     try:
@@ -88,21 +93,25 @@ def sync_latest_video(header):
     logging.info("开始监控视频: %s", title)
     return oid, title
 
-def fetch_comments(oid, header):
-    url = "https://api.bilibili.com/x/v2/reply/main"
-    params = {"oid": oid, "type": 1, "mode": 2}
-    try:
-        r = requests.get(url, headers=header, params=params, timeout=10)
-        data = r.json()
-        return data.get("data", {}).get("replies", []) or []
-    except:
+def fetch_latest_comments(oid, header):
+    if not oid:
         return []
-
-def fetch_sub_replies(oid, root_rpid, header):
-    url = "https://api.bilibili.com/x/v2/reply/reply"
-    params = {"oid": oid, "type": 1, "root": root_rpid, "pn": 1, "ps": 30}
+    mixin_key_salt = "ea1db124af3c7062474693fa704f4ff8"
+    params = {
+        'oid': oid,
+        'type': 1,
+        'mode': 2,
+        'plat': 1,
+        'web_location': 1315875,
+        'wts': int(time.time())
+    }
+    query = urllib.parse.urlencode(sorted(params.items()))
+    w_rid = md5(query + mixin_key_salt)
+    params['w_rid'] = w_rid
+    url = f"https://api.bilibili.com/x/v2/reply/wbi/main?{urllib.parse.urlencode(params)}"
     try:
-        r = requests.get(url, headers=header, params=params, timeout=10)
+        r = requests.get(url, headers=header, timeout=8)
+        r.raise_for_status()
         data = r.json()
         if data.get("code") == 0:
             return data.get("data", {}).get("replies", []) or []
@@ -110,17 +119,38 @@ def fetch_sub_replies(oid, root_rpid, header):
     except:
         return []
 
+def fetch_all_sub_replies(oid, root_rpid, header):
+    all_replies = []
+    pn = 1
+    while True:
+        url = f"https://api.bilibili.com/x/v2/reply/reply?oid={oid}&type=1&root={root_rpid}&pn={pn}&ps=20"
+        try:
+            r = requests.get(url, headers=header, timeout=8)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("code") != 0 or not data.get("data"):
+                break
+            replies = data["data"].get("replies", [])
+            if not replies:
+                break
+            all_replies.extend(replies)
+            pn += 1
+            time.sleep(0.8)
+        except:
+            break
+    return all_replies
+
 def start_monitoring(header):
     last_video_check = 0
     oid, title = sync_latest_video(header)
     if not oid:
-        logging.error("初始视频获取失败，程序退出")
+        logging.error("初始视频获取失败")
         sys.exit(1)
 
     seen = set()
-    replies = fetch_comments(oid, header)
-    for r in replies:
-        seen.add(r["rpid_str"])
+    main_comments = fetch_latest_comments(oid, header)
+    for c in main_comments:
+        seen.add(c["rpid_str"])
     logging.info("已加载 %d 条历史主评论", len(seen))
 
     while True:
@@ -129,43 +159,42 @@ def start_monitoring(header):
             logging.info("检查时间: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
 
             if is_work_time():
-                replies = fetch_comments(oid, header)
-                new_comments = []
-                for r in replies:
-                    rpid = r["rpid_str"]
+                main_comments = fetch_latest_comments(oid, header)
+                new_items = []
+                for c in main_comments:
+                    rpid = c["rpid_str"]
                     if rpid in seen:
                         continue
                     seen.add(rpid)
-                    comment = {
-                        "user": r["member"]["uname"],
-                        "message": r["content"]["message"],
-                        "time": pd.to_datetime(r["ctime"], unit="s"),
+                    new_items.append({
+                        "user": c["member"]["uname"],
+                        "message": c["content"]["message"],
+                        "time": pd.to_datetime(c["ctime"], unit="s"),
                         "is_reply": False,
                         "reply_to": None
-                    }
-                    new_comments.append(comment)
+                    })
 
-                    sub_replies = fetch_sub_replies(oid, rpid, header)
-                    for sub in sub_replies:
+                    # 获取所有子回复
+                    subs = fetch_all_sub_replies(oid, rpid, header)
+                    for sub in subs:
                         sub_rpid = sub["rpid_str"]
                         if sub_rpid in seen:
                             continue
                         seen.add(sub_rpid)
-                        sub_comment = {
+                        new_items.append({
                             "user": sub["member"]["uname"],
                             "message": sub["content"]["message"],
                             "time": pd.to_datetime(sub["ctime"], unit="s"),
                             "is_reply": True,
-                            "reply_to": r["member"]["uname"]
-                        }
-                        new_comments.append(sub_comment)
+                            "reply_to": c["member"]["uname"]
+                        })
 
-                if new_comments:
-                    logging.info("发现 %d 条新评论/回复 - %s", len(new_comments), title)
-                    for c in new_comments:
-                        prefix = f"回复@{c['reply_to']} " if c["is_reply"] else ""
-                        logging.info("%s%s : %s", prefix, c["user"], c["message"])
-                    notifier.send_webhook_notification(title, new_comments)
+                if new_items:
+                    logging.info("发现 %d 条新评论/回复 - %s", len(new_items), title)
+                    for item in new_items:
+                        prefix = f"回复@{item['reply_to']} " if item["is_reply"] else ""
+                        logging.info("%s%s : %s", prefix, item["user"], item["message"])
+                    notifier.send_webhook_notification(title, new_items)
 
                 time.sleep(random.uniform(20, 40))
             else:
@@ -177,9 +206,9 @@ def start_monitoring(header):
                     oid = new_oid
                     title = new_title
                     seen = set()
-                    replies = fetch_comments(oid, header)
-                    for r in replies:
-                        seen.add(r["rpid_str"])
+                    main_comments = fetch_latest_comments(oid, header)
+                    for c in main_comments:
+                        seen.add(c["rpid_str"])
                     logging.info("切换新视频，已加载历史评论")
                 last_video_check = time.time()
 
