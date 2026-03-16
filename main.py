@@ -122,22 +122,24 @@ def fetch_latest_comments(oid, header):
 def fetch_all_sub_replies(oid, root_rpid, header):
     all_replies = []
     pn = 1
-    while True:
-        url = f"https://api.bilibili.com/x/v2/reply/reply?oid={oid}&type=1&root={root_rpid}&pn={pn}&ps=20"
+    max_pages = 8
+    while pn <= max_pages:
+        url = f"https://api.bilibili.com/x/v2/reply/reply?oid={oid}&type=1&root={root_rpid}&pn={pn}&ps=15"
         try:
             r = requests.get(url, headers=header, timeout=8)
             r.raise_for_status()
             data = r.json()
-            if data.get("code") != 0 or not data.get("data"):
+            if data.get("code") != 0:
                 break
-            replies = data["data"].get("replies", [])
+            replies = data.get("data", {}).get("replies", [])
             if not replies:
                 break
             all_replies.extend(replies)
             pn += 1
-            time.sleep(0.8)
+            time.sleep(random.uniform(1.2, 2.0))
         except:
             break
+    logging.info(f"根评论 {root_rpid} 采集到 {len(all_replies)} 条子回复")
     return all_replies
 
 def start_monitoring(header):
@@ -174,7 +176,6 @@ def start_monitoring(header):
                         "reply_to": None
                     })
 
-                    # 获取所有子回复
                     subs = fetch_all_sub_replies(oid, rpid, header)
                     for sub in subs:
                         sub_rpid = sub["rpid_str"]
