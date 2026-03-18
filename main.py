@@ -1,8 +1,10 @@
 import sys
+import requests
 import time
 import datetime
 import subprocess
 import random
+import pandas as pd
 import logging
 import traceback
 import pytz
@@ -31,7 +33,11 @@ def get_header():
         subprocess.run([sys.executable, "login_bilibili.py"])
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
-    return {"Cookie": cookie, "User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com"}
+    return {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.bilibili.com"
+    }
 
 def is_work_time():
     now = datetime.datetime.now(china_tz)
@@ -44,8 +50,8 @@ def get_video_info(bv, header):
         data = r.json()
         if data["code"] == 0:
             return str(data["data"]["aid"]), data["data"]["title"]
-    except:
-        pass
+    except Exception as e:
+        logging.error("获取视频信息失败: %s", e)
     return None, None
 
 def get_latest_video(header):
@@ -54,10 +60,12 @@ def get_latest_video(header):
     try:
         r = requests.get(url, headers=header, params=params, timeout=10)
         data = r.json()
-        if data["code"] != 0: return None
-        for item in data.get("data", {}).get("items", []):
+        if data["code"] != 0:
+            return None
+        items = data["data"]["items"]
+        for item in items:
             try:
-                if item.get("type") == "DYNAMIC_TYPE_AV":
+                if item["type"] == "DYNAMIC_TYPE_AV":
                     return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
             except:
                 continue
@@ -66,12 +74,14 @@ def get_latest_video(header):
 
 def sync_latest_video(header):
     bv = get_latest_video(header)
-    if not bv: return None, None
+    if not bv:
+        return None, None
     videos = db.get_monitored_videos()
     if videos and videos[0][1] == bv:
         return videos[0][0], videos[0][2]
     oid, title = get_video_info(bv, header)
-    if not oid: return None, None
+    if not oid:
+        return None, None
     db.clear_videos()
     db.add_video_to_db(oid, bv, title)
     logging.info("开始监控视频: %s", title)
@@ -90,71 +100,94 @@ def fetch_comments(oid, header):
 def fetch_sub_replies(oid, root_rpid, header):
     all_replies = []
     pn = 1
-    while pn <= 5:
+    while True:
         params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
         try:
             r = requests.get("https://api.bilibili.com/x/v2/reply/reply", headers=header, params=params, timeout=8)
             data = r.json()
             if data.get("code") != 0 or not data.get("data", {}).get("replies"):
                 break
-            all_replies.extend(data["data"]["replies"])
+            replies = data["data"]["replies"]
+            all_replies.extend(replies)
             pn += 1
-            time.sleep(random.uniform(1.2, 2.0))
+            time.sleep(random.uniform(1, 2))
         except:
             break
     return all_replies
 
 def start_monitoring(header):
-    last_check = time.time()
+    last_video_check = time.time()
     oid, title = sync_latest_video(header)
     if not oid:
-        logging.error("初始视频获取失败，程序退出")
+        logging.error("初始视频获取失败")
         sys.exit(1)
 
-    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
-    logging.info("程序启动成功，开始监控: %s", title)
+    seen = set()
+    for r in fetch_comments(oid, header):
+        seen.add(r["rpid_str"])
+    logging.info("已加载历史主评论")
 
     while True:
         try:
+            now = datetime.datetime.now(china_tz)
+            logging.info("检查时间: %s", now.strftime("%Y-%m-%d %H:%M:%S"))
+
             if is_work_time():
                 replies = fetch_comments(oid, header)
-                new_list = []
+                new_comments = []
                 for r in replies:
                     rpid = r["rpid_str"]
-                    if rpid in seen: continue
+                    if rpid in seen:
+                        continue
                     seen.add(rpid)
-                    new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "is_reply": False})
+                    comment = {
+                        "user": r["member"]["uname"],
+                        "message": r["content"]["message"],
+                        "time": pd.to_datetime(r["ctime"], unit="s"),
+                        "is_reply": False,
+                        "reply_to": None
+                    }
+                    new_comments.append(comment)
 
-                    for sub in fetch_sub_replies(oid, rpid, header):
-                        srpid = sub["rpid_str"]
-                        if srpid in seen: continue
-                        seen.add(srpid)
-                        new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r["member"]["uname"]})
+                    subs = fetch_sub_replies(oid, rpid, header)
+                    for sub in subs:
+                        sub_rpid = sub["rpid_str"]
+                        if sub_rpid in seen:
+                            continue
+                        seen.add(sub_rpid)
+                        new_comments.append({
+                            "user": sub["member"]["uname"],
+                            "message": sub["content"]["message"],
+                            "time": pd.to_datetime(sub["ctime"], unit="s"),
+                            "is_reply": True,
+                            "reply_to": r["member"]["uname"]
+                        })
 
-                if new_list:
-                    logging.info("发现 %d 条新评论/回复", len(new_list))
-                    for item in new_list:
-                        prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
-                        logging.info("%s%s : %s", prefix, item["user"], item["message"])
-                    try:
-                        notifier.send_webhook_notification(title, new_list)
-                    except:
-                        pass
-                time.sleep(random.uniform(25, 45))
+                if new_comments:
+                    logging.info("发现 %d 条新评论/回复 - %s", len(new_comments), title)
+                    for c in new_comments:
+                        prefix = f"回复@{c['reply_to']} " if c["is_reply"] else ""
+                        logging.info("%s%s : %s", prefix, c["user"], c["message"])
+                    notifier.send_webhook_notification(title, new_comments)
+
+                time.sleep(random.uniform(20, 40))
             else:
                 time.sleep(3600)
 
-            if time.time() - last_check > VIDEO_CHECK_INTERVAL:
+            if time.time() - last_video_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
-                    oid, title = new_oid, new_title
-                    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
-                    logging.info("切换新视频")
-                last_check = time.time()
+                    oid = new_oid
+                    title = new_title
+                    seen = set()
+                    for r in fetch_comments(oid, header):
+                        seen.add(r["rpid_str"])
+                    logging.info("切换新视频，已加载历史评论")
+                last_video_check = time.time()
 
         except Exception as e:
-            logging.error("程序异常: %s", traceback.format_exc())
-            time.sleep(60)
+            logging.error("异常: %s", traceback.format_exc())
+            time.sleep(30)
 
 if __name__ == "__main__":
     db.init_db()
