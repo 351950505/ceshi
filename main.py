@@ -1,4 +1,3 @@
-cd /opt/bilibili-comment/ceshi && cat > main.py << 'FIX'
 import sys
 import time
 import datetime
@@ -12,7 +11,6 @@ import notifier
 
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -92,7 +90,7 @@ def fetch_comments(oid, header):
 def fetch_sub_replies(oid, root_rpid, header):
     all_replies = []
     pn = 1
-    while pn <= 6:
+    while pn <= 5:
         params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
         try:
             r = requests.get("https://api.bilibili.com/x/v2/reply/reply", headers=header, params=params, timeout=8)
@@ -106,18 +104,10 @@ def fetch_sub_replies(oid, root_rpid, header):
             break
     return all_replies
 
-def send_exception_notification(error_msg):
-    try:
-        notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": f"监控程序发生异常:\n{error_msg[:500]}"}])
-    except:
-        pass
-
 def start_monitoring(header):
     last_check = time.time()
-    last_heartbeat = time.time()
     oid, title = sync_latest_video(header)
     if not oid:
-        send_exception_notification("初始视频获取失败")
         logging.error("初始视频获取失败，程序退出")
         sys.exit(1)
 
@@ -126,14 +116,6 @@ def start_monitoring(header):
 
     while True:
         try:
-            current_time = time.time()
-
-            if is_work_time() and current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
-                now_str = datetime.datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
-                notifier.send_webhook_notification("监控心跳", [{"user": "系统", "message": f"程序运行正常\n时间: {now_str}\n监控视频: {title}"}])
-                last_heartbeat = current_time
-                logging.info("已发送10分钟心跳")
-
             if is_work_time():
                 replies = fetch_comments(oid, header)
                 new_list = []
@@ -147,14 +129,22 @@ def start_monitoring(header):
                         srpid = sub["rpid_str"]
                         if srpid in seen: continue
                         seen.add(srpid)
-                        new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r["member"]["uname"]})
+                        new_list.append({
+                            "user": sub["member"]["uname"],
+                            "message": sub["content"]["message"],
+                            "is_reply": True,
+                            "reply_to": r["member"]["uname"]
+                        })
 
                 if new_list:
                     logging.info("发现 %d 条新评论/回复", len(new_list))
                     for item in new_list:
-                        prefix = f"回复@{item.get('reply_to','')} " if item["is_reply"] else ""
+                        prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
                         logging.info("%s%s : %s", prefix, item["user"], item["message"])
-                    notifier.send_webhook_notification(title, new_list)
+                    try:
+                        notifier.send_webhook_notification(title, new_list)
+                    except:
+                        pass
 
                 time.sleep(random.uniform(25, 45))
             else:
@@ -169,18 +159,11 @@ def start_monitoring(header):
                 last_check = time.time()
 
         except Exception as e:
-            err = traceback.format_exc()
-            logging.error("程序异常: %s", err)
-            send_exception_notification(err)
+            logging.error("程序异常: %s", traceback.format_exc())
             time.sleep(60)
 
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
-    logging.info("B站监控程序启动（10分钟心跳 + 异常提醒）")
+    logging.info("B站监控程序启动")
     start_monitoring(header)
-FIX
-
-pkill -f main.py 2>/dev/null
-nohup python3 main.py >> bili_monitor.log 2>&1 &
-tail -f bili_monitor.log
