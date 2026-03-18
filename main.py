@@ -13,7 +13,7 @@ import notifier
 
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600  # 10分钟心跳
+HEARTBEAT_INTERVAL = 600
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -129,7 +129,6 @@ def start_monitoring(header):
         try:
             current_time = time.time()
 
-            # 独立心跳：工作时间每10分钟发送一次
             if is_work_time() and current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
                 notifier.send_webhook_notification(
@@ -139,7 +138,6 @@ def start_monitoring(header):
                 last_heartbeat = current_time
                 logging.info("已发送10分钟心跳")
 
-            # 正常检测新评论
             if is_work_time():
                 replies = fetch_comments(oid, header)
                 new_list = []
