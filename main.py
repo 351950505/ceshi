@@ -5,12 +5,13 @@ import subprocess
 import random
 import logging
 import traceback
+import requests
 import database as db
 import notifier
 
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600        # 10分钟心跳
+HEARTBEAT_INTERVAL = 600
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -63,17 +64,22 @@ def get_latest_video(header):
         return None
 
 def sync_latest_video(header):
-    bv = get_latest_video(header)
-    if not bv: return None, None
-    videos = db.get_monitored_videos()
-    if videos and videos[0][1] == bv:
-        return videos[0][0], videos[0][2]
-    oid, title = get_video_info(bv, header)
-    if not oid: return None, None
-    db.clear_videos()
-    db.add_video_to_db(oid, bv, title)
-    logging.info("开始监控视频: %s", title)
-    return oid, title
+    for i in range(5):  # 重试5次
+        bv = get_latest_video(header)
+        if bv:
+            videos = db.get_monitored_videos()
+            if videos and videos[0][1] == bv:
+                return videos[0][0], videos[0][2]
+            oid, title = get_video_info(bv, header)
+            if oid:
+                db.clear_videos()
+                db.add_video_to_db(oid, bv, title)
+                logging.info("开始监控视频: %s", title)
+                return oid, title
+        logging.warning(f"获取最新视频失败，第 {i+1} 次重试...")
+        time.sleep(10)
+    logging.error("连续5次获取视频失败")
+    return None, None
 
 def fetch_comments(oid, header):
     url = "https://api.bilibili.com/x/v2/reply/main"
@@ -102,14 +108,9 @@ def fetch_sub_replies(oid, root_rpid, header):
             break
     return all_replies
 
-def send_heartbeat(title):
+def send_exception_notification(msg):
     try:
-        now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
-        notifier.send_webhook_notification(
-            "监控心跳",
-            [{"user": "系统", "message": f"程序运行正常\n时间: {now_str.strftime('%Y-%m-%d %H:%M:%S')}\n监控视频: {title}"}]
-        )
-        logging.info("已发送10分钟心跳")
+        notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
     except:
         pass
 
@@ -117,24 +118,33 @@ def start_monitoring(header):
     last_check = time.time()
     last_heartbeat = time.time()
     oid, title = sync_latest_video(header)
-    if not oid:
-        logging.error("初始视频获取失败，程序退出")
-        sys.exit(1)
 
-    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
-    logging.info("程序启动成功，开始监控: %s", title)
+    if not oid:
+        send_exception_notification("初始视频获取失败（已重试5次），请检查 Cookie 或 UP 主动态")
+        logging.error("初始视频获取失败（已重试5次）")
+        # 不退出，继续循环尝试
+        oid, title = None, "待获取视频"
+
+    seen = set(r["rpid_str"] for r in fetch_comments(oid, header)) if oid else set()
+    logging.info("程序启动成功，开始监控: %s", title or "待获取视频")
 
     while True:
         try:
             current = time.time()
 
-            # ==================== 10分钟心跳 ====================
+            # 10分钟心跳
             if is_work_time() and current - last_heartbeat >= HEARTBEAT_INTERVAL:
-                send_heartbeat(title)
+                now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
+                notifier.send_webhook_notification(
+                    "监控心跳",
+                    [{"user": "系统", "message": f"程序运行正常\n时间: {now_str.strftime('%Y-%m-%d %H:%M:%S')}\n监控视频: {title or '待获取'}"}]
+                )
                 last_heartbeat = current
+                logging.info("已发送10分钟心跳")
 
-            # ==================== 正常监控 ====================
-            if is_work_time():
+            # 正常监控
+            if is_work_time() and oid:
+                # ...（保持原监控逻辑不变）
                 replies = fetch_comments(oid, header)
                 new_list = []
                 for r in replies:
@@ -142,7 +152,6 @@ def start_monitoring(header):
                     if rpid in seen: continue
                     seen.add(rpid)
                     new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "is_reply": False})
-
                     for sub in fetch_sub_replies(oid, rpid, header):
                         srpid = sub["rpid_str"]
                         if srpid in seen: continue
@@ -158,11 +167,11 @@ def start_monitoring(header):
                         notifier.send_webhook_notification(title, new_list)
                     except:
                         pass
-
                 time.sleep(random.uniform(25, 45))
             else:
-                time.sleep(3600)
+                time.sleep(30)  # 非工作时间或无视频时短睡
 
+            # 每6小时尝试刷新视频
             if time.time() - last_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
@@ -174,10 +183,7 @@ def start_monitoring(header):
         except Exception as e:
             err = traceback.format_exc()
             logging.error("程序异常: %s", err)
-            try:
-                notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": f"监控程序发生异常:\n{err[:400]}"}])
-            except:
-                pass
+            send_exception_notification(f"监控程序异常: {err[:300]}")
             time.sleep(60)
 
 if __name__ == "__main__":
