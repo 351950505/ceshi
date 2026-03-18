@@ -129,12 +129,7 @@ def start_monitoring(header):
                         srpid = sub["rpid_str"]
                         if srpid in seen: continue
                         seen.add(srpid)
-                        new_list.append({
-                            "user": sub["member"]["uname"],
-                            "message": sub["content"]["message"],
-                            "is_reply": True,
-                            "reply_to": r["member"]["uname"]
-                        })
+                        new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r["member"]["uname"]})
 
                 if new_list:
                     logging.info("发现 %d 条新评论/回复", len(new_list))
@@ -145,7 +140,6 @@ def start_monitoring(header):
                         notifier.send_webhook_notification(title, new_list)
                     except:
                         pass
-
                 time.sleep(random.uniform(25, 45))
             else:
                 time.sleep(3600)
