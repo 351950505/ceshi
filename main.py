@@ -62,8 +62,7 @@ def get_latest_video(header):
         data = r.json()
         if data["code"] != 0:
             return None
-        items = data["data"]["items"]
-        for item in items:
+        for item in data["data"]["items"]:
             try:
                 if item["type"] == "DYNAMIC_TYPE_AV":
                     return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
@@ -89,7 +88,7 @@ def sync_latest_video(header):
 
 def fetch_comments(oid, header):
     url = "https://api.bilibili.com/x/v2/reply/main"
-    params = {"oid": oid, "type": 1, "mode": 2}
+    params = {"oid": oid, "type": 1, "mode": 2, "ps": 20}
     try:
         r = requests.get(url, headers=header, params=params, timeout=10)
         data = r.json()
@@ -98,22 +97,16 @@ def fetch_comments(oid, header):
         return []
 
 def fetch_sub_replies(oid, root_rpid, header):
-    all_replies = []
-    pn = 1
-    while True:
-        params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
-        try:
-            r = requests.get("https://api.bilibili.com/x/v2/reply/reply", headers=header, params=params, timeout=8)
-            data = r.json()
-            if data.get("code") != 0 or not data.get("data", {}).get("replies"):
-                break
-            replies = data["data"]["replies"]
-            all_replies.extend(replies)
-            pn += 1
-            time.sleep(random.uniform(1, 2))
-        except:
-            break
-    return all_replies
+    url = "https://api.bilibili.com/x/v2/reply/reply"
+    params = {"oid": oid, "type": 1, "root": root_rpid, "pn": 1, "ps": 20}
+    try:
+        r = requests.get(url, headers=header, params=params, timeout=8)
+        data = r.json()
+        if data.get("code") == 0:
+            return data.get("data", {}).get("replies", []) or []
+        return []
+    except:
+        return []
 
 def start_monitoring(header):
     last_video_check = time.time()
