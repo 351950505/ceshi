@@ -1,3 +1,4 @@
+cd /opt/bilibili-comment/ceshi && cat > main.py << 'FIX'
 import sys
 import time
 import datetime
@@ -127,17 +128,12 @@ def start_monitoring(header):
         try:
             current_time = time.time()
 
-            # 10分钟心跳
             if is_work_time() and current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
-                notifier.send_webhook_notification(
-                    "监控心跳", 
-                    [{"user": "系统", "message": f"程序运行正常\n时间: {now_str}\n监控视频: {title}"}]
-                )
+                notifier.send_webhook_notification("监控心跳", [{"user": "系统", "message": f"程序运行正常\n时间: {now_str}\n监控视频: {title}"}])
                 last_heartbeat = current_time
                 logging.info("已发送10分钟心跳")
 
-            # 检测新评论
             if is_work_time():
                 replies = fetch_comments(oid, header)
                 new_list = []
@@ -151,12 +147,7 @@ def start_monitoring(header):
                         srpid = sub["rpid_str"]
                         if srpid in seen: continue
                         seen.add(srpid)
-                        new_list.append({
-                            "user": sub["member"]["uname"],
-                            "message": sub["content"]["message"],
-                            "is_reply": True,
-                            "reply_to": r["member"]["uname"]
-                        })
+                        new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r["member"]["uname"]})
 
                 if new_list:
                     logging.info("发现 %d 条新评论/回复", len(new_list))
@@ -188,3 +179,8 @@ if __name__ == "__main__":
     header = get_header()
     logging.info("B站监控程序启动（10分钟心跳 + 异常提醒）")
     start_monitoring(header)
+FIX
+
+pkill -f main.py 2>/dev/null
+nohup python3 main.py >> bili_monitor.log 2>&1 &
+tail -f bili_monitor.log
