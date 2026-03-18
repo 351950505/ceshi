@@ -13,7 +13,7 @@ import notifier
 
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600  # 10分钟
+HEARTBEAT_INTERVAL = 600  # 10分钟心跳
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -165,4 +165,28 @@ def start_monitoring(header):
                     for item in new_list:
                         prefix = f"回复@{item.get('reply_to','')} " if item["is_reply"] else ""
                         logging.info("%s%s : %s", prefix, item["user"], item["message"])
-                    notifier.send_webhook_notification
+                    notifier.send_webhook_notification(title, new_list)
+
+                time.sleep(random.uniform(25, 45))
+            else:
+                time.sleep(3600)
+
+            if time.time() - last_check > VIDEO_CHECK_INTERVAL:
+                new_oid, new_title = sync_latest_video(header)
+                if new_oid and new_oid != oid:
+                    oid, title = new_oid, new_title
+                    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
+                    logging.info("切换新视频")
+                last_check = time.time()
+
+        except Exception as e:
+            err = traceback.format_exc()
+            logging.error("程序异常: %s", err)
+            send_exception_notification(err)
+            time.sleep(60)
+
+if __name__ == "__main__":
+    db.init_db()
+    header = get_header()
+    logging.info("B站监控程序启动（10分钟心跳 + 异常提醒）")
+    start_monitoring(header)
