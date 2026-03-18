@@ -1,10 +1,8 @@
 import sys
-import requests
 import time
 import datetime
 import subprocess
 import random
-import pandas as pd
 import logging
 import traceback
 import pytz
@@ -129,6 +127,7 @@ def start_monitoring(header):
         try:
             current_time = time.time()
 
+            # 10分钟心跳
             if is_work_time() and current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
                 notifier.send_webhook_notification(
@@ -138,6 +137,7 @@ def start_monitoring(header):
                 last_heartbeat = current_time
                 logging.info("已发送10分钟心跳")
 
+            # 检测新评论
             if is_work_time():
                 replies = fetch_comments(oid, header)
                 new_list = []
