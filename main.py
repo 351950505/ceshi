@@ -13,7 +13,7 @@ import notifier
 
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600  # 工作时间每10分钟发一次心跳
+HEARTBEAT_INTERVAL = 600  # 10分钟
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -127,15 +127,19 @@ def start_monitoring(header):
 
     while True:
         try:
-            now = datetime.datetime.now(china_tz)
             current_time = time.time()
 
-            # 工作时间每10分钟发送一次心跳
+            # 独立心跳：工作时间每10分钟发送一次
             if is_work_time() and current_time - last_heartbeat >= HEARTBEAT_INTERVAL:
-                notifier.send_webhook_notification("监控心跳", [{"user": "系统", "message": f"程序运行正常\n当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}\n监控视频: {title}"}])
+                now_str = datetime.datetime.now(china_tz).strftime("%Y-%m-%d %H:%M:%S")
+                notifier.send_webhook_notification(
+                    "监控心跳", 
+                    [{"user": "系统", "message": f"程序运行正常\n时间: {now_str}\n监控视频: {title}"}]
+                )
                 last_heartbeat = current_time
-                logging.info("已发送10分钟心跳到 Webhook")
+                logging.info("已发送10分钟心跳")
 
+            # 正常检测新评论
             if is_work_time():
                 replies = fetch_comments(oid, header)
                 new_list = []
@@ -161,28 +165,4 @@ def start_monitoring(header):
                     for item in new_list:
                         prefix = f"回复@{item.get('reply_to','')} " if item["is_reply"] else ""
                         logging.info("%s%s : %s", prefix, item["user"], item["message"])
-                    notifier.send_webhook_notification(title, new_list)
-
-                time.sleep(random.uniform(25, 45))
-            else:
-                time.sleep(3600)
-
-            if time.time() - last_check > VIDEO_CHECK_INTERVAL:
-                new_oid, new_title = sync_latest_video(header)
-                if new_oid and new_oid != oid:
-                    oid, title = new_oid, new_title
-                    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
-                    logging.info("切换新视频")
-                last_check = time.time()
-
-        except Exception as e:
-            err = traceback.format_exc()
-            logging.error("程序异常: %s", err)
-            send_exception_notification(err)
-            time.sleep(60)
-
-if __name__ == "__main__":
-    db.init_db()
-    header = get_header()
-    logging.info("B站监控程序启动（10分钟心跳 + 异常提醒）")
-    start_monitoring(header)
+                    notifier.send_webhook_notification
