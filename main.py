@@ -105,16 +105,16 @@ def send_exception_notification(msg):
         pass
 
 # ------------------------
-# 核心改动：基于时间戳和动态分页的新读取方法
+# 核心改动：加入 seen_rcounts (子回复数量缓存)
 # ------------------------
-def scan_new_comments(oid, header, last_read_time, seen):
+def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
     new_list =[]
     max_ctime_in_this_round = last_read_time
     
     pn = 1
-    while pn <= 10:  # 最多往下挖10页，防止遇到死循环或API限制
-        # 改用 /x/v2/reply 接口，并设定 sort=0 (严格按时间倒序：最新发布的在最前)
+    while pn <= 10:  # 最多往下挖10页
         url = "https://api.bilibili.com/x/v2/reply"
+        # sort=0 保证最新发布的永远在最前面
         params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
         
         try:
@@ -125,14 +125,14 @@ def scan_new_comments(oid, header, last_read_time, seen):
             if not replies:
                 break
                 
-            page_all_older = True  # 假设这页全都是比上次读取时间还老的数据
+            page_all_older = True  
             
             for r_obj in replies:
                 rpid = r_obj["rpid_str"]
                 r_ctime = r_obj["ctime"]
                 max_ctime_in_this_round = max(max_ctime_in_this_round, r_ctime)
                 
-                # 1. 检测主评论时间
+                # 1. 检测主评论
                 if r_ctime > last_read_time:
                     page_all_older = False
                     if rpid not in seen:
@@ -144,16 +144,20 @@ def scan_new_comments(oid, header, last_read_time, seen):
                             "ctime": r_ctime
                         })
                 
-                # 2. 检查子评论(盖楼)，连老评论底下的新回复也不放过
-                if r_obj.get("rcount", 0) > 0:
+                # 2. 终极优化：检测子评论（盖楼）
+                # 只有当 B站返回的子回复总数(rcount) > 我们记录的数量时，才去请求子接口！
+                current_rcount = r_obj.get("rcount", 0)
+                
+                if current_rcount > seen_rcounts.get(rpid, 0):
+                    page_all_older = False  # 即使主评论老了，有新子回复也要继续往后翻页看
                     sub_replies = fetch_sub_replies(oid, rpid, header)
+                    
                     for sub in sub_replies:
                         srpid = sub["rpid_str"]
                         s_ctime = sub["ctime"]
                         max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
                         
                         if s_ctime > last_read_time and srpid not in seen:
-                            page_all_older = False
                             seen.add(srpid)
                             new_list.append({
                                 "user": sub["member"]["uname"], 
@@ -163,13 +167,15 @@ def scan_new_comments(oid, header, last_read_time, seen):
                                 "ctime": s_ctime
                             })
                             
-            # 【防漏精髓】：如果这一整页的主评论和子回复都比 last_read_time 老，
-            # 说明新的消息已经被我们抓完了，没必要再请求下一页了，直接退出翻页循环。
+                    # 抓取完后，更新这条评论最新的子回复数量缓存！
+                    seen_rcounts[rpid] = current_rcount
+                            
             if page_all_older:
                 break
                 
             pn += 1
             time.sleep(random.uniform(1.0, 1.5))
+            
         except Exception as e:
             logging.error("分页获取评论异常: %s", e)
             break
@@ -187,9 +193,10 @@ def start_monitoring(header):
         logging.error("初始视频获取失败（已重试5次）")
         oid, title = None, "待获取视频"
 
-    # 初始化读取时间为当前时间戳，只会抓取程序启动之后新发布的消息
+    # 初始化时间戳、去重池、回复数缓存池
     last_read_time = int(time.time())
     seen = set()
+    seen_rcounts = {}
     
     logging.info("程序启动成功，开始时间基准线监控: %s", title or "待获取视频")
 
@@ -206,19 +213,17 @@ def start_monitoring(header):
                 last_heartbeat = current
                 logging.info("已发送10分钟心跳")
 
-            # 正常监控 (依赖时间戳过滤)
+            # 正常监控
             if is_work_time() and oid:
-                new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
+                # 传入 seen_rcounts 缓存字典
+                new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen, seen_rcounts)
                 
-                # 更新读取时间（将时间基准线推移到最新一条评论的时间）
                 if new_last_read_time > last_read_time:
                     last_read_time = new_last_read_time
 
                 if new_list:
-                    # 按照 ctime (发布时间) 从小到大排序，保证通知的消息顺序也是正确的先后顺序
                     new_list.sort(key=lambda x: x["ctime"])
-                    
-                    logging.info("发现 %d 条新评论", len(new_list))
+                    logging.info("发现 %d 条新评论/回复", len(new_list))
                     for item in new_list:
                         prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
                         logging.info("%s%s : %s", prefix, item["user"], item["message"])
@@ -227,7 +232,7 @@ def start_monitoring(header):
                     except:
                         pass
                 
-                # 【改动点】：将获取评论的休眠间隔从 25~45秒 压缩为 10~20秒
+                # 休眠 10~20 秒 (极速极静默版)
                 time.sleep(random.uniform(10, 20))
             else:
                 time.sleep(30)
@@ -237,9 +242,10 @@ def start_monitoring(header):
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
                     oid, title = new_oid, new_title
-                    # 切换视频后，清空已看集合，重置最新读取时间
+                    # 切换视频后，清空所有缓存池，重置时间线
                     last_read_time = int(time.time())
                     seen.clear()
+                    seen_rcounts.clear()
                     logging.info("切换新视频，重置时间线监控")
                 last_check = time.time()
 
@@ -252,34 +258,5 @@ def start_monitoring(header):
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
-    logging.info("B站监控程序启动（极速版：10~20秒延迟）")
+    logging.info("B站监控程序启动（终极极速防风控版：rcount 缓存 + 时间排序）")
     start_monitoring(header)
-    # 1. 在 start_monitoring 初始化时，加一个字典
-seen_rcounts = {}
-
-# 2. 修改 scan_new_comments 的传参，把 seen_rcounts 传进去
-def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
-    # ... 前面代码不变 ...
-                
-                # 优化后的楼中楼检查逻辑：
-                current_rcount = r_obj.get("rcount", 0)
-                # 只有当当前的子回复数量 > 我们记录过的子回复数量时，才去请求子接口！
-                if current_rcount > seen_rcounts.get(rpid, 0):
-                    sub_replies = fetch_sub_replies(oid, rpid, header)
-                    for sub in sub_replies:
-                        srpid = sub["rpid_str"]
-                        s_ctime = sub["ctime"]
-                        max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
-                        
-                        if s_ctime > last_read_time and srpid not in seen:
-                            page_all_older = False
-                            seen.add(srpid)
-                            new_list.append({
-                                "user": sub["member"]["uname"], 
-                                "message": sub["content"]["message"], 
-                                "is_reply": True, 
-                                "reply_to": r_obj["member"]["uname"],
-                                "ctime": s_ctime
-                            })
-                    # 更新这条评论的最新回复数缓存
-                    seen_rcounts[rpid] = current_rcount
