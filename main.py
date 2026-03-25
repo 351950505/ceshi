@@ -254,3 +254,32 @@ if __name__ == "__main__":
     header = get_header()
     logging.info("B站监控程序启动（极速版：10~20秒延迟）")
     start_monitoring(header)
+    # 1. 在 start_monitoring 初始化时，加一个字典
+seen_rcounts = {}
+
+# 2. 修改 scan_new_comments 的传参，把 seen_rcounts 传进去
+def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
+    # ... 前面代码不变 ...
+                
+                # 优化后的楼中楼检查逻辑：
+                current_rcount = r_obj.get("rcount", 0)
+                # 只有当当前的子回复数量 > 我们记录过的子回复数量时，才去请求子接口！
+                if current_rcount > seen_rcounts.get(rpid, 0):
+                    sub_replies = fetch_sub_replies(oid, rpid, header)
+                    for sub in sub_replies:
+                        srpid = sub["rpid_str"]
+                        s_ctime = sub["ctime"]
+                        max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
+                        
+                        if s_ctime > last_read_time and srpid not in seen:
+                            page_all_older = False
+                            seen.add(srpid)
+                            new_list.append({
+                                "user": sub["member"]["uname"], 
+                                "message": sub["content"]["message"], 
+                                "is_reply": True, 
+                                "reply_to": r_obj["member"]["uname"],
+                                "ctime": s_ctime
+                            })
+                    # 更新这条评论的最新回复数缓存
+                    seen_rcounts[rpid] = current_rcount
