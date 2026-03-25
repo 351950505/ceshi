@@ -100,7 +100,7 @@ def fetch_sub_replies(oid, root_rpid, header):
 
 def send_exception_notification(msg):
     try:
-        notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
+        notifier.send_webhook_notification("程序异常",[{"user": "系统", "message": msg}])
     except:
         pass
 
@@ -218,7 +218,7 @@ def start_monitoring(header):
                     # 按照 ctime (发布时间) 从小到大排序，保证通知的消息顺序也是正确的先后顺序
                     new_list.sort(key=lambda x: x["ctime"])
                     
-                    logging.info("发现 %d 条新评论/回复", len(new_list))
+                    logging.info("发现 %d 条新评论", len(new_list))
                     for item in new_list:
                         prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
                         logging.info("%s%s : %s", prefix, item["user"], item["message"])
@@ -227,7 +227,8 @@ def start_monitoring(header):
                     except:
                         pass
                 
-                time.sleep(random.uniform(25, 45))
+                # 【改动点】：将获取评论的休眠间隔从 25~45秒 压缩为 10~20秒
+                time.sleep(random.uniform(10, 20))
             else:
                 time.sleep(30)
 
@@ -251,5 +252,5 @@ def start_monitoring(header):
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
-    logging.info("B站监控程序启动（基于时间戳精准防漏）")
+    logging.info("B站监控程序启动（极速版：10~20秒延迟）")
     start_monitoring(header)
