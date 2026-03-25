@@ -54,7 +54,7 @@ def get_latest_video(header):
         r = requests.get(url, headers=header, params=params, timeout=10)
         data = r.json()
         if data["code"] != 0: return None
-        for item in data.get("data", {}).get("items", []):
+        for item in data.get("data", {}).get("items",[]):
             try:
                 if item.get("type") == "DYNAMIC_TYPE_AV":
                     return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
@@ -81,18 +81,8 @@ def sync_latest_video(header):
     logging.error("连续5次获取视频失败")
     return None, None
 
-def fetch_comments(oid, header):
-    url = "https://api.bilibili.com/x/v2/reply/main"
-    params = {"oid": oid, "type": 1, "mode": 2}
-    try:
-        r = requests.get(url, headers=header, params=params, timeout=10)
-        data = r.json()
-        return data.get("data", {}).get("replies", []) or []
-    except:
-        return []
-
 def fetch_sub_replies(oid, root_rpid, header):
-    all_replies = []
+    all_replies =[]
     pn = 1
     while pn <= 5:
         params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
@@ -114,6 +104,79 @@ def send_exception_notification(msg):
     except:
         pass
 
+# ------------------------
+# 核心改动：基于时间戳和动态分页的新读取方法
+# ------------------------
+def scan_new_comments(oid, header, last_read_time, seen):
+    new_list =[]
+    max_ctime_in_this_round = last_read_time
+    
+    pn = 1
+    while pn <= 10:  # 最多往下挖10页，防止遇到死循环或API限制
+        # 改用 /x/v2/reply 接口，并设定 sort=0 (严格按时间倒序：最新发布的在最前)
+        url = "https://api.bilibili.com/x/v2/reply"
+        params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
+        
+        try:
+            r = requests.get(url, headers=header, params=params, timeout=10)
+            data = r.json()
+            replies = data.get("data", {}).get("replies") or[]
+            
+            if not replies:
+                break
+                
+            page_all_older = True  # 假设这页全都是比上次读取时间还老的数据
+            
+            for r_obj in replies:
+                rpid = r_obj["rpid_str"]
+                r_ctime = r_obj["ctime"]
+                max_ctime_in_this_round = max(max_ctime_in_this_round, r_ctime)
+                
+                # 1. 检测主评论时间
+                if r_ctime > last_read_time:
+                    page_all_older = False
+                    if rpid not in seen:
+                        seen.add(rpid)
+                        new_list.append({
+                            "user": r_obj["member"]["uname"], 
+                            "message": r_obj["content"]["message"], 
+                            "is_reply": False,
+                            "ctime": r_ctime
+                        })
+                
+                # 2. 检查子评论(盖楼)，连老评论底下的新回复也不放过
+                if r_obj.get("rcount", 0) > 0:
+                    sub_replies = fetch_sub_replies(oid, rpid, header)
+                    for sub in sub_replies:
+                        srpid = sub["rpid_str"]
+                        s_ctime = sub["ctime"]
+                        max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
+                        
+                        if s_ctime > last_read_time and srpid not in seen:
+                            page_all_older = False
+                            seen.add(srpid)
+                            new_list.append({
+                                "user": sub["member"]["uname"], 
+                                "message": sub["content"]["message"], 
+                                "is_reply": True, 
+                                "reply_to": r_obj["member"]["uname"],
+                                "ctime": s_ctime
+                            })
+                            
+            # 【防漏精髓】：如果这一整页的主评论和子回复都比 last_read_time 老，
+            # 说明新的消息已经被我们抓完了，没必要再请求下一页了，直接退出翻页循环。
+            if page_all_older:
+                break
+                
+            pn += 1
+            time.sleep(random.uniform(1.0, 1.5))
+        except Exception as e:
+            logging.error("分页获取评论异常: %s", e)
+            break
+            
+    return new_list, max_ctime_in_this_round
+
+
 def start_monitoring(header):
     last_check = time.time()
     last_heartbeat = time.time()
@@ -122,11 +185,13 @@ def start_monitoring(header):
     if not oid:
         send_exception_notification("初始视频获取失败（已重试5次），请检查 Cookie 或 UP 主动态")
         logging.error("初始视频获取失败（已重试5次）")
-        # 不退出，继续循环尝试
         oid, title = None, "待获取视频"
 
-    seen = set(r["rpid_str"] for r in fetch_comments(oid, header)) if oid else set()
-    logging.info("程序启动成功，开始监控: %s", title or "待获取视频")
+    # 初始化读取时间为当前时间戳，只会抓取程序启动之后新发布的消息
+    last_read_time = int(time.time())
+    seen = set()
+    
+    logging.info("程序启动成功，开始时间基准线监控: %s", title or "待获取视频")
 
     while True:
         try:
@@ -136,29 +201,23 @@ def start_monitoring(header):
             if is_work_time() and current - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
                 notifier.send_webhook_notification(
-                    "监控心跳",
-                    [{"user": "系统", "message": f"程序运行正常\n时间: {now_str.strftime('%Y-%m-%d %H:%M:%S')}\n监控视频: {title or '待获取'}"}]
+                    "监控心跳",[{"user": "系统", "message": f"程序运行正常\n时间: {now_str.strftime('%Y-%m-%d %H:%M:%S')}\n监控视频: {title or '待获取'}"}]
                 )
                 last_heartbeat = current
                 logging.info("已发送10分钟心跳")
 
-            # 正常监控
+            # 正常监控 (依赖时间戳过滤)
             if is_work_time() and oid:
-                # ...（保持原监控逻辑不变）
-                replies = fetch_comments(oid, header)
-                new_list = []
-                for r in replies:
-                    rpid = r["rpid_str"]
-                    if rpid in seen: continue
-                    seen.add(rpid)
-                    new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "is_reply": False})
-                    for sub in fetch_sub_replies(oid, rpid, header):
-                        srpid = sub["rpid_str"]
-                        if srpid in seen: continue
-                        seen.add(srpid)
-                        new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r["member"]["uname"]})
+                new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
+                
+                # 更新读取时间（将时间基准线推移到最新一条评论的时间）
+                if new_last_read_time > last_read_time:
+                    last_read_time = new_last_read_time
 
                 if new_list:
+                    # 按照 ctime (发布时间) 从小到大排序，保证通知的消息顺序也是正确的先后顺序
+                    new_list.sort(key=lambda x: x["ctime"])
+                    
                     logging.info("发现 %d 条新评论/回复", len(new_list))
                     for item in new_list:
                         prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
@@ -167,17 +226,20 @@ def start_monitoring(header):
                         notifier.send_webhook_notification(title, new_list)
                     except:
                         pass
+                
                 time.sleep(random.uniform(25, 45))
             else:
-                time.sleep(30)  # 非工作时间或无视频时短睡
+                time.sleep(30)
 
             # 每6小时尝试刷新视频
             if time.time() - last_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
                     oid, title = new_oid, new_title
-                    seen = set(r["rpid_str"] for r in fetch_comments(oid, header))
-                    logging.info("切换新视频")
+                    # 切换视频后，清空已看集合，重置最新读取时间
+                    last_read_time = int(time.time())
+                    seen.clear()
+                    logging.info("切换新视频，重置时间线监控")
                 last_check = time.time()
 
         except Exception as e:
@@ -189,5 +251,5 @@ def start_monitoring(header):
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
-    logging.info("B站监控程序启动（10分钟心跳 + 异常提醒）")
+    logging.info("B站监控程序启动（基于时间戳精准防漏）")
     start_monitoring(header)
