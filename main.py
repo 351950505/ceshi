@@ -5,9 +5,12 @@ import subprocess
 import random
 import logging
 import traceback
-import requests
 import hashlib
 import urllib.parse
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import database as db
 import notifier
 
@@ -18,10 +21,25 @@ HEARTBEAT_INTERVAL = 600
 logging.basicConfig(
     filename='bili_monitor.log',
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s[%(levelname)s] %(message)s',
     encoding='utf-8',
     filemode='a'
 )
+
+# ------------------------
+# 核心网络优化：全局会话与自动重试机制
+# ------------------------
+# 配置重试策略：遇到网络断开、DNS解析失败、502/504等错误时，自动重试 5 次
+retry_strategy = Retry(
+    total=5,  # 最大重试次数
+    backoff_factor=1,  # 重试间隔等待时间 (1s, 2s, 4s...)
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"]
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session = requests.Session()
+session.mount("http://", adapter)
+session.mount("https://", adapter)
 
 # ------------------------
 # Wbi 签名算法加密模块 (防风控核心)
@@ -57,7 +75,8 @@ def encWbi(params: dict, img_key: str, sub_key: str):
 def update_wbi_keys(header):
     url = "https://api.bilibili.com/x/web-interface/nav"
     try:
-        r = requests.get(url, headers=header, timeout=10)
+        # 使用配置了重试机制的 session
+        r = session.get(url, headers=header, timeout=10)
         data = r.json()
         wbi_img = data["data"]["wbi_img"]
         WBI_KEYS["img_key"] = wbi_img["img_url"].rsplit('/', 1)[1].split('.')[0]
@@ -73,14 +92,14 @@ def wbi_request(url, params, header):
         time.sleep(1) 
         
     signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
-    r = requests.get(url, headers=header, params=signed_params, timeout=10)
+    r = session.get(url, headers=header, params=signed_params, timeout=10)
     data = r.json()
     
     if data.get("code") == -400:
         logging.warning("触发 -400 风控，正在重新计算 Wbi 签名重试...")
         update_wbi_keys(header)
         signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
-        r = requests.get(url, headers=header, params=signed_params, timeout=10)
+        r = session.get(url, headers=header, params=signed_params, timeout=10)
         data = r.json()
         
     return data
@@ -103,7 +122,7 @@ def is_work_time():
 def get_video_info(bv, header):
     url = f"https://api.bilibili.com/x/web-interface/view?bvid={bv}"
     try:
-        r = requests.get(url, headers=header, timeout=10)
+        r = session.get(url, headers=header, timeout=10)
         data = r.json()
         if data["code"] == 0:
             return str(data["data"]["aid"]), data["data"]["title"]
@@ -115,7 +134,7 @@ def get_latest_video(header):
     url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
     params = {"host_mid": TARGET_UID}
     try:
-        r = requests.get(url, headers=header, params=params, timeout=10)
+        r = session.get(url, headers=header, params=params, timeout=10)
         data = r.json()
         if data["code"] != 0: return None
         for item in data.get("data", {}).get("items",[]):
@@ -197,7 +216,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
             time.sleep(random.uniform(0.5, 1.0))
             
         except Exception as e:
-            logging.error("分页获取评论异常: %s", e)
+            logging.error("分页获取评论网络异常(已多次重试): %s", e)
             break
             
     return new_list, max_ctime_in_this_round
@@ -221,7 +240,6 @@ def start_monitoring(header):
         try:
             current = time.time()
 
-            # 心跳监控
             if is_work_time() and current - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
                 notifier.send_webhook_notification(
@@ -230,16 +248,13 @@ def start_monitoring(header):
                 last_heartbeat = current
                 logging.info("已发送10分钟心跳")
 
-            # 正常监控
             if is_work_time() and oid:
-                # 只传 seen，去除去掉了所有和 rcount 有关的参数
                 new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                 
                 if new_last_read_time > last_read_time:
                     last_read_time = new_last_read_time
 
                 if new_list:
-                    # 排序并发送通知
                     new_list.sort(key=lambda x: x["ctime"])
                     logging.info("发现 %d 条新主评论", len(new_list))
                     for item in new_list:
@@ -254,7 +269,6 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 每6小时尝试刷新视频
             if time.time() - last_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
@@ -266,13 +280,15 @@ def start_monitoring(header):
 
         except Exception as e:
             err = traceback.format_exc()
-            logging.error("程序异常: %s", err)
-            send_exception_notification(f"监控程序异常: {err[:300]}")
-            time.sleep(60)
+            logging.error("主循环发生异常: %s", err)
+            # 过滤掉网络波动导致的频繁异常提醒
+            if "NameResolutionError" not in err and "ConnectionError" not in err:
+                send_exception_notification(f"监控程序异常: {err[:300]}")
+            time.sleep(30)
 
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（纯净极速版：仅监控主界面回复）")
+    logging.info("B站监控程序启动（纯净极速+网络重试防御版）")
     start_monitoring(header)
