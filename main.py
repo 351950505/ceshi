@@ -36,31 +36,25 @@ mixinKeyEncTab =[
 ]
 
 def getMixinKey(orig: str):
-    """对 imgKey 和 subKey 进行字符顺序打乱编码"""
     return "".join([orig[i] for i in mixinKeyEncTab])[:32]
 
 def encWbi(params: dict, img_key: str, sub_key: str):
-    """为请求参数进行 wbi 签名"""
     mixin_key = getMixinKey(img_key + sub_key)
     curr_time = round(time.time())
     params['wts'] = curr_time
-    # 按照 key 升序字典排序
     params = dict(sorted(params.items()))
-    # 过滤掉特殊字符
     filtered_params = {}
     for k, v in params.items():
         v_str = str(v)
         for char in "!'()*":
             v_str = v_str.replace(char, '')
         filtered_params[k] = v_str
-    # 序列化参数并计算 md5
     query = urllib.parse.urlencode(filtered_params)
     wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
     filtered_params['w_rid'] = wbi_sign
     return filtered_params
 
 def update_wbi_keys(header):
-    """从导航接口获取最新的 Wbi 密钥"""
     url = "https://api.bilibili.com/x/web-interface/nav"
     try:
         r = requests.get(url, headers=header, timeout=10)
@@ -74,17 +68,14 @@ def update_wbi_keys(header):
         logging.error("获取 Wbi 密钥失败: %s", e)
 
 def wbi_request(url, params, header):
-    """封装带 Wbi 签名的安全请求"""
-    # 密钥有效期为数小时，我们这里设定每 6 小时强制刷新一次密钥
     if time.time() - WBI_KEYS["last_update"] > 21600 or not WBI_KEYS["img_key"]:
         update_wbi_keys(header)
-        time.sleep(1) # 避免请求过频
+        time.sleep(1) 
         
     signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     r = requests.get(url, headers=header, params=signed_params, timeout=10)
     data = r.json()
     
-    # 容错：如果遇到 -400，说明密钥可能过期失效，立刻刷新重试一次
     if data.get("code") == -400:
         logging.warning("触发 -400 风控，正在重新计算 Wbi 签名重试...")
         update_wbi_keys(header)
@@ -94,9 +85,6 @@ def wbi_request(url, params, header):
         
     return data
 
-# ------------------------
-# 基础功能模块
-# ------------------------
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
@@ -157,23 +145,6 @@ def sync_latest_video(header):
     logging.error("连续5次获取视频失败")
     return None, None
 
-def fetch_sub_replies(oid, root_rpid, header):
-    all_replies =[]
-    pn = 1
-    while pn <= 5:
-        params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
-        try:
-            # 【使用 Wbi 封装请求】
-            data = wbi_request("https://api.bilibili.com/x/v2/reply/reply", params, header)
-            if data.get("code") != 0 or not data.get("data", {}).get("replies"):
-                break
-            all_replies.extend(data["data"]["replies"])
-            pn += 1
-            time.sleep(random.uniform(1.2, 2.0))
-        except:
-            break
-    return all_replies
-
 def send_exception_notification(msg):
     try:
         notifier.send_webhook_notification("程序异常",[{"user": "系统", "message": msg}])
@@ -181,12 +152,12 @@ def send_exception_notification(msg):
         pass
 
 # ------------------------
-# 核心改动：Wbi 签名 + 5分钟时间回溯缓冲池 (防漏消息彻底解决)
+# 极致精简版：仅扫描主界面新评论
 # ------------------------
-def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
+def scan_new_comments(oid, header, last_read_time, seen):
     new_list =[]
     max_ctime_in_this_round = last_read_time
-    # 设定 300 秒（5分钟）的回溯缓冲时间，完美解决 B站 CDN 延迟导致的消息遗漏
+    # 5分钟的 CDN 延迟缓冲依然保留，绝不漏主评论
     safe_read_time = last_read_time - 300 
     
     pn = 1
@@ -194,7 +165,6 @@ def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
         params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
         
         try:
-            # 【使用 Wbi 封装请求】
             data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
             replies = data.get("data", {}).get("replies") or[]
             
@@ -208,47 +178,23 @@ def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
                 r_ctime = r_obj["ctime"]
                 max_ctime_in_this_round = max(max_ctime_in_this_round, r_ctime)
                 
-                # 【防漏优化】：不使用绝对的 last_read_time，而是留有 5 分钟余量！
+                # 仅检测主评论时间
                 if r_ctime > safe_read_time:
-                    page_all_older = False  # 只要还有 5 分钟内的数据，就可能还有遗漏，继续翻页
-                    
+                    page_all_older = False
                     if rpid not in seen:
                         seen.add(rpid)
                         new_list.append({
                             "user": r_obj["member"]["uname"], 
                             "message": r_obj["content"]["message"], 
-                            "is_reply": False,
                             "ctime": r_ctime
                         })
-                
-                current_rcount = r_obj.get("rcount", 0)
-                if current_rcount > seen_rcounts.get(rpid, 0):
-                    page_all_older = False  # 有子回复变动，强制翻页检查
-                    sub_replies = fetch_sub_replies(oid, rpid, header)
-                    
-                    for sub in sub_replies:
-                        srpid = sub["rpid_str"]
-                        s_ctime = sub["ctime"]
-                        max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
-                        
-                        # 同样使用缓冲时间去捕获子回复的延迟
-                        if s_ctime > safe_read_time and srpid not in seen:
-                            seen.add(srpid)
-                            new_list.append({
-                                "user": sub["member"]["uname"], 
-                                "message": sub["content"]["message"], 
-                                "is_reply": True, 
-                                "reply_to": r_obj["member"]["uname"],
-                                "ctime": s_ctime
-                            })
                             
-                    seen_rcounts[rpid] = current_rcount
-                            
+            # 如果这页的主评论全部都是老评论了，直接停止翻页
             if page_all_older:
                 break
                 
             pn += 1
-            time.sleep(random.uniform(1.0, 1.5))
+            time.sleep(random.uniform(0.5, 1.0))
             
         except Exception as e:
             logging.error("分页获取评论异常: %s", e)
@@ -256,9 +202,6 @@ def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
             
     return new_list, max_ctime_in_this_round
 
-# ------------------------
-# 主循环守护
-# ------------------------
 def start_monitoring(header):
     last_check = time.time()
     last_heartbeat = time.time()
@@ -271,7 +214,6 @@ def start_monitoring(header):
 
     last_read_time = int(time.time())
     seen = set()
-    seen_rcounts = {}
     
     logging.info("程序启动成功，开始时间基准线监控: %s", title or "待获取视频")
 
@@ -279,6 +221,7 @@ def start_monitoring(header):
         try:
             current = time.time()
 
+            # 心跳监控
             if is_work_time() and current - last_heartbeat >= HEARTBEAT_INTERVAL:
                 now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
                 notifier.send_webhook_notification(
@@ -287,34 +230,37 @@ def start_monitoring(header):
                 last_heartbeat = current
                 logging.info("已发送10分钟心跳")
 
+            # 正常监控
             if is_work_time() and oid:
-                new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen, seen_rcounts)
+                # 只传 seen，去除去掉了所有和 rcount 有关的参数
+                new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                 
                 if new_last_read_time > last_read_time:
                     last_read_time = new_last_read_time
 
                 if new_list:
+                    # 排序并发送通知
                     new_list.sort(key=lambda x: x["ctime"])
-                    logging.info("发现 %d 条新评论/回复", len(new_list))
+                    logging.info("发现 %d 条新主评论", len(new_list))
                     for item in new_list:
-                        prefix = f"回复@{item.get('reply_to','')} " if item.get("is_reply") else ""
-                        logging.info("%s%s : %s", prefix, item["user"], item["message"])
+                        logging.info("%s : %s", item["user"], item["message"])
                     try:
                         notifier.send_webhook_notification(title, new_list)
                     except:
                         pass
                 
-                time.sleep(random.uniform(10, 20))
+                # 极限刷新率：5~10 秒
+                time.sleep(random.uniform(5, 10))
             else:
                 time.sleep(30)
 
+            # 每6小时尝试刷新视频
             if time.time() - last_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
                     oid, title = new_oid, new_title
                     last_read_time = int(time.time())
                     seen.clear()
-                    seen_rcounts.clear()
                     logging.info("切换新视频，重置时间线监控")
                 last_check = time.time()
 
@@ -327,7 +273,6 @@ def start_monitoring(header):
 if __name__ == "__main__":
     db.init_db()
     header = get_header()
-    # 启动前初始化并获取一次 Wbi 密钥
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（集成 Wbi 签名 + 时间回溯防漏补捞机制）")
+    logging.info("B站监控程序启动（纯净极速版：仅监控主界面回复）")
     start_monitoring(header)
