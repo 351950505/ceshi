@@ -29,7 +29,7 @@ DYNAMIC_BURST_DURATION = 300      # 狂暴模式持续时间(5分钟=300秒)
 logging.basicConfig(
     filename='bili_monitor.log',
     level=logging.INFO,
-    format='%(asctime)s[%(levelname)s] %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
     encoding='utf-8',
     filemode='a'
 )
@@ -99,17 +99,26 @@ def wbi_request(url, params, header):
         
     signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     r = session.get(url, headers=header, params=signed_params, timeout=10)
-    data = r.json()
+    
+    # 【修复重点】：强制捕获非 JSON 响应，直接伪装成 -412 触发休眠
+    try:
+        data = r.json()
+    except ValueError:
+        data = {"code": -412}
     
     if data.get("code") == -400:
         logging.warning("触发 -400 风控，重新计算 Wbi 签名...")
         update_wbi_keys(header)
         signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
         r = session.get(url, headers=header, params=signed_params, timeout=10)
-        data = r.json()
-    elif data.get("code") == -412:
-        logging.error("【严重警告】触发 -412 拦截！休眠 15 分钟...")
-        notifier.send_webhook_notification("系统风控预警",[{"user": "系统", "message": "触发B站-412请求拦截，程序将休眠15分钟以保护IP。"}])
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"code": -412}
+
+    if data.get("code") == -412:
+        logging.error("【系统预警】请求被拦截(或返回空数据)！强制休眠 15 分钟...")
+        notifier.send_webhook_notification("系统风控预警",[{"user": "系统", "message": "触发 B站底层风控拦截，程序自动休眠 15 分钟保护 IP。"}])
         time.sleep(900) 
         
     return data
@@ -144,7 +153,11 @@ def get_latest_video(header, target_uid):
     params = {"host_mid": target_uid}
     try:
         r = session.get(url, headers=header, params=params, timeout=10)
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError:
+            data = {"code": -412}
+            
         if data.get("code") == -412:
             time.sleep(900)
             return None
@@ -175,7 +188,7 @@ def sync_latest_video(header):
 
 def send_exception_notification(msg):
     try:
-        notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
+        notifier.send_webhook_notification("程序异常",[{"user": "系统", "message": msg}])
     except: pass
 
 # ------------------------
@@ -214,7 +227,6 @@ def init_extra_dynamics(header):
     return seen_dynamics, active_dynamics
 
 def check_new_dynamics(header, seen_dynamics, active_dynamics):
-    """检查新动态，纯净提取文字内容，不要传送门"""
     new_alerts =[]
     has_new_dynamic = False
     
@@ -223,9 +235,14 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
         params = {"host_mid": uid}
         try:
             r = session.get(url, headers=header, params=params, timeout=10)
-            data = r.json()
+            try:
+                data = r.json()
+            except ValueError:
+                data = {"code": -412}
             
-            if data.get("code") == -412: continue
+            if data.get("code") == -412: 
+                logging.error(f"动态检查触碰风控(返回空/412)，跳过。")
+                continue
             if data.get("code") != 0: continue
             
             items = data.get("data", {}).get("items",[])
@@ -237,12 +254,10 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
                     seen_dynamics[uid].add(id_str)
                     has_new_dynamic = True
                     
-                    # 1. 尝试提取动态的直接文本内容
                     dyn_text = ""
                     try: dyn_text = item["modules"]["module_dynamic"]["desc"]["text"]
                     except: pass
                     
-                    # 2. 提取附加类型
                     dyn_type = item.get("type")
                     attach_str = ""
                     try:
@@ -258,7 +273,6 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
                             attach_str = "🔴 开启了直播"
                     except: pass
 
-                    # 3. 组合极简纯净文案 (无传送门)
                     final_desc = ""
                     if dyn_text: final_desc += f"【正文】:\n{dyn_text}\n"
                     if attach_str: final_desc += f"【附带】: {attach_str}"
@@ -273,7 +287,6 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
                         "message": final_desc
                     })
                     
-                    # 4. 把新动态加入“评论监控池”
                     basic = item.get("basic", {})
                     c_oid = basic.get("comment_id_str")
                     c_type = basic.get("comment_type")
@@ -292,7 +305,6 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
     return has_new_dynamic
 
 def check_dynamic_up_replies(header, active_dynamics, seen_dynamic_replies):
-    """巡查近期的动态，看 UP 主自己有没有在底下发评论 (无传送门)"""
     new_alerts =[]
     current_time = time.time()
     
@@ -319,14 +331,12 @@ def check_dynamic_up_replies(header, active_dynamics, seen_dynamic_replies):
                     rpid = str(r_obj["rpid_str"])
                     r_mid = str(r_obj["member"]["mid"])
                     
-                    # 判断是不是UP主本人的补充评论
                     if r_mid == str(uid) and rpid not in seen_dynamic_replies:
                         seen_dynamic_replies.add(rpid)
                         
                         msg = r_obj["content"]["message"]
                         name = r_obj["member"]["uname"]
                         
-                        # 极简纯净通知
                         new_alerts.append({
                             "user": name,
                             "message": f"💬 UP主补充评论：\n{msg}"
@@ -379,7 +389,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
             pn += 1
             time.sleep(random.uniform(0.5, 1.0))
         except Exception as e:
-            logging.error("分页获取评论网络异常: %s", e)
+            logging.error("分页获取评论网络异常(已自愈): %s", e)
             break
             
     return new_list, max_ctime_in_this_round
@@ -402,7 +412,7 @@ def start_monitoring(header):
     seen_dynamic_replies = set() 
     
     last_dynamic_check = time.time()
-    dynamic_burst_end_time = 0  # 狂暴模式结束时间戳
+    dynamic_burst_end_time = 0  
     
     logging.info("程序启动成功，开始时间基准线监控: %s", title or "待获取视频")
 
@@ -411,7 +421,7 @@ def start_monitoring(header):
             current = time.time()
 
             if is_work_time() and current - last_heartbeat >= HEARTBEAT_INTERVAL:
-                now_str = datetime.datetime.now(datetime.timezone.utc) + timedelta(hours=8)
+                now_str = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
                 notifier.send_webhook_notification(
                     "监控心跳",[{"user": "系统", "message": f"程序运行正常\n监控视频: {title or '待获取'}"}]
                 )
@@ -419,7 +429,6 @@ def start_monitoring(header):
                 logging.info("已发送10分钟心跳")
 
             if is_work_time():
-                # 1. 主视频评论监控
                 if oid:
                     new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                     if new_last_read_time > last_read_time:
@@ -433,11 +442,9 @@ def start_monitoring(header):
                         try: notifier.send_webhook_notification(title, new_list)
                         except: pass
                 
-                # 2. 动态 & UP主评论监听 (根据是否处于狂暴模式决定刷新间隔)
                 current_dyn_interval = DYNAMIC_BURST_INTERVAL if current < dynamic_burst_end_time else DYNAMIC_CHECK_INTERVAL
                 
                 if current - last_dynamic_check >= current_dyn_interval:
-                    # 如果有新动态发布，立刻激活 5分钟 狂暴刷新模式
                     has_new_dyn = check_new_dynamics(header, seen_dynamics, active_dynamics)
                     if has_new_dyn:
                         dynamic_burst_end_time = current + DYNAMIC_BURST_DURATION
@@ -446,7 +453,6 @@ def start_monitoring(header):
                     check_dynamic_up_replies(header, active_dynamics, seen_dynamic_replies)
                     last_dynamic_check = time.time()
 
-                # 主循环极限刷新率：5~10 秒
                 time.sleep(random.uniform(5, 10))
             else:
                 time.sleep(30)
@@ -471,5 +477,5 @@ if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（支持 5分钟狂暴抓取 + 无传送门极简版）")
+    logging.info("B站监控程序启动（支持强效断网/风控免疫自愈保护机制）")
     start_monitoring(header)
