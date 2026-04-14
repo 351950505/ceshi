@@ -15,7 +15,6 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 600
 
-# 动态监控配置
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885]
 DYNAMIC_CHECK_INTERVAL = 60
 DYNAMIC_BURST_INTERVAL = 10
@@ -29,9 +28,7 @@ logging.basicConfig(
     filemode='a'
 )
 
-# ------------------------
-# 核心网络：仅基础 requests.get（严格遵循避坑原则）
-# ------------------------
+# Wbi 签名模块
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
@@ -46,8 +43,7 @@ def encWbi(params: dict, img_key: str, sub_key: str):
     filtered_params = {}
     for k, v in params.items():
         v_str = str(v)
-        for char in "!'()*":
-            v_str = v_str.replace(char, '')
+        for char in "!'()*": v_str = v_str.replace(char, '')
         filtered_params[k] = v_str
     query = urllib.parse.urlencode(filtered_params)
     wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
@@ -78,7 +74,6 @@ def wbi_request(url, params, header):
     except Exception:
         return {"code": -1}
     if data.get("code") == -400:
-        logging.warning("触发 -400，重新计算 Wbi 签名...")
         update_wbi_keys(header)
         signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
         try:
@@ -93,7 +88,6 @@ def get_header():
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
     except:
-        logging.warning("未找到Cookie，启动扫码登录")
         subprocess.run([sys.executable, "login_bilibili.py"])
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
@@ -147,13 +141,11 @@ def send_exception_notification(msg):
         notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
     except: pass
 
-# ====================== 动态监控 ======================
+# 动态监控
 def init_extra_dynamics(header):
-    seen_dynamics = {}
-    active_dynamics = {}
+    seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
+    active_dynamics = {uid: {} for uid in EXTRA_DYNAMIC_UIDS}
     for uid in EXTRA_DYNAMIC_UIDS:
-        seen_dynamics[uid] = set()
-        active_dynamics[uid] = {}
         url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
         params = {"host_mid": uid}
         try:
@@ -259,9 +251,9 @@ def check_dynamic_up_replies(header, active_dynamics, seen_dynamic_replies):
         try: notifier.send_webhook_notification("🔔 UP主本尊动态评论区出没", new_alerts)
         except: pass
 
-# ====================== 主视频评论监控 ======================
+# 主视频评论监控（修复版）
 def scan_new_comments(oid, header, last_read_time, seen):
-    new_list =[]
+    new_list = []
     max_ctime_in_this_round = last_read_time
     safe_read_time = last_read_time - 300
     pn = 1
@@ -270,7 +262,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
         try:
             data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
             if data.get("code") != 0: break
-            replies = data.get("data", {}).get("replies") or[]
+            replies = data.get("data", {}).get("replies") or []
             if not replies: break
             page_all_older = True
             for r_obj in replies:
@@ -320,7 +312,7 @@ def start_monitoring(header):
                 last_heartbeat = current
 
             if is_work_time():
-                # 视频主评论监控
+                # 视频主评论监控（核心修复：确保一直执行）
                 if oid:
                     new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                     if new_last_read_time > last_read_time:
@@ -331,7 +323,7 @@ def start_monitoring(header):
                         try: notifier.send_webhook_notification(title, new_list)
                         except: pass
 
-                # 动态监控（支持狂暴模式）
+                # 动态监控
                 current_dyn_interval = DYNAMIC_BURST_INTERVAL if current < dynamic_burst_end_time else DYNAMIC_CHECK_INTERVAL
                 if current - last_dynamic_check >= current_dyn_interval:
                     has_new_dyn = check_new_dynamics(header, seen_dynamics, active_dynamics)
@@ -360,5 +352,5 @@ if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（视频主评论 + 动态监控版）")
+    logging.info("B站监控程序启动（主视频监控已修复）")
     start_monitoring(header)
