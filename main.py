@@ -15,9 +15,8 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 600
 
-# 动态监控配置（轻量版）
-EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885,285340365]
-DYNAMIC_CHECK_INTERVAL = 30   # 改为30秒一次，降低负担
+EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
+DYNAMIC_CHECK_INTERVAL = 30
 
 logging.basicConfig(
     filename='bili_monitor.log',
@@ -27,7 +26,7 @@ logging.basicConfig(
     filemode='a'
 )
 
-# Wbi 签名模块（不变）
+# Wbi 签名模块
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
@@ -140,7 +139,7 @@ def send_exception_notification(msg):
         notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
     except: pass
 
-# 轻量动态监控（只获取最新动态内容）
+# 轻量动态监控
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     for uid in EXTRA_DYNAMIC_UIDS:
@@ -155,7 +154,6 @@ def check_new_dynamics(header, seen_dynamics):
                 if not id_str or id_str in seen_dynamics[uid]: continue
                 seen_dynamics[uid].add(id_str)
 
-                # 只取动态文字内容
                 dyn_text = ""
                 try:
                     dyn_text = item["modules"]["module_dynamic"]["desc"]["text"]
@@ -170,10 +168,7 @@ def check_new_dynamics(header, seen_dynamics):
                 except:
                     pass
 
-                new_alerts.append({
-                    "user": name,
-                    "message": dyn_text
-                })
+                new_alerts.append({"user": name, "message": dyn_text})
         except:
             pass
     if new_alerts:
@@ -183,7 +178,7 @@ def check_new_dynamics(header, seen_dynamics):
         except:
             pass
 
-# 主视频评论监控（仅主评论）
+# 主视频评论监控（修复显示具体内容）
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime_in_this_round = last_read_time
@@ -227,7 +222,7 @@ def start_monitoring(header):
     seen = set()
     seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
 
-    logging.info("程序启动成功（主评论 + 轻量动态监控）")
+    logging.info("程序启动成功（主评论内容显示已修复）")
     while True:
         try:
             current = time.time()
@@ -239,7 +234,7 @@ def start_monitoring(header):
                 last_heartbeat = current
 
             if is_work_time():
-                # 主评论监控
+                # 主评论监控（显示具体内容）
                 if oid:
                     new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                     if new_last_read_time > last_read_time:
@@ -247,12 +242,14 @@ def start_monitoring(header):
                     if new_list:
                         new_list.sort(key=lambda x: x["ctime"])
                         logging.info("发现 %d 条新主评论", len(new_list))
+                        for item in new_list:
+                            logging.info("%s : %s", item["user"], item["message"])
                         try:
                             notifier.send_webhook_notification(title, new_list)
                         except:
                             pass
 
-                # 轻量动态监控（30秒一次）
+                # 动态监控
                 check_new_dynamics(header, seen_dynamics)
 
                 time.sleep(random.uniform(10, 20))
@@ -275,5 +272,5 @@ if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（动态30秒轻量版）")
+    logging.info("B站监控程序启动（主评论内容显示修复完成）")
     start_monitoring(header)
