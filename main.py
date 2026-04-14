@@ -20,7 +20,7 @@ HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
 # 动态监控名单
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
 DYNAMIC_CHECK_INTERVAL = 30       # 动态轮询频率
-DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒
+DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒（5分钟）
 LOG_FILE = 'bili_monitor.log'
 # ==============================================
 
@@ -29,8 +29,11 @@ LOG_FILE = 'bili_monitor.log'
 # ------------------------
 def init_logging():
     # 物理级清空旧内容，确保重启后日志是全新的
-    with open(LOG_FILE, 'w', encoding='utf-8') as f:
-        f.truncate()
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                f.truncate()
+    except: pass
     
     logging.basicConfig(
         filename=LOG_FILE,
@@ -170,8 +173,12 @@ def check_new_dynamics(header, seen_dynamics):
             
             name = author_mod.get("name", str(uid))
             msg = f"【正文】: {desc_text}\n【关联】: {attach}" if attach else desc_text
+            
+            # 增强日志反馈：记录动态摘要
+            log_msg = msg.replace('\n', ' ')[:50]
+            logging.info(f"动态抓取成功: [{name}] {log_msg}...")
+            
             new_alerts.append({"user": name, "message": msg or "发布了新动态"})
-            logging.info(f"动态成功抓取: {name}")
         except Exception: pass
 
     if new_alerts:
@@ -197,7 +204,10 @@ def scan_new_comments(oid, header, last_read_time, seen):
                     seen.add(rpid)
                     uname = r.get("member", {}).get("uname", "未知用户")
                     msg = r.get("content", {}).get("message", "")
-                    logging.info(f"评论抓取成功: {uname}")
+                    
+                    # 增强日志反馈：记录评论摘要
+                    logging.info(f"评论抓取成功: [{uname}] {msg[:50]}...")
+                    
                     new_list.append({"user": uname, "message": msg, "ctime": ctime})
         if page_all_older: break
         time.sleep(random.uniform(0.5, 1.0))
