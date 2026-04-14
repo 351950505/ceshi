@@ -12,14 +12,14 @@ import database as db
 import notifier
 
 # ================= 核心配置区 =================
-TARGET_UID = 1671203508           # 主监控视频评论的UP
-VIDEO_CHECK_INTERVAL = 21600      # 6小时同步一次最新视频
-HEARTBEAT_INTERVAL = 600          # 10分钟发一次心跳
+TARGET_UID = 1671203508           # 主监控UP主 (监控其最新视频的主评论+楼中楼)
+VIDEO_CHECK_INTERVAL = 21600      # 6小时刷新一次监控视频
+HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
 
 # 动态监控名单
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885]
-DYNAMIC_CHECK_INTERVAL = 60       # 动态日常检查间隔
-DYNAMIC_BURST_INTERVAL = 10       # 发现新动态后的狂暴模式刷新间隔
+DYNAMIC_CHECK_INTERVAL = 60       # 动态日常检查间隔(秒)
+DYNAMIC_BURST_INTERVAL = 10       # 发现新动态后的狂暴刷新间隔(秒)
 DYNAMIC_BURST_DURATION = 300      # 狂暴模式持续时间(5分钟)
 # ==============================================
 
@@ -69,7 +69,7 @@ def update_wbi_keys(header):
         WBI_KEYS["img_key"] = wbi_img["img_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["sub_key"] = wbi_img["sub_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["last_update"] = time.time()
-        logging.info("Wbi 密钥已更新")
+        logging.info("Wbi 密钥已自动更新")
     except Exception: pass
 
 def wbi_request(url, params, header):
@@ -84,7 +84,7 @@ def wbi_request(url, params, header):
         return {"code": -1}
 
 # ------------------------
-# 辅助功能模块
+# 基础功能模块
 # ------------------------
 def get_header():
     try:
@@ -134,13 +134,75 @@ def sync_latest_video(header):
             if oid:
                 db.clear_videos()
                 db.add_video_to_db(oid, bv, title)
-                logging.info("监控视频: %s", title)
+                logging.info("开始监控视频: %s", title)
                 return oid, title
         time.sleep(10)
     return None, None
 
 # ------------------------
-# 动态雷达：支持 5 分钟狂暴高频模式
+# 核心扫描：保留主评论 + 子回复抓取逻辑
+# ------------------------
+def fetch_sub_replies(oid, root_rpid, header):
+    all_replies = []
+    pn = 1
+    while pn <= 5:
+        params = {"oid": oid, "type": 1, "root": root_rpid, "pn": pn, "ps": 20}
+        try:
+            data = wbi_request("https://api.bilibili.com/x/v2/reply/reply", params, header)
+            if data.get("code") != 0 or not data.get("data", {}).get("replies"):
+                break
+            all_replies.extend(data["data"]["replies"])
+            pn += 1
+            time.sleep(random.uniform(1.2, 2.0))
+        except: break
+    return all_replies
+
+def scan_new_comments(oid, header, last_read_time, seen, seen_rcounts):
+    new_list = []
+    max_ctime_in_this_round = last_read_time
+    safe_read_time = last_read_time - 300 
+    
+    pn = 1
+    while pn <= 10:  
+        params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
+        try:
+            data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
+            replies = data.get("data", {}).get("replies") or []
+            if not replies: break
+            
+            page_all_older = True  
+            for r_obj in replies:
+                rpid = r_obj["rpid_str"]
+                r_ctime = r_obj["ctime"]
+                max_ctime_in_this_round = max(max_ctime_in_this_round, r_ctime)
+                
+                if r_ctime > safe_read_time:
+                    page_all_older = False
+                    if rpid not in seen:
+                        seen.add(rpid)
+                        new_list.append({"user": r_obj["member"]["uname"], "message": r_obj["content"]["message"], "is_reply": False, "ctime": r_ctime})
+                
+                # 保留 rcount 子回复检查逻辑
+                current_rcount = r_obj.get("rcount", 0)
+                if current_rcount > seen_rcounts.get(rpid, 0):
+                    page_all_older = False
+                    sub_replies = fetch_sub_replies(oid, rpid, header)
+                    for sub in sub_replies:
+                        srpid = sub["rpid_str"]
+                        s_ctime = sub["ctime"]
+                        max_ctime_in_this_round = max(max_ctime_in_this_round, s_ctime)
+                        if s_ctime > safe_read_time and srpid not in seen:
+                            seen.add(srpid)
+                            new_list.append({"user": sub["member"]["uname"], "message": sub["content"]["message"], "is_reply": True, "reply_to": r_obj["member"]["uname"], "ctime": s_ctime})
+                    seen_rcounts[rpid] = current_rcount
+            if page_all_older: break
+            pn += 1
+            time.sleep(random.uniform(1.0, 1.5))
+        except: break
+    return new_list, max_ctime_in_this_round
+
+# ------------------------
+# 动态雷达模块 (新增独立模块)
 # ------------------------
 def init_extra_dynamics(header):
     seen, active = {}, {}
@@ -169,10 +231,9 @@ def check_new_dynamics(header, seen, active):
                 if id_str and id_str not in seen[uid]:
                     seen[uid].add(id_str)
                     has_new = True
-                    txt = "发布了新内容"
+                    txt = "发布了新动态"; name = str(uid)
                     try: txt = item["modules"]["module_dynamic"]["desc"]["text"]
                     except: pass
-                    name = str(uid)
                     try: name = item["modules"]["module_author"]["name"]
                     except: pass
                     new_alerts.append({"user": name, "message": txt[:200]})
@@ -180,7 +241,7 @@ def check_new_dynamics(header, seen, active):
                     if basic.get("comment_id_str"):
                         active[uid][id_str] = {"oid": basic["comment_id_str"], "type": basic["comment_type"], "ctime": time.time()}
         except: continue
-    if new_alerts: notifier.send_webhook_notification("💡 关注UP新动态", new_alerts)
+    if new_alerts: notifier.send_webhook_notification("💡 特别关注UP主新动态", new_alerts)
     return has_new
 
 def check_dynamic_up_replies(header, active, seen_replies):
@@ -201,105 +262,62 @@ def check_dynamic_up_replies(header, active, seen_replies):
                     if r and str(r["member"]["mid"]) == str(uid) and r["rpid_str"] not in seen_replies:
                         seen_replies.add(r["rpid_str"])
                         new_alerts.append({"user": r["member"]["uname"], "message": f"💬 补充动态评论：\n{r['content']['message']}"})
-    if new_alerts: notifier.send_webhook_notification("🔔 UP主动态回复", new_alerts)
+    if new_alerts: notifier.send_webhook_notification("🔔 UP主动态出没", new_alerts)
 
 # ------------------------
-# 纯净扫描：仅主评论 (去除了所有子回复逻辑)
-# ------------------------
-def scan_new_comments(oid, header, last_read_time, seen):
-    new_list = []
-    max_ctime = last_read_time
-    safe_time = last_read_time - 300 
-    
-    pn = 1
-    while pn <= 5:  # 仅扫描前5页最新评论
-        # sort=2 确保按时间排序，从而能抓到最新评论
-        params = {"oid": oid, "type": 1, "sort": 2, "pn": pn, "ps": 20}
-        try:
-            data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
-            replies = data.get("data", {}).get("replies") or []
-            if not replies: break
-                
-            page_all_older = True  
-            for r in replies:
-                rpid = r["rpid_str"]
-                ctime = r["ctime"]
-                max_ctime = max(max_ctime, ctime)
-                
-                if ctime > safe_time:
-                    page_all_older = False
-                    if rpid not in seen:
-                        seen.add(rpid)
-                        new_list.append({
-                            "user": r["member"]["uname"], 
-                            "message": r["content"]["message"], 
-                            "ctime": ctime
-                        })
-            if page_all_older: break
-            pn += 1
-            time.sleep(random.uniform(1.0, 1.5))
-        except: break
-            
-    return new_list, max_ctime
-
-# ------------------------
-# 主循环
+# 主循环守护
 # ------------------------
 def start_monitoring(header):
-    last_check_video = time.time()
-    last_heartbeat = time.time()
-    last_dynamic_check = 0
+    last_v_check = time.time()
+    last_hb = time.time()
+    last_d_check = 0
     burst_end_time = 0
     
     oid, title = sync_latest_video(header)
-    last_read_time = int(time.time())
-    seen_comments = set()
-    seen_dyns, active_dyns = init_extra_dynamics(header)
-    seen_dyn_replies = set()
+    last_read_time = int(time.time()); seen_comments = set(); seen_rcounts = {}
+    seen_dyns, active_dyns = init_extra_dynamics(header); seen_dyn_replies = set()
     
     logging.info("程序启动。监控视频: %s", title or "待获取")
 
     while True:
         try:
             now = time.time()
+            if is_work_time() and now - last_hb >= HEARTBEAT_INTERVAL:
+                notifier.send_webhook_notification("心跳", [{"user": "系统", "message": f"运行中\n目标视频: {title}"}])
+                last_hb = now
 
-            # 1. 心跳
-            if is_work_time() and now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                notifier.send_webhook_notification("心跳", [{"user": "系统", "message": f"正常监控: {title}"}])
-                last_heartbeat = now
+            if is_work_time():
+                # 1. 视频评论及子回复监控 (保留原逻辑)
+                if oid:
+                    new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments, seen_rcounts)
+                    if new_t > last_read_time: last_read_time = new_t
+                    if new_c:
+                        new_c.sort(key=lambda x: x["ctime"])
+                        notifier.send_webhook_notification(title, new_c)
+                
+                # 2. 动态雷达监控 (新增逻辑)
+                current_d_interval = DYNAMIC_BURST_INTERVAL if now < burst_end_time else DYNAMIC_CHECK_INTERVAL
+                if now - last_d_check >= current_d_interval:
+                    if check_new_dynamics(header, seen_dyns, active_dyns):
+                        burst_end_time = now + DYNAMIC_BURST_DURATION
+                        logging.info("🔥 发现新内容，进入狂暴模式")
+                    check_dynamic_up_replies(header, active_dyns, seen_dyn_replies)
+                    last_d_check = now
 
-            # 2. 视频主评论
-            if is_work_time() and oid:
-                new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
-                if new_t > last_read_time: last_read_time = new_t
-                if new_c:
-                    new_c.sort(key=lambda x: x["ctime"])
-                    notifier.send_webhook_notification(title, new_c)
-            
-            # 3. 动态雷达 (含狂暴模式)
-            current_interval = DYNAMIC_BURST_INTERVAL if now < burst_end_time else DYNAMIC_CHECK_INTERVAL
-            if now - last_dynamic_check >= current_interval:
-                if check_new_dynamics(header, seen_dyns, active_dyns):
-                    burst_end_time = now + DYNAMIC_BURST_DURATION
-                    logging.info("🔥 发现新动态，开启5分钟狂暴刷新")
-                check_dynamic_up_replies(header, active_dyns, seen_dyn_replies)
-                last_dynamic_check = time.time()
+                time.sleep(random.uniform(10, 20))
+            else:
+                time.sleep(30)
 
-            # 4. 定时视频同步
-            if now - last_check_video > VIDEO_CHECK_INTERVAL:
+            if now - last_v_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
-                    oid, title = new_oid, new_title
-                    last_read_time, seen_comments.clear()
-                last_check_video = now
-
-            time.sleep(random.uniform(10, 20))
+                    oid, title = new_oid, new_title; last_read_time = int(time.time())
+                    seen_comments.clear(); seen_rcounts.clear()
+                last_v_check = now
         except Exception:
-            logging.error(traceback.format_exc())
-            time.sleep(60)
+            logging.error(traceback.format_exc()); time.sleep(60)
 
 if __name__ == "__main__":
-    db.init_db()
-    h = get_header()
-    update_wbi_keys(h)
+    db.init_db(); h = get_header(); update_wbi_keys(h)
+    logging.info("B站全能监控启动（主视频+动态雷达+子回复补抓）")
     start_monitoring(h)
