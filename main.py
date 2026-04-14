@@ -13,16 +13,23 @@ import notifier
 
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508           # 主监控视频评论的UP
-VIDEO_CHECK_INTERVAL = 21600      # 6小时同步一次最新视频
-HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
+VIDEO_CHECK_INTERVAL = 21600      
+HEARTBEAT_INTERVAL = 600          
 
-# 动态监控名单
-EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
-DYNAMIC_CHECK_INTERVAL = 30       # 动态检查间隔
+# 动态监控名单 (已添加新UID)
+EXTRA_DYNAMIC_UIDS = [
+    3546905852250875, 
+    3546961271589219, 
+    3546610447419885, 
+    285340365, 
+    3706948578969654
+]
+
+DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒（5分钟）
 # ==============================================
 
-# 【修改点】filemode='w' 确保每次启动都清空之前的日志
+# 确保每次启动清空旧日志
 logging.basicConfig(
     filename='bili_monitor.log',
     level=logging.INFO,
@@ -32,7 +39,7 @@ logging.basicConfig(
 )
 
 # ------------------------
-# Wbi 签名算法模块 (防风控核心)
+# Wbi 签名模块 (保留原始逻辑)
 # ------------------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
@@ -95,7 +102,7 @@ def wbi_request(url, params, header):
     return data
 
 # ------------------------
-# 基础功能模块
+# 基础辅助模块 (保留原始逻辑)
 # ------------------------
 def get_header():
     try:
@@ -150,13 +157,12 @@ def sync_latest_video(header):
         time.sleep(10)
     return None, None
 
+# ------------------------
+# 动态监控逻辑：修复正文提取 + 300秒时效性
+# ------------------------
 def init_extra_dynamics(header):
-    seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
-    return seen_dynamics
+    return {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
 
-# ------------------------
-# 优化后的动态监控模块
-# ------------------------
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     now_ts = time.time()
@@ -176,22 +182,22 @@ def check_new_dynamics(header, seen_dynamics):
             if not id_str or id_str in seen_dynamics[uid]:
                 continue
 
-            # 【修改点】300秒时效性校验
-            pub_ts = item.get("modules", {}).get("module_author", {}).get("pub_ts", 0)
+            # 1. 时效性校验
+            try:
+                pub_ts = float(item.get("modules", {}).get("module_author", {}).get("pub_ts", 0))
+            except: pub_ts = 0
+
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                # 如果动态太老，记录ID但并不报警
                 seen_dynamics[uid].add(id_str)
                 continue
 
             seen_dynamics[uid].add(id_str)
 
-            # 【修复点】更健壮的内容抓取逻辑
+            # 2. 内容提取修复
             dyn_text = ""
             try:
-                # 尝试从描述模块提取文本
                 dyn_text = item.get("modules", {}).get("module_dynamic", {}).get("desc", {}).get("text", "")
-            except:
-                pass
+            except: pass
 
             dyn_type = item.get("type")
             attach_str = ""
@@ -206,43 +212,29 @@ def check_new_dynamics(header, seen_dynamics):
                     attach_str = "🔄 转发了动态"
                 elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
                     attach_str = "🔴 开启了直播"
-            except: 
-                pass
+            except: pass
 
             final_desc = ""
-            if dyn_text: 
-                final_desc += f"【正文】:\n{dyn_text}\n"
-            if attach_str: 
-                final_desc += f"【附带】: {attach_str}"
-            if not final_desc: 
-                final_desc = "发布了新动态"
+            if dyn_text: final_desc += f"【正文】: {dyn_text}\n"
+            if attach_str: final_desc += f"【附带】: {attach_str}"
+            if not final_desc: final_desc = "发布了新动态"
 
             name = str(uid)
-            try: 
-                name = item["modules"]["module_author"]["name"]
-            except: 
-                pass
+            try: name = item["modules"]["module_author"]["name"]
+            except: pass
 
-            new_alerts.append({
-                "user": name,
-                "message": final_desc
-            })
-
-            # 日志记录截断正文以便查看
-            logging.info(f"成功抓取动态 - {name}: {final_desc.replace(chr(10), ' ')[:50]}...")
+            new_alerts.append({"user": name, "message": final_desc})
+            logging.info(f"成功抓取动态 - {name}: {final_desc.replace(chr(10), ' ')}")
 
         except Exception:
             pass
 
     if new_alerts:
-        logging.info(f"发现 {len(new_alerts)} 条最新有效动态！")
-        try: 
-            notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
-        except: 
-            pass
+        try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
+        except: pass
 
 # ------------------------
-# 主视频评论监控
+# 主视频评论监控逻辑 (零修改)
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list =[]
@@ -282,15 +274,13 @@ def start_monitoring(header):
     last_check = time.time()
     last_heartbeat = time.time()
     oid, title = sync_latest_video(header)
-    if not oid:
-        oid, title = None, "待获取视频"
-        
+    
     last_read_time = int(time.time())
     seen = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("程序启动成功：旧日志已清空，监控300秒内最新内容")
-
+    logging.info("程序启动成功：旧日志已清空，监控300秒内最新动态")
+    
     while True:
         try:
             current = time.time()
@@ -302,13 +292,10 @@ def start_monitoring(header):
                         last_read_time = new_last_read_time
                     if new_list:
                         new_list.sort(key=lambda x: x["ctime"])
-                        logging.info("发现 %d 条新主评论", len(new_list))
                         for item in new_list:
-                            logging.info(f"成功抓取评论 - {item['user']}: {item['message'][:30]}...")
-                        try: 
-                            notifier.send_webhook_notification(title, new_list)
-                        except: 
-                            pass
+                            logging.info(f"成功抓取评论 - {item['user']}: {item['message'][:50]}...")
+                        try: notifier.send_webhook_notification(title, new_list)
+                        except: pass
 
                 # 2. 动态监控
                 check_new_dynamics(header, seen_dynamics)
@@ -317,7 +304,7 @@ def start_monitoring(header):
                 if current - last_heartbeat >= HEARTBEAT_INTERVAL:
                     notifier.send_webhook_notification(
                         "监控心跳",
-                        [{"user": "系统", "message": f"程序运行正常\n当前监控: {title or '待获取'}"}]
+                        [{"user": "系统", "message": f"程序运行正常\n监控视频: {title or '待获取'}"}]
                     )
                     last_heartbeat = current
 
@@ -325,15 +312,13 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 定时更新视频AID
             if time.time() - last_check > VIDEO_CHECK_INTERVAL:
                 new_oid, new_title = sync_latest_video(header)
                 if new_oid and new_oid != oid:
                     oid, title = new_oid, new_title
-                    last_read_time = int(time.time())
-                    seen.clear()
+                    last_read_time = int(time.time()); seen.clear()
                 last_check = time.time()
-        except Exception:
+        except Exception as e:
             logging.error(traceback.format_exc())
             time.sleep(60)
 
