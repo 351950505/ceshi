@@ -31,7 +31,7 @@ logging.basicConfig(
 )
 
 # ------------------------
-# Wbi 签名算法模块 (防风控核心)
+# Wbi 签名算法模块
 # ------------------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
@@ -90,7 +90,7 @@ def wbi_request(url, params, header):
     return data
 
 # ------------------------
-# 基础辅助模块
+# 辅助与同步模块
 # ------------------------
 def get_header():
     try:
@@ -123,19 +123,18 @@ def sync_latest_video(header):
     return None, None
 
 # ------------------------
-# 动态轮询逻辑 (含缺失的 init 函数)
+# 动态雷达模块
 # ------------------------
 def init_extra_dynamics(header):
-    """初始化动态监控名单的 seen 列表"""
     seen = {}
     for uid in EXTRA_DYNAMIC_UIDS:
         seen[uid] = set()
-        # 预抓取当前最新的一条，防止程序启动时瞬间推送旧动态
         try:
             r = requests.get(f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={uid}", headers=header, timeout=10)
             data = r.json()
             items = data.get("data", {}).get("items", [])
             if items:
+                # 初始加载第一条ID，防止重启轰炸
                 seen[uid].add(items[0].get("id_str"))
         except: pass
     return seen
@@ -170,33 +169,29 @@ def check_new_dynamics(header, seen_dynamics):
 
             seen_dynamics[uid].add(id_str)
 
-            # --- 深度提取内容 ---
+            # 深度提取内容
             dyn_text = ""
             module_dyn = item.get("modules", {}).get("module_dynamic", {})
-            
             desc_node = module_dyn.get("desc")
             if desc_node and desc_node.get("text"):
                 dyn_text = desc_node["text"]
             
-            if not dyn_text and item.get("type") == "DYNAMIC_TYPE_FORWARD":
-                dyn_text = "转发了动态"
-
             major = module_dyn.get("major", {})
             attach_str = ""
             if major:
-                if major.get("archive"): # 视频
+                if major.get("archive"): 
                     arc = major["archive"]
-                    attach_str = f"🎥 视频：《{arc.get('title')}》\n简介：{arc.get('desc')[:50]}"
-                elif major.get("article"): # 专栏
+                    attach_str = f"🎥 视频：《{arc.get('title')}》"
+                elif major.get("article"): 
                     art = major["article"]
                     attach_str = f"📄 专栏：《{art.get('title')}》"
-                elif major.get("live_rcmd"): # 直播
+                elif major.get("live_rcmd"):
                     live = major["live_rcmd"]["content"]["live_play_info"]
                     attach_str = f"🔴 直播中：{live.get('title')}"
 
             final_desc = ""
             if dyn_text: final_desc += f"【正文】:\n{dyn_text}\n"
-            if attach_str: final_desc += f"【关联】:\n{attach_str}"
+            if attach_str: final_desc += f"【关联】: {attach_str}"
             if not final_desc: final_desc = "发布了新动态"
 
             name = str(uid)
@@ -204,7 +199,7 @@ def check_new_dynamics(header, seen_dynamics):
             except: pass
 
             new_alerts.append({"user": name, "message": final_desc})
-            logging.info(f"成功抓取动态 - {name}: {final_desc.replace(chr(10), ' ')}")
+            logging.info(f"动态抓取成功 - {name}: {final_desc.replace(chr(10), ' ')}")
 
         except Exception as e:
             logging.error(f"动态扫描异常 (UID:{uid}): {e}")
@@ -214,7 +209,7 @@ def check_new_dynamics(header, seen_dynamics):
         except: pass
 
 # ------------------------
-# 视频评论监控模块
+# 视频评论扫描模块
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -235,31 +230,34 @@ def scan_new_comments(oid, header, last_read_time, seen):
                 page_all_older = False
                 if rpid not in seen:
                     seen.add(rpid)
-                    logging.info(f"成功抓取评论: {r['member']['uname']}")
-                    new_list.append({"user": r["member']['uname'], "message": r["content"]["message"], "ctime": ctime})
+                    # --- 这里是之前报错的修复点 ---
+                    user_name = r["member"]["uname"]
+                    msg_content = r["content"]["message"]
+                    logging.info(f"成功抓取主评论: [{user_name}]")
+                    new_list.append({"user": user_name, "message": msg_content, "ctime": ctime})
         if page_all_older: break
         pn += 1
         time.sleep(random.uniform(0.5, 1.0))
     return new_list, max_ctime
 
 # ------------------------
-# 主循环控制
+# 主监控循环
 # ------------------------
 def start_monitoring(header):
     last_v_check = 0; last_hb = time.time(); last_d_check = 0
     oid, title = sync_latest_video(header)
     last_read_time = int(time.time()); seen_comments = set()
     
-    # 此处已补全 init 函数
+    # 初始化动态名单 (确保函数已定义在上方)
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("监控程序已启动 (深度内容修复 + 函数补全版)")
+    logging.info("B站监控程序已启动 (核心语法修复版)")
 
     while True:
         try:
             now = time.time()
             if is_work_time():
-                # 1. 扫描评论
+                # 1. 评论
                 if oid:
                     new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
                     if new_t > last_read_time: last_read_time = new_t
@@ -268,12 +266,12 @@ def start_monitoring(header):
                         try: notifier.send_webhook_notification(title, new_c)
                         except: pass
 
-                # 2. 扫描动态
+                # 2. 动态
                 check_new_dynamics(header, seen_dynamics)
 
                 # 3. 心跳
                 if now - last_hb >= HEARTBEAT_INTERVAL:
-                    notifier.send_webhook_notification("心跳", [{"user": "系统", "message": f"运行中\n监控: {title or '无'}"}])
+                    notifier.send_webhook_notification("心跳", [{"user": "系统", "message": f"运行正常 | 视频: {title or '无'}"}])
                     last_hb = now
 
                 time.sleep(random.uniform(10, 20))
@@ -288,5 +286,7 @@ def start_monitoring(header):
             logging.error(traceback.format_exc()); time.sleep(60)
 
 if __name__ == "__main__":
-    db.init_db(); h = get_header(); update_wbi_keys(h)
+    db.init_db()
+    h = get_header()
+    update_wbi_keys(h)
     start_monitoring(h)
