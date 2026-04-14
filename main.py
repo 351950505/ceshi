@@ -53,7 +53,7 @@ def init_logging():
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动")
+    logging.info("B站监控系统启动 (24小时全天候监控模式)")
     logging.info("=" * 60)
 
 
@@ -180,11 +180,8 @@ def get_header():
 
 
 def is_work_time():
-    now = datetime.datetime.now(
-        datetime.timezone.utc
-    ) + datetime.timedelta(hours=8)
-
-    return now.weekday() < 5 and 9 <= now.hour < 19
+    # 💥 已解除时间封印，强制 24H 全天候运行！
+    return True
 
 
 # ---------------- 视频 ----------------
@@ -247,7 +244,7 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态 ----------------
+# ---------------- 动态（带诊断与完整排版） ----------------
 def init_extra_dynamics(header):
     seen = {}
 
@@ -269,7 +266,7 @@ def init_extra_dynamics(header):
 
 
 def deep_find_text(obj):
-    """原版的兜底深度搜索，保持不变"""
+    """原版的兜底深度搜索"""
     result = []
 
     def walk(x):
@@ -326,7 +323,7 @@ def extract_dynamic_text(item):
         
         # ⚠️ 安全防御：防止内容无限长导致 Webhook 崩溃（放宽至 1500 字）
         if len(final_text) > 1500:
-            final_text = final_text[:1500] + "\n\n...(内容过长，为确保通知成功已安全截断)"
+            final_text = final_text[:1500] + "\n\n...(内容过长，为确保通知成功已安全保护截断)"
             
         return final_text
 
@@ -374,9 +371,10 @@ def check_new_dynamics(header, seen_dynamics):
 
                 name = author.get("name", str(uid))
 
-                # 💡 日志黑洞 1 修复：打印被“超时限制”抛弃的新动态
-                if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                    logging.info(f"⏭️ 忽略超时动态 [{name}] 动态ID:{id_str}, 距今 {int(now_ts - pub_ts)} 秒 (超过设定 {DYNAMIC_MAX_AGE}秒)")
+                # 记录被超时丢弃的动态，防止以后误以为是BUG
+                time_diff = now_ts - pub_ts
+                if time_diff > DYNAMIC_MAX_AGE:
+                    logging.info(f"⏭️ 忽略超时动态 [{name}] ID:{id_str}, 距今 {int(time_diff)} 秒 (设定的阈值为 {DYNAMIC_MAX_AGE}秒)")
                     continue
 
                 # 提取完整排版文本
@@ -392,12 +390,11 @@ def check_new_dynamics(header, seen_dynamics):
                     "message": final_msg
                 })
 
-                logging.info(f"✅ 抓取到新动态并加入推送队列 [{name}]:\n{final_msg}")
+                logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
 
                 break
 
         except Exception as e:
-            # 强化了报错打印
             logging.error(f"❌ 动态获取循环异常 {uid}: {e}\n{traceback.format_exc()}")
 
         time.sleep(random.uniform(1, 2))
@@ -410,7 +407,7 @@ def check_new_dynamics(header, seen_dynamics):
             )
             logging.info(f"🚀 成功发送 {len(alerts)} 条 Webhook 动态通知！")
         except Exception as e:
-            # 💡 日志黑洞 2 修复：去掉了 `pass`，彻底把发送失败的原因打出来
+            # 去掉原版的 pass，彻底把发送失败的报错打印出来
             logging.error(f"❌ Webhook 发送失败（可能是文本超长或含特殊字符）: {e}\n{traceback.format_exc()}")
 
     return has_new
@@ -484,7 +481,7 @@ def start_monitoring(header):
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("监控服务已启动")
+    logging.info("监控服务已启动，正在扫描新数据...")
 
     while True:
         try:
