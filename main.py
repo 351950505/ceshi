@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-import datetime
 import subprocess
 import random
 import logging
@@ -36,6 +35,7 @@ LOG_FILE = "bili_monitor.log"
 # ==============================================
 
 
+# ================= 日志 =================
 def init_logging():
     try:
         if os.path.exists(LOG_FILE):
@@ -53,43 +53,35 @@ def init_logging():
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (24小时全天候监控模式)")
+    logging.info("B站监控系统 DEBUG启动（仅打印模式）")
     logging.info("=" * 60)
 
 
+# ================= 网络 =================
 def safe_request(url, params, header, retries=3):
     h = header.copy()
     h["Connection"] = "close"
 
     for i in range(retries):
         try:
-            r = requests.get(
-                url,
-                headers=h,
-                params=params,
-                timeout=10
-            )
-
+            r = requests.get(url, headers=h, params=params, timeout=10)
             txt = r.text.strip()
 
             if not txt:
-                time.sleep(2)
+                time.sleep(1)
                 continue
 
             return r.json()
 
-        except:
-            time.sleep(2 + i)
+        except Exception as e:
+            logging.warning(f"请求失败 retry={i}: {e}")
+            time.sleep(1 + i)
 
     return {"code": -500}
 
 
-# ---------------- WBI ----------------
-WBI_KEYS = {
-    "img_key": "",
-    "sub_key": "",
-    "last_update": 0
-}
+# ================= WBI（原样保留） =================
+WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 
 mixinKeyEncTab = [
     46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
@@ -98,19 +90,15 @@ mixinKeyEncTab = [
     22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52
 ]
 
-
 def getMixinKey(orig):
     return "".join([orig[i] for i in mixinKeyEncTab])[:32]
 
-
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
-
     params["wts"] = round(time.time())
     params = dict(sorted(params.items()))
 
     filtered = {}
-
     for k, v in params.items():
         v = str(v)
         for c in "!'()*":
@@ -139,36 +127,26 @@ def update_wbi_keys(header):
             WBI_KEYS["sub_key"] = img["sub_url"].rsplit("/", 1)[1].split(".")[0]
             WBI_KEYS["last_update"] = time.time()
 
-            logging.info("WBI密钥已更新")
-
-    except:
-        pass
+            logging.info("WBI更新成功")
+    except Exception as e:
+        logging.error(f"WBI更新失败: {e}")
 
 
 def wbi_request(url, params, header):
-    if (
-        not WBI_KEYS["img_key"]
-        or time.time() - WBI_KEYS["last_update"] > 21600
-    ):
+    if not WBI_KEYS["img_key"] or time.time() - WBI_KEYS["last_update"] > 21600:
         update_wbi_keys(header)
 
-    signed = encWbi(
-        params.copy(),
-        WBI_KEYS["img_key"],
-        WBI_KEYS["sub_key"]
-    )
-
+    signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     return safe_request(url, signed, header)
 
 
-# ---------------- 基础 ----------------
+# ================= header =================
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
     except:
         subprocess.run([sys.executable, "login_bilibili.py"])
-
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
 
@@ -180,11 +158,10 @@ def get_header():
 
 
 def is_work_time():
-    # 💥 已解除时间封印，强制 24H 全天候运行！
     return True
 
 
-# ---------------- 视频 ----------------
+# ================= 视频（保留） =================
 def get_latest_video(header):
     data = safe_request(
         "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
@@ -215,17 +192,13 @@ def get_video_info(bv, header):
     )
 
     if data.get("code") == 0:
-        return (
-            str(data["data"]["aid"]),
-            data["data"]["title"]
-        )
+        return str(data["data"]["aid"]), data["data"]["title"]
 
     return None, None
 
 
 def sync_latest_video(header):
     bv = get_latest_video(header)
-
     if not bv:
         return None, None
 
@@ -244,37 +217,15 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（带诊断与完整排版） ----------------
-def init_extra_dynamics(header):
-    seen = {}
-
-    for uid in EXTRA_DYNAMIC_UIDS:
-        seen[uid] = set()
-
-        data = safe_request(
-            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-            {"host_mid": uid},
-            header
-        )
-
-        if data.get("code") == 0:
-            for item in (data.get("data") or {}).get("items", []):
-                if item.get("id_str"):
-                    seen[uid].add(item["id_str"])
-
-    return seen
-
-
+# ================= 动态 DEBUG核心 =================
 def deep_find_text(obj):
-    """原版的兜底深度搜索"""
     result = []
 
     def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
-                if k in ["text", "content", "desc", "title", "words"]:
-                    if isinstance(v, str) and v.strip():
-                        result.append(v.strip())
+                if isinstance(v, str) and k in ["text", "content", "desc", "title", "words"]:
+                    result.append(v)
                 walk(v)
         elif isinstance(x, list):
             for i in x:
@@ -282,130 +233,95 @@ def deep_find_text(obj):
 
     walk(obj)
 
-    uniq = []
-    for x in result:
-        if x not in uniq:
-            uniq.append(x)
-
-    return " ".join(uniq).strip()
+    return " ".join(list(dict.fromkeys(result)))
 
 
 def extract_dynamic_text(item):
-    """安全增强版（多结构兼容 + 全日志 + 零崩溃）"""
     try:
         id_str = item.get("id_str", "unknown")
-        logging.info(f"🧩 动态解析开始 ID:{id_str}")
 
-        modules = item.get("modules") or {}
-        dyn = modules.get("module_dynamic") or {}
+        logging.info("=" * 80)
+        logging.info(f"🔍 解析动态 ID: {id_str}")
 
-        results = []
-
-        # ========== 1. desc.text（最高优先级，最稳定）==========
+        logging.info("📦 FULL ITEM DUMP:")
         try:
-            desc = dyn.get("desc") or {}
-            if isinstance(desc, dict):
-                text = desc.get("text")
-                if text:
-                    results.append(str(text))
-                    logging.info("✅ 命中 desc.text")
-        except Exception as e:
-            logging.warning(f"desc.text解析失败: {e}")
+            logging.info(json.dumps(item, ensure_ascii=False, indent=2)[:4000])
+        except:
+            logging.info(str(item)[:2000])
 
-        # ========== 2. rich_text_nodes ==========
+        modules = item.get("modules")
+        logging.info(f"modules: {type(modules)}")
+
+        if not modules:
+            return "【DEBUG】modules为空"
+
+        dyn = modules.get("module_dynamic") if isinstance(modules, dict) else None
+        logging.info(f"module_dynamic: {str(dyn)[:500]}")
+
+        content = []
+
+        # rich nodes
         try:
-            desc = dyn.get("desc") or {}
-            nodes = desc.get("rich_text_nodes") if isinstance(desc, dict) else None
+            rich = None
+            if isinstance(dyn, dict):
+                desc = dyn.get("desc")
+                if isinstance(desc, dict):
+                    rich = desc.get("rich_text_nodes")
 
-            if not nodes:
-                nodes = dyn.get("rich_text_nodes")
+            logging.info(f"rich_nodes: {rich}")
 
-            if isinstance(nodes, list):
-                tmp = []
-                for n in nodes:
+            if isinstance(rich, list):
+                for n in rich:
                     if isinstance(n, dict):
                         t = n.get("text") or n.get("orig_text")
                         if t:
-                            tmp.append(str(t))
-
-                if tmp:
-                    results.append("\n".join(tmp))
-                    logging.info(f"✅ rich_text_nodes 命中 {len(tmp)}段")
+                            content.append(t)
         except Exception as e:
-            logging.warning(f"rich_text_nodes解析失败: {e}")
+            logging.error(f"rich解析失败: {e}")
 
-        # ========== 3. major.opus（新版图文）==========
+        # major
         try:
-            major = dyn.get("major") or {}
-            if major.get("type") == "MAJOR_TYPE_OPUS":
-                opus = major.get("opus") or {}
+            if isinstance(dyn, dict):
+                major = dyn.get("major")
+                logging.info(f"major: {str(major)[:300]}")
 
-                for path in ["summary", "desc", "content"]:
-                    v = opus.get(path)
-                    if isinstance(v, dict):
-                        t = v.get("text") or v.get("content")
-                        if t:
-                            results.append(str(t))
+                if isinstance(major, dict):
+                    for k in ["opus", "draw", "archive"]:
+                        if k in major:
+                            blk = major[k]
+                            logging.info(f"hit major.{k}")
 
-                # 兼容裸字段
-                if isinstance(opus.get("content"), str):
-                    results.append(opus["content"])
+                            if isinstance(blk, dict):
+                                for path in [("desc", "text"), ("desc", "content"), ("title",)]:
+                                    cur = blk
+                                    for p in path:
+                                        if isinstance(cur, dict):
+                                            cur = cur.get(p)
+                                        else:
+                                            cur = None
 
-                logging.info("✅ OPUS结构解析完成")
+                                    if isinstance(cur, str):
+                                        content.append(cur)
         except Exception as e:
-            logging.warning(f"OPUS解析失败: {e}")
+            logging.error(f"major解析失败: {e}")
 
-        # ========== 4. major.draw（图片动态）==========
-        try:
-            major = dyn.get("major") or {}
-            if major.get("type") == "MAJOR_TYPE_DRAW":
-                draw = major.get("draw") or {}
-                items = draw.get("items") or []
+        if not content:
+            logging.warning("fallback deep_find_text")
+            content.append(deep_find_text(dyn))
 
-                tmp = []
-                for it in items:
-                    if isinstance(it, dict):
-                        d = it.get("desc")
-                        if d:
-                            tmp.append(str(d))
+        if not content:
+            return "【DEBUG】解析失败"
 
-                if tmp:
-                    results.append("\n".join(tmp))
-                    logging.info(f"✅ DRAW解析 {len(tmp)}条")
-        except Exception as e:
-            logging.warning(f"DRAW解析失败: {e}")
-
-        # ========== 5. 兜底 deep scan ==========
-        if not results:
-            try:
-                fallback = deep_find_text(dyn)
-                if fallback:
-                    results.append(fallback)
-                    logging.info("🟡 deep_find_text兜底命中")
-            except Exception as e:
-                logging.warning(f"deep_find_text失败: {e}")
-
-        # ========== 6. 最终兜底 ==========
-        if not results:
-            logging.error(f"❌ 完全解析失败 ID:{id_str}")
-            return "发布了新动态"
-
-        final_text = "\n\n".join(results).strip()
-
-        if len(final_text) > 1800:
-            final_text = final_text[:1800] + "\n\n...(已截断)"
-
-        logging.info(f"🎯 动态解析成功 ID:{id_str} 长度:{len(final_text)}")
-        return final_text
+        return "\n\n".join(content)
 
     except Exception as e:
-        logging.error(f"💥 extract_dynamic_text崩溃 ID:{item.get('id_str')}: {e}\n{traceback.format_exc()}")
-        return "发布了新动态 (异常兜底)"
+        logging.error(traceback.format_exc())
+        return "【DEBUG】异常"
 
-def check_new_dynamics(header, seen_dynamics):
-    alerts = []
-    has_new = False
-    now_ts = time.time()
+
+# ================= 动态扫描（不推送版） =================
+def check_new_dynamics(header, seen):
+    logging.info("🔁 动态扫描（DEBUG无推送）")
 
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
@@ -422,208 +338,50 @@ def check_new_dynamics(header, seen_dynamics):
 
             for item in items:
                 id_str = item.get("id_str")
-
                 if not id_str:
                     continue
 
-                if id_str in seen_dynamics[uid]:
+                if id_str in seen[uid]:
                     continue
 
-                seen_dynamics[uid].add(id_str)
+                seen[uid].add(id_str)
 
-                modules = item.get("modules") or {}
-                author = modules.get("module_author") or {}
+                logging.info(f"🆕 新动态 UID={uid} ID={id_str}")
 
-                try:
-                    pub_ts = float(author.get("pub_ts", 0))
-                except:
-                    pub_ts = 0
-
-                name = author.get("name", str(uid))
-
-                # 记录被超时丢弃的动态，防止以后误以为是BUG
-                time_diff = now_ts - pub_ts
-                if time_diff > DYNAMIC_MAX_AGE:
-                    logging.info(f"⏭️ 忽略超时动态 [{name}] ID:{id_str}, 距今 {int(time_diff)} 秒 (设定的阈值为 {DYNAMIC_MAX_AGE}秒)")
-                    continue
-
-                # 提取完整排版文本
                 text = extract_dynamic_text(item)
-                
-                # 追加传送门链接
-                final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"
 
-                has_new = True
-
-                alerts.append({
-                    "user": name,
-                    "message": final_msg
-                })
-
-                logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
-
-                break
+                logging.info("======== 动态 BEGIN ========")
+                logging.info(text)
+                logging.info("======== 动态 END ========")
 
         except Exception as e:
-            logging.error(f"❌ 动态获取循环异常 {uid}: {e}\n{traceback.format_exc()}")
+            logging.error(traceback.format_exc())
 
-        time.sleep(random.uniform(1, 2))
+        time.sleep(1)
 
-    if alerts:
-        try:
-            notifier.send_webhook_notification(
-                "💡 特别关注UP主发布新内容",
-                alerts
-            )
-            logging.info(f"🚀 成功发送 {len(alerts)} 条 Webhook 动态通知！")
-        except Exception as e:
-            # 去掉原版的 pass，彻底把发送失败的报错打印出来
-            logging.error(f"❌ Webhook 发送失败（可能是文本超长或含特殊字符）: {e}\n{traceback.format_exc()}")
-
-    return has_new
+    return False
 
 
-# ---------------- 评论 ----------------
-def scan_new_comments(oid, header, last_read_time, seen):
-    new_list = []
-    max_ctime = last_read_time
-    safe_time = last_read_time - 300
-
-    pn = 1
-
-    while pn <= 10:
-        data = wbi_request(
-            "https://api.bilibili.com/x/v2/reply",
-            {
-                "oid": oid,
-                "type": 1,
-                "sort": 0,
-                "pn": pn,
-                "ps": 20
-            },
-            header
-        )
-
-        replies = (data.get("data") or {}).get("replies") or []
-
-        if not replies:
-            break
-
-        page_old = True
-
-        for r in replies:
-            rpid = r["rpid_str"]
-            ctime = r["ctime"]
-
-            max_ctime = max(max_ctime, ctime)
-
-            if ctime > safe_time:
-                page_old = False
-
-                if rpid not in seen:
-                    seen.add(rpid)
-
-                    new_list.append({
-                        "user": r["member"]["uname"],
-                        "message": r["content"]["message"],
-                        "ctime": ctime
-                    })
-
-        if page_old:
-            break
-
-        pn += 1
-        time.sleep(random.uniform(0.5, 1))
-
-    return new_list, max_ctime
-
-
-# ---------------- 主循环 ----------------
+# ================= 主循环 =================
 def start_monitoring(header):
-    last_v_check = 0
-    last_hb = time.time()
-    last_d_check = 0
-    burst_end = 0
+    seen = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
 
-    oid, title = sync_latest_video(header)
-
-    last_read_time = int(time.time())
-    seen_comments = set()
-    seen_dynamics = init_extra_dynamics(header)
-
-    logging.info("监控服务已启动，正在扫描新数据...")
+    logging.info("DEBUG监控启动")
 
     while True:
         try:
-            now = time.time()
-
             if is_work_time():
-
-                if oid:
-                    new_c, new_t = scan_new_comments(
-                        oid,
-                        header,
-                        last_read_time,
-                        seen_comments
-                    )
-
-                    if new_t > last_read_time:
-                        last_read_time = new_t
-
-                    if new_c:
-                        new_c.sort(key=lambda x: x["ctime"])
-                        try:
-                            notifier.send_webhook_notification(
-                                title,
-                                new_c
-                            )
-                        except Exception as e:
-                            logging.error(f"评论通知发送失败: {e}\n{traceback.format_exc()}")
-
-                interval = (
-                    DYNAMIC_BURST_INTERVAL
-                    if now < burst_end
-                    else DYNAMIC_CHECK_INTERVAL
-                )
-
-                if now - last_d_check >= interval:
-                    if check_new_dynamics(
-                        header,
-                        seen_dynamics
-                    ):
-                        burst_end = now + DYNAMIC_BURST_DURATION
-
-                    last_d_check = now
-
-                if now - last_hb >= HEARTBEAT_INTERVAL:
-                    try:
-                        notifier.send_webhook_notification(
-                            "心跳",
-                            [{
-                                "user": "系统",
-                                "message": "正常运行中"
-                            }]
-                        )
-                    except Exception:
-                        pass
-                    last_hb = now
-
-                time.sleep(random.uniform(10, 15))
-
+                check_new_dynamics(header, seen)
+                time.sleep(10)
             else:
                 time.sleep(30)
-
-            if now - last_v_check > VIDEO_CHECK_INTERVAL:
-                res = sync_latest_video(header)
-                if res:
-                    oid, title = res
-                last_v_check = now
 
         except Exception:
             logging.error(traceback.format_exc())
             time.sleep(60)
 
 
+# ================= main =================
 if __name__ == "__main__":
     init_logging()
     db.init_db()
