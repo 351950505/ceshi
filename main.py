@@ -18,7 +18,6 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 600
 
-# 动态监控名单（UID）
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875,
     3546961271589219,
@@ -27,18 +26,17 @@ EXTRA_DYNAMIC_UIDS = [
     3706948578969654
 ]
 
-DYNAMIC_CHECK_INTERVAL = 35
+DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_BURST_INTERVAL = 10
 DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
 
 LOG_FILE = "bili_monitor.log"
-
 # ==============================================
 
 
 # ------------------------
-# 日志初始化（物理清空）
+# 日志初始化
 # ------------------------
 def init_logging():
     try:
@@ -56,23 +54,23 @@ def init_logging():
         filemode="w"
     )
 
-    logging.info("=" * 50)
-    logging.info("B站全能监控启动")
-    logging.info("=" * 50)
+    logging.info("=" * 60)
+    logging.info("B站监控系统启动")
+    logging.info("=" * 60)
 
 
 # ------------------------
 # 安全请求
 # ------------------------
 def safe_request(url, params, header, retries=3):
-    safe_header = header.copy()
-    safe_header["Connection"] = "close"
+    h = header.copy()
+    h["Connection"] = "close"
 
     for i in range(retries):
         try:
             r = requests.get(
                 url,
-                headers=safe_header,
+                headers=h,
                 params=params,
                 timeout=10
             )
@@ -92,7 +90,7 @@ def safe_request(url, params, header, retries=3):
 
 
 # ------------------------
-# WBI签名模块
+# WBI签名
 # ------------------------
 WBI_KEYS = {
     "img_key": "",
@@ -108,11 +106,11 @@ mixinKeyEncTab = [
 ]
 
 
-def getMixinKey(orig: str):
+def getMixinKey(orig):
     return "".join([orig[i] for i in mixinKeyEncTab])[:32]
 
 
-def encWbi(params: dict, img_key: str, sub_key: str):
+def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
 
     params["wts"] = round(time.time())
@@ -142,13 +140,13 @@ def update_wbi_keys(header):
         )
 
         if data.get("code") == 0:
-            wbi = data["data"]["wbi_img"]
+            img = data["data"]["wbi_img"]
 
-            WBI_KEYS["img_key"] = wbi["img_url"].rsplit("/", 1)[1].split(".")[0]
-            WBI_KEYS["sub_key"] = wbi["sub_url"].rsplit("/", 1)[1].split(".")[0]
+            WBI_KEYS["img_key"] = img["img_url"].rsplit("/", 1)[1].split(".")[0]
+            WBI_KEYS["sub_key"] = img["sub_url"].rsplit("/", 1)[1].split(".")[0]
             WBI_KEYS["last_update"] = time.time()
 
-            logging.info("WBI密钥更新成功")
+            logging.info("WBI密钥已更新")
 
     except:
         pass
@@ -204,7 +202,7 @@ def get_header():
 
 
 # ------------------------
-# 工作时间
+# 时间控制
 # ------------------------
 def is_work_time():
     now = datetime.datetime.now(
@@ -215,8 +213,30 @@ def is_work_time():
 
 
 # ------------------------
-# 视频监控
+# 视频模块
 # ------------------------
+def get_latest_video(header):
+    data = safe_request(
+        "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+        {"host_mid": TARGET_UID},
+        header
+    )
+
+    if data.get("code") != 0:
+        return None
+
+    items = (data.get("data") or {}).get("items", [])
+
+    for item in items:
+        try:
+            if item.get("type") == "DYNAMIC_TYPE_AV":
+                return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
+        except:
+            pass
+
+    return None
+
+
 def get_video_info(bv, header):
     data = safe_request(
         f"https://api.bilibili.com/x/web-interface/view?bvid={bv}",
@@ -233,28 +253,8 @@ def get_video_info(bv, header):
     return None, None
 
 
-def get_latest_video(header, target_uid):
-    data = safe_request(
-        "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-        {"host_mid": target_uid},
-        header
-    )
-
-    if data.get("code") == 0:
-        items = (data.get("data") or {}).get("items", [])
-
-        for item in items:
-            try:
-                if item.get("type") == "DYNAMIC_TYPE_AV":
-                    return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
-            except:
-                pass
-
-    return None
-
-
 def sync_latest_video(header):
-    bv = get_latest_video(header, TARGET_UID)
+    bv = get_latest_video(header)
 
     if not bv:
         return None, None
@@ -276,15 +276,13 @@ def sync_latest_video(header):
 
 
 # ------------------------
-# 动态初始化
+# 动态模块
 # ------------------------
 def init_extra_dynamics(header):
     seen = {}
-    active = {}
 
     for uid in EXTRA_DYNAMIC_UIDS:
         seen[uid] = set()
-        active[uid] = {}
 
         data = safe_request(
             "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
@@ -299,14 +297,60 @@ def init_extra_dynamics(header):
                 if item.get("id_str"):
                     seen[uid].add(item["id_str"])
 
-    return seen, active
+    return seen
 
 
-# ------------------------
-# 动态监控（增强版）
-# ------------------------
-def check_new_dynamics(header, seen_dynamics, active_dynamics):
-    new_alerts = []
+def extract_dynamic_text(item):
+    modules = item.get("modules") or {}
+    dyn = modules.get("module_dynamic") or {}
+    major = dyn.get("major") or {}
+
+    text = ""
+
+    desc = dyn.get("desc") or {}
+    text = desc.get("text", "").strip()
+
+    if not text:
+        nodes = desc.get("rich_text_nodes") or []
+        arr = []
+
+        for n in nodes:
+            t = n.get("text", "")
+            if t:
+                arr.append(t)
+
+        text = "".join(arr).strip()
+
+    if not text:
+        opus = major.get("opus") or {}
+
+        text = (
+            opus.get("summary", {})
+            .get("text", "")
+            .strip()
+        )
+
+    if not text:
+        try:
+            paras = opus.get("paragraphs") or []
+            arr = []
+
+            for p in paras:
+                for n in p.get("nodes") or []:
+                    w = n.get("word") or {}
+                    words = w.get("words", "")
+                    if words:
+                        arr.append(words)
+
+            text = "".join(arr).strip()
+        except:
+            pass
+
+    return text
+
+
+def check_new_dynamics(header, seen_dynamics):
+    alerts = []
     has_new = False
     now_ts = time.time()
 
@@ -318,108 +362,63 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
                 header
             )
 
-            code = data.get("code", -1)
-            logging.info(f"动态检测 UID={uid} code={code}")
-
-            if code != 0:
+            if data.get("code") != 0:
                 continue
 
-            inner = data.get("data") or {}
-
             items = (
-                inner.get("items")
-                or inner.get("cards")
-                or inner.get("list")
+                (data.get("data") or {}).get("items")
                 or []
             )
 
-            if not isinstance(items, list):
-                continue
-
             for item in items:
+                id_str = item.get("id_str")
+
+                if not id_str:
+                    continue
+
+                if id_str in seen_dynamics[uid]:
+                    continue
+
+                seen_dynamics[uid].add(id_str)
+
+                modules = item.get("modules") or {}
+                author = modules.get("module_author") or {}
+
                 try:
-                    id_str = item.get("id_str")
+                    pub_ts = float(author.get("pub_ts", 0))
+                except:
+                    pub_ts = 0
 
-                    if not id_str:
-                        continue
+                if now_ts - pub_ts > DYNAMIC_MAX_AGE:
+                    continue
 
-                    if id_str in seen_dynamics[uid]:
-                        continue
+                has_new = True
 
-                    seen_dynamics[uid].add(id_str)
+                name = author.get("name", str(uid))
+                text = extract_dynamic_text(item)
 
-                    modules = item.get("modules") or {}
-                    author = modules.get("module_author") or {}
-                    dyn = modules.get("module_dynamic") or {}
-                    major = dyn.get("major") or {}
+                if not text:
+                    text = "发布了新动态"
 
-                    try:
-                        pub_ts = float(author.get("pub_ts", 0))
-                    except:
-                        pub_ts = 0
+                alerts.append({
+                    "user": name,
+                    "message": text[:500]
+                })
 
-                    if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                        continue
+                logging.info(f"动态抓取 [{name}] {text[:80]}")
 
-                    has_new = True
-
-                    name = author.get("name", str(uid))
-
-                    content = ""
-
-                    desc = dyn.get("desc") or {}
-                    content = desc.get("text", "")
-
-                    if not content:
-                        opus = major.get("opus") or {}
-                        content = (
-                            opus.get("summary", {})
-                            .get("text", "")
-                        )
-
-                    attach = ""
-
-                    archive = major.get("archive") or {}
-                    if archive:
-                        attach = f"视频：{archive.get('title','')}"
-
-                    final_msg = content.strip()
-
-                    if attach:
-                        final_msg += f"\n{attach}"
-
-                    if not final_msg:
-                        final_msg = "发布了新动态"
-
-                    new_alerts.append({
-                        "user": name,
-                        "message": final_msg[:300]
-                    })
-
-                    logging.info(f"抓到动态 [{name}]")
-
-                    basic = item.get("basic") or {}
-
-                    if basic.get("comment_id_str"):
-                        active_dynamics[uid][id_str] = {
-                            "oid": basic["comment_id_str"],
-                            "type": basic["comment_type"],
-                            "ctime": time.time()
-                        }
-
-                except Exception as e:
-                    logging.error(f"单条动态解析失败:{e}")
+                break
 
         except Exception as e:
-            logging.error(f"动态UID异常 {uid}: {e}")
+            logging.error(f"动态检测异常 {uid}: {e}")
 
-        time.sleep(random.uniform(1.5, 3))
+        time.sleep(random.uniform(1, 2))
 
-    if new_alerts:
+    if alerts:
         try:
             notifier.send_webhook_notification(
-                "💡 特别关注UP发布新内容",
-                new_alerts
+                "💡 特别关注UP主发布新内容",
+                alerts
             )
         except:
             pass
@@ -428,77 +427,12 @@ def check_new_dynamics(header, seen_dynamics, active_dynamics):
 
 
 # ------------------------
-# 动态补充评论
-# ------------------------
-def check_dynamic_up_replies(header, active_dynamics, seen_replies):
-    alerts = []
-    now = time.time()
-
-    for uid, dyns in list(active_dynamics.items()):
-        for did, info in list(dyns.items()):
-            if now - info["ctime"] > 86400:
-                del dyns[did]
-                continue
-
-            data = wbi_request(
-                "https://api.bilibili.com/x/v2/reply",
-                {
-                    "oid": info["oid"],
-                    "type": info["type"],
-                    "sort": 0,
-                    "pn": 1,
-                    "ps": 20
-                },
-                header
-            )
-
-            if data.get("code") != 0:
-                continue
-
-            inner = data.get("data") or {}
-            replies = inner.get("replies") or []
-
-            top = (inner.get("upper") or {}).get("top")
-            if top:
-                replies.append(top)
-
-            for r in replies:
-                try:
-                    if str((r.get("member") or {}).get("mid")) != str(uid):
-                        continue
-
-                    rpid = r.get("rpid_str")
-
-                    if rpid in seen_replies:
-                        continue
-
-                    seen_replies.add(rpid)
-
-                    alerts.append({
-                        "user": r["member"]["uname"],
-                        "message": "💬 UP主动态补充：\n" + r["content"]["message"]
-                    })
-
-                except:
-                    pass
-
-    if alerts:
-        try:
-            notifier.send_webhook_notification(
-                "🔔 UP主本尊动态出没",
-                alerts
-            )
-        except:
-            pass
-
-
-# ------------------------
-# 评论监控（零修改）
+# 评论监控（保留原逻辑）
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
-    safe_read_time = last_read_time - 300
+    safe_time = last_read_time - 300
 
     pn = 1
 
@@ -528,7 +462,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
 
             max_ctime = max(max_ctime, ctime)
 
-            if ctime > safe_read_time:
+            if ctime > safe_time:
                 page_old = False
 
                 if rpid not in seen:
@@ -563,10 +497,9 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
 
-    seen_dyns, active_dyns = init_extra_dynamics(header)
-    seen_dyn_replies = set()
+    seen_dynamics = init_extra_dynamics(header)
 
-    logging.info(f"启动成功 当前视频：{title}")
+    logging.info("监控服务已启动")
 
     while True:
         try:
@@ -574,7 +507,7 @@ def start_monitoring(header):
 
             if is_work_time():
 
-                # 评论监控
+                # 评论
                 if oid:
                     new_c, new_t = scan_new_comments(
                         oid,
@@ -594,7 +527,7 @@ def start_monitoring(header):
                             new_c
                         )
 
-                # 动态监控
+                # 动态
                 interval = (
                     DYNAMIC_BURST_INTERVAL
                     if now < burst_end
@@ -602,21 +535,11 @@ def start_monitoring(header):
                 )
 
                 if now - last_d_check >= interval:
-
-                    logging.info("动态监控运行中")
-
                     if check_new_dynamics(
                         header,
-                        seen_dyns,
-                        active_dyns
+                        seen_dynamics
                     ):
                         burst_end = now + DYNAMIC_BURST_DURATION
-
-                    check_dynamic_up_replies(
-                        header,
-                        active_dyns,
-                        seen_dyn_replies
-                    )
 
                     last_d_check = now
 
@@ -640,7 +563,7 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 视频刷新
+            # 视频同步
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
                 res = sync_latest_video(header)
 
@@ -662,7 +585,6 @@ if __name__ == "__main__":
     db.init_db()
 
     h = get_header()
-
     update_wbi_keys(h)
 
     start_monitoring(h)
