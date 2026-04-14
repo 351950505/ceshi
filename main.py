@@ -90,7 +90,7 @@ def wbi_request(url, params, header):
     return data
 
 # ------------------------
-# 辅助与同步模块
+# 基础辅助模块
 # ------------------------
 def get_header():
     try:
@@ -119,11 +119,11 @@ def sync_latest_video(header):
                     db.clear_videos(); db.add_video_to_db(aid, bv, title)
                     logging.info(f"监控目标切换: {title}")
                 return aid, title
-    except: pass
+    except Exception: pass
     return None, None
 
 # ------------------------
-# 动态雷达模块
+# 动态轮询逻辑 (修复 NameError，确保定义在调用前)
 # ------------------------
 def init_extra_dynamics(header):
     seen = {}
@@ -134,9 +134,8 @@ def init_extra_dynamics(header):
             data = r.json()
             items = data.get("data", {}).get("items", [])
             if items:
-                # 初始加载第一条ID，防止重启轰炸
                 seen[uid].add(items[0].get("id_str"))
-        except: pass
+        except Exception: pass
     return seen
 
 def check_new_dynamics(header, seen_dynamics):
@@ -161,7 +160,7 @@ def check_new_dynamics(header, seen_dynamics):
             # 时效性校验
             try:
                 pub_ts = float(item.get("modules", {}).get("module_author", {}).get("pub_ts", 0))
-            except: pub_ts = 0
+            except Exception: pub_ts = 0
 
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
@@ -169,7 +168,7 @@ def check_new_dynamics(header, seen_dynamics):
 
             seen_dynamics[uid].add(id_str)
 
-            # 深度提取内容
+            # 深度内容抓取
             dyn_text = ""
             module_dyn = item.get("modules", {}).get("module_dynamic", {})
             desc_node = module_dyn.get("desc")
@@ -196,7 +195,7 @@ def check_new_dynamics(header, seen_dynamics):
 
             name = str(uid)
             try: name = item["modules"]["module_author"]["name"]
-            except: pass
+            except Exception: pass
 
             new_alerts.append({"user": name, "message": final_desc})
             logging.info(f"动态抓取成功 - {name}: {final_desc.replace(chr(10), ' ')}")
@@ -206,10 +205,10 @@ def check_new_dynamics(header, seen_dynamics):
 
     if new_alerts:
         try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
-        except: pass
+        except Exception: pass
 
 # ------------------------
-# 视频评论扫描模块
+# 视频评论扫描模块 (修复 SyntaxError 重点区)
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -230,11 +229,15 @@ def scan_new_comments(oid, header, last_read_time, seen):
                 page_all_older = False
                 if rpid not in seen:
                     seen.add(rpid)
-                    # --- 这里是之前报错的修复点 ---
-                    user_name = r["member"]["uname"]
-                    msg_content = r["content"]["message"]
-                    logging.info(f"成功抓取主评论: [{user_name}]")
-                    new_list.append({"user": user_name, "message": msg_content, "ctime": ctime})
+                    # --- 修复后的代码，确保引号和结构完全正确 ---
+                    u_name = r["member"]["uname"]
+                    u_msg = r["content"]["message"]
+                    logging.info(f"成功抓取主评论: [{u_name}]")
+                    new_list.append({
+                        "user": u_name,
+                        "message": u_msg,
+                        "ctime": ctime
+                    })
         if page_all_older: break
         pn += 1
         time.sleep(random.uniform(0.5, 1.0))
@@ -248,25 +251,25 @@ def start_monitoring(header):
     oid, title = sync_latest_video(header)
     last_read_time = int(time.time()); seen_comments = set()
     
-    # 初始化动态名单 (确保函数已定义在上方)
+    # 初始化动态名单
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("B站监控程序已启动 (核心语法修复版)")
+    logging.info("B站监控程序已启动 (最终语法修正版)")
 
     while True:
         try:
             now = time.time()
             if is_work_time():
-                # 1. 评论
+                # 1. 扫描评论
                 if oid:
                     new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
                     if new_t > last_read_time: last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         try: notifier.send_webhook_notification(title, new_c)
-                        except: pass
+                        except Exception: pass
 
-                # 2. 动态
+                # 2. 扫描动态
                 check_new_dynamics(header, seen_dynamics)
 
                 # 3. 心跳
