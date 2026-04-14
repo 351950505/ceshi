@@ -247,7 +247,7 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（全新升级版） ----------------
+# ---------------- 动态 ----------------
 def init_extra_dynamics(header):
     seen = {}
 
@@ -268,112 +268,46 @@ def init_extra_dynamics(header):
     return seen
 
 
+def deep_find_text(obj):
+    result = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ["text", "content", "desc", "title", "words"]:
+                    if isinstance(v, str) and v.strip():
+                        result.append(v.strip())
+                walk(v)
+
+        elif isinstance(x, list):
+            for i in x:
+                walk(i)
+
+    walk(obj)
+
+    uniq = []
+    for x in result:
+        if x not in uniq:
+            uniq.append(x)
+
+    return " ".join(uniq).strip()
+
+
 def extract_dynamic_text(item):
-    """
-    终极版动态解析器：支持富文本、Opus图文、专栏、视频、转发、None Safe兜底
-    """
     try:
-        content_list = []
-        
-        # 1. 识别是否为转发 (Forward)
-        dyn_type = item.get("type", "")
-        if dyn_type == "DYNAMIC_TYPE_FORWARD":
-            content_list.append("【🔄 转发动态】")
+        modules = item.get("modules") or {}
+        dyn = modules.get("module_dynamic") or {}
 
-        modules = item.get("modules", {})
-        module_dynamic = modules.get("module_dynamic", {})
-        
-        # 2. 提取外层正文 (desc) - 优先使用富文本节点保证完整性
-        desc = module_dynamic.get("desc", {})
-        rich_nodes = desc.get("rich_text_nodes", [])
-        
-        if rich_nodes:
-            node_texts = []
-            for node in rich_nodes:
-                # 安全提取节点文字（包含普通文本、@、表情文字表达等）
-                node_texts.append(str(node.get("text", "")))
-            if node_texts:
-                content_list.append("".join(node_texts).strip())
-        else:
-            # Fallback：没有富文本节点则取基础 text
-            text = desc.get("text", "")
-            if text:
-                content_list.append(str(text).strip())
+        text = deep_find_text(dyn)
 
-        # 3. 提取特殊主体内容 (major)
-        major = module_dynamic.get("major", {})
-        if major:
-            major_type = major.get("type", "")
-            
-            # 🖼️ 老版图文 (DRAW)
-            if major_type == "MAJOR_TYPE_DRAW":
-                draw = major.get("draw", {})
-                items = draw.get("items", [])
-                if items:
-                    content_list.append(f"\n[🖼️ 组图：共 {len(items)} 张]")
-            
-            # 📰 新版通用图文/文章 (OPUS)
-            elif major_type == "MAJOR_TYPE_OPUS":
-                opus = major.get("opus", {})
-                title = opus.get("title", "")
-                if title:
-                    content_list.append(f"\n[📰 标题] 《{title}》")
-                    
-                summary = opus.get("summary", {})
-                # B站有两套 Opus summary 格式，做安全兼容
-                summary_text = summary.get("text", "") if isinstance(summary, dict) else opus.get("summary", "")
-                if summary_text:
-                    content_list.append(f"[📝 摘要] {summary_text}")
-                    
-                pics = opus.get("pics", [])
-                if pics:
-                    content_list.append(f"[🖼️ 附图：共 {len(pics)} 张]")
-            
-            # 📚 老版专栏 (ARTICLE)
-            elif major_type == "MAJOR_TYPE_ARTICLE":
-                article = major.get("article", {})
-                title = article.get("title", "")
-                article_desc = article.get("desc", "")
-                if title:
-                    content_list.append(f"\n[📚 专栏] 《{title}》")
-                if article_desc:
-                    content_list.append(str(article_desc))
-            
-            # 🎬 视频投稿 (ARCHIVE)
-            elif major_type == "MAJOR_TYPE_ARCHIVE":
-                archive = major.get("archive", {})
-                title = archive.get("title", "")
-                archive_desc = archive.get("desc", "")
-                if title:
-                    content_list.append(f"\n[🎬 投稿视频] 《{title}》")
-                if archive_desc:
-                    content_list.append(str(archive_desc))
-                    
-            # 🔴 直播推荐 (LIVE_RCMD)
-            elif major_type == "MAJOR_TYPE_LIVE_RCMD":
-                live = major.get("live_rcmd", {})
-                try:
-                    content = json.loads(live.get("content", "{}"))
-                    live_play_info = content.get("live_play_info", {})
-                    title = live_play_info.get("title", "")
-                    if title:
-                        content_list.append(f"\n[🔴 直播中] {title}")
-                except:
-                    pass
+        if text:
+            return text[:500]
 
-        # 4. 组装最终文本并过滤空行
-        final_text = "\n".join([c for c in content_list if c]).strip()
-        
-        # 兜底 fallback
-        if not final_text:
-            final_text = "【无文本动态】发布了新内容（可能为纯分享或未知类型）"
-            
-        return final_text
+        raw = json.dumps(item, ensure_ascii=False)
+        return raw[:500]
 
-    except Exception as e:
-        # 绝对防御：0 crash
-        logging.error(f"动态文本提取发生异常: {e}")
-        return "【解析异常兜底】发布了新动态"
+    except:
+        return "发布了新动态"
 
 
 def check_new_dynamics(header, seen_dynamics):
@@ -417,31 +351,21 @@ def check_new_dynamics(header, seen_dynamics):
                     continue
 
                 name = author.get("name", str(uid))
-                
-                # 1. 抽取完整无损动态内容
-                parsed_text = extract_dynamic_text(item)
-                
-                # 2. 组装“传送门模式” (Webhook 输出的最终 Message)
-                portal_url = f"https://t.bilibili.com/{id_str}"
-                final_message = f"{parsed_text}\n\n🔗 {portal_url}"
-                
+                text = extract_dynamic_text(item)
+
                 has_new = True
 
                 alerts.append({
                     "user": name,
-                    "message": final_message
+                    "message": text
                 })
 
-                # 3. 完整的多行日志查看排版
-                logging.info("-" * 50)
-                logging.info(f"🆕 发现新动态 | UP主: {name}")
-                logging.info(f"📝 完整内容:\n{final_message}")
-                logging.info("-" * 50)
+                logging.info(f"动态抓取 [{name}] {text}")
 
                 break
 
         except Exception as e:
-            logging.error(f"动态请求异常 {uid}: {traceback.format_exc()}")
+            logging.error(f"动态异常 {uid}: {e}")
 
         time.sleep(random.uniform(1, 2))
 
@@ -457,7 +381,7 @@ def check_new_dynamics(header, seen_dynamics):
     return has_new
 
 
-# ---------------- 评论（稳定版：禁止修改） ----------------
+# ---------------- 评论 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
