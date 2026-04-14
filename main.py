@@ -139,7 +139,7 @@ def send_exception_notification(msg):
         notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
     except: pass
 
-# 轻量动态监控
+# 轻量动态监控 - 只获取最新动态 + 显示具体内容
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     for uid in EXTRA_DYNAMIC_UIDS:
@@ -149,36 +149,48 @@ def check_new_dynamics(header, seen_dynamics):
             r = requests.get(url, headers=header, params=params, timeout=10)
             data = r.json()
             if data.get("code") != 0: continue
-            for item in data.get("data", {}).get("items", []):
-                id_str = item.get("id_str")
-                if not id_str or id_str in seen_dynamics[uid]: continue
-                seen_dynamics[uid].add(id_str)
 
-                dyn_text = ""
-                try:
-                    dyn_text = item["modules"]["module_dynamic"]["desc"]["text"]
-                except:
-                    pass
-                if not dyn_text:
-                    dyn_text = "发布了新动态"
+            items = data.get("data", {}).get("items", [])
+            if not items: continue
 
-                name = str(uid)
-                try:
-                    name = item["modules"]["module_author"]["name"]
-                except:
-                    pass
+            # 只取第一条（最新）动态
+            item = items[0]
+            id_str = item.get("id_str")
+            if not id_str or id_str in seen_dynamics[uid]:
+                continue
 
-                new_alerts.append({"user": name, "message": dyn_text})
+            seen_dynamics[uid].add(id_str)
+
+            # 提取具体动态内容
+            dyn_text = ""
+            try:
+                dyn_text = item["modules"]["module_dynamic"]["desc"]["text"]
+            except:
+                pass
+            if not dyn_text:
+                dyn_text = "发布了新动态"
+
+            name = str(uid)
+            try:
+                name = item["modules"]["module_author"]["name"]
+            except:
+                pass
+
+            new_alerts.append({"user": name, "message": dyn_text})
+
+            logging.info("新动态 - %s: %s", name, dyn_text)  # 日志显示具体内容
+
         except:
             pass
+
     if new_alerts:
-        logging.info(f"发现 {len(new_alerts)} 条新动态")
+        logging.info(f"发现 {len(new_alerts)} 条最新动态")
         try:
             notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
         except:
             pass
 
-# 主视频评论监控（修复显示具体内容）
+# 主视频评论监控
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime_in_this_round = last_read_time
@@ -222,7 +234,7 @@ def start_monitoring(header):
     seen = set()
     seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
 
-    logging.info("程序启动成功（主评论内容显示已修复）")
+    logging.info("程序启动成功（仅最新动态 + 主评论内容显示）")
     while True:
         try:
             current = time.time()
@@ -234,7 +246,7 @@ def start_monitoring(header):
                 last_heartbeat = current
 
             if is_work_time():
-                # 主评论监控（显示具体内容）
+                # 主评论监控
                 if oid:
                     new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                     if new_last_read_time > last_read_time:
@@ -249,7 +261,7 @@ def start_monitoring(header):
                         except:
                             pass
 
-                # 动态监控
+                # 动态监控（仅最新一条）
                 check_new_dynamics(header, seen_dynamics)
 
                 time.sleep(random.uniform(10, 20))
@@ -272,5 +284,5 @@ if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（主评论内容显示修复完成）")
+    logging.info("B站监控程序启动（动态仅最新 + 内容显示修复）")
     start_monitoring(header)
