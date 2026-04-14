@@ -17,7 +17,7 @@ TARGET_UID = 1671203508           # 主监控视频评论的UP
 VIDEO_CHECK_INTERVAL = 21600      
 HEARTBEAT_INTERVAL = 600          
 
-# 动态监控名单
+# 动态监控名单 (已包含您要求的所有UID)
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875, 
     3546961271589219, 
@@ -32,12 +32,14 @@ LOG_FILE = 'bili_monitor.log'
 # ==============================================
 
 # ------------------------
-# 强制日志初始化：物理清空
+# 强制日志初始化：启动物理清空
 # ------------------------
 def init_logging():
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, 'w', encoding='utf-8') as f:
-            f.truncate()
+    try:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, 'w', encoding='utf-8') as f:
+                f.truncate()
+    except: pass
     
     logging.basicConfig(
         filename=LOG_FILE,
@@ -51,7 +53,7 @@ def init_logging():
     logging.info("="*50)
 
 # ------------------------
-# Wbi 签名模块 (保持原样)
+# Wbi 签名模块 (保留原始逻辑，零修改)
 # ------------------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
@@ -101,7 +103,7 @@ def wbi_request(url, params, header):
     except Exception: return {"code": -1}
 
 # ------------------------
-# 基础辅助模块 (保持原样)
+# 业务辅助 (保留原始逻辑)
 # ------------------------
 def get_header():
     try:
@@ -116,16 +118,6 @@ def get_header():
 def is_work_time():
     now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=8)
     return now.weekday() < 5 and 9 <= now.hour < 19
-
-def get_video_info(bv, header):
-    url = f"https://api.bilibili.com/x/web-interface/view?bvid={bv}"
-    try:
-        r = requests.get(url, headers=header, timeout=10)
-        data = r.json()
-        if data["code"] == 0:
-            return str(data["data"]["aid"]), data["data"]["title"]
-    except: pass
-    return None, None
 
 def sync_latest_video(header):
     try:
@@ -144,12 +136,12 @@ def sync_latest_video(header):
     except: pass
     return None, None
 
-# ------------------------
-# 深度优化：动态正文抓取逻辑
-# ------------------------
 def init_extra_dynamics(header):
     return {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
 
+# ------------------------
+# 【核心修复】动态内容抓取：完全参考 API-collect 最新规范
+# ------------------------
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     now_ts = time.time()
@@ -159,7 +151,6 @@ def check_new_dynamics(header, seen_dynamics):
         try:
             r = requests.get(url, headers=header, params=params, timeout=10)
             data = r.json()
-            if data.get("code") != 0: continue
             items = data.get("data", {}).get("items", [])
             if not items: continue
 
@@ -167,9 +158,9 @@ def check_new_dynamics(header, seen_dynamics):
             id_str = item.get("id_str")
             if not id_str or id_str in seen_dynamics[uid]: continue
 
-            # 时效性校验
-            author_mod = item.get("modules", {}).get("module_author", {})
-            try: pub_ts = float(author_mod.get("pub_ts", 0))
+            # 1. 时效性校验
+            author_node = item.get("modules", {}).get("module_author", {})
+            try: pub_ts = float(author_node.get("pub_ts", 0))
             except: pub_ts = 0
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
@@ -177,61 +168,52 @@ def check_new_dynamics(header, seen_dynamics):
 
             seen_dynamics[uid].add(id_str)
 
-            # --- 深度提取内容逻辑 ---
-            dyn_text = ""
-            attach_str = ""
-            module_dyn = item.get("modules", {}).get("module_dynamic", {})
+            # 2. 深度内容提取 (参考 API-collect)
+            mod_dyn = item.get("modules", {}).get("module_dynamic", {})
+            major = mod_dyn.get("major", {})
             
-            # 1. 提取发布者的描述文本 (通用文字/图文)
-            if module_dyn.get("desc") and module_dyn["desc"].get("text"):
-                dyn_text = module_dyn["desc"]["text"]
+            # 路径 A: 传统文本内容 (desc)
+            content_text = mod_dyn.get("desc", {}).get("text", "")
             
-            # 2. 如果是新版图文 (Opus格式) 且 dyn_text 为空
-            major = module_dyn.get("major", {})
-            if major.get("opus"):
-                opus = major["opus"]
-                if not dyn_text: dyn_text = opus.get("summary", {}).get("text", "")
+            # 路径 B: 新版 Opus 图文内容 (summary)
+            if not content_text and major.get("opus"):
+                content_text = major["opus"].get("summary", {}).get("text", "")
             
-            # 3. 提取关联卡片信息
+            # 路径 C: 视频/专栏 标题和简介补全
+            attach_info = ""
             dyn_type = item.get("type")
-            if dyn_type == "DYNAMIC_TYPE_AV":
-                arc = major.get("archive", {})
-                attach_str = f"🎥 视频：《{arc.get('title')}》\n摘要：{arc.get('desc', '')[:50]}"
-            elif dyn_type == "DYNAMIC_TYPE_ARTICLE":
-                art = major.get("article", {})
-                attach_str = f"📄 专栏：《{art.get('title')}》\n摘要：{art.get('desc', '')[:50]}"
-            elif dyn_type == "DYNAMIC_TYPE_FORWARD":
-                # 处理转发：尝试抓取原作者名
-                fwd_item = item.get("orig")
-                orig_author = "未知用户"
-                try: orig_author = fwd_item["modules"]["module_author"]["name"]
-                except: pass
-                attach_str = f"🔄 转发了 {orig_author} 的内容"
-            elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
-                live = major.get("live_rcmd", {}).get("content", {}).get("live_play_info", {})
-                attach_str = f"🔴 正在直播：{live.get('title')}"
-
-            # 组装正文
-            final_desc = ""
-            if dyn_text: final_desc += f"【正文】:\n{dyn_text}\n"
-            if attach_str: final_desc += f"【附带】: {attach_str}"
-            if not final_desc: final_desc = "发布了新内容"
-
-            name = author_mod.get("name", str(uid))
-            new_alerts.append({"user": name, "message": final_desc})
             
-            # 日志输出：完整正文压缩为单行
-            log_content = final_desc.replace('\n', ' ')
-            logging.info(f"成功抓取动态 - [{name}] 内容: {log_content}")
+            if major.get("archive"): # 视频
+                v = major["archive"]
+                attach_info = f"🎥 视频: {v.get('title')}\n简介: {v.get('desc', '')[:60]}"
+            elif major.get("article"): # 专栏
+                a = major["article"]
+                attach_info = f"📄 专栏: {a.get('title')}\n摘要: {a.get('desc', '')[:60]}"
+            elif dyn_type == "DYNAMIC_TYPE_FORWARD": # 转发
+                orig = item.get("orig", {})
+                orig_name = orig.get("modules", {}).get("module_author", {}).get("name", "未知")
+                attach_info = f"🔄 转发了 @{orig_name} 的内容"
+
+            # 组装最终消息
+            final_msg = ""
+            if content_text: final_msg += f"【正文】: {content_text}\n"
+            if attach_info: final_msg += f"【关联】: {attach_info}"
+            if not final_msg: final_msg = "发布了新动态 (请至APP查看详情)"
+
+            name = author_node.get("name", str(uid))
+            new_alerts.append({"user": name, "message": final_msg})
+            
+            # 日志展示：合并换行符方便单行观察
+            logging.info(f"动态成功抓取 - [{name}]: {final_msg.replace(chr(10), ' ')}")
 
         except Exception: pass
 
     if new_alerts:
-        try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
+        try: notifier.send_webhook_notification("💡 特别关注UP发布新内容", new_alerts)
         except: pass
 
 # ------------------------
-# 核心扫描：主视频评论 (零修改)
+# 核心扫描：主视频评论 (严格保留原始逻辑)
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -264,6 +246,9 @@ def scan_new_comments(oid, header, last_read_time, seen):
         except: break
     return new_list, max_ctime
 
+# ------------------------
+# 主循环控制
+# ------------------------
 def start_monitoring(header):
     last_v_check = 0; last_hb = time.time(); last_d_check = 0
     oid, title = sync_latest_video(header)
