@@ -28,7 +28,12 @@ logging.basicConfig(
 
 # Wbi 签名模块
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
+mixinKeyEncTab = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+    33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+    61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+    36, 20, 34, 44, 52
+]
 
 def getMixinKey(orig: str):
     return "".join([orig[i] for i in mixinKeyEncTab])[:32]
@@ -41,7 +46,8 @@ def encWbi(params: dict, img_key: str, sub_key: str):
     filtered_params = {}
     for k, v in params.items():
         v_str = str(v)
-        for char in "!'()*": v_str = v_str.replace(char, '')
+        for char in "!'()*":
+            v_str = v_str.replace(char, '')
         filtered_params[k] = v_str
     query = urllib.parse.urlencode(filtered_params)
     wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
@@ -139,7 +145,11 @@ def send_exception_notification(msg):
         notifier.send_webhook_notification("程序异常", [{"user": "系统", "message": msg}])
     except: pass
 
-# 轻量动态监控 - 只获取最新动态 + 显示具体内容
+# 动态监控（仅最新动态 + 显示具体内容）
+def init_extra_dynamics(header):
+    seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
+    return seen_dynamics
+
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     for uid in EXTRA_DYNAMIC_UIDS:
@@ -153,7 +163,7 @@ def check_new_dynamics(header, seen_dynamics):
             items = data.get("data", {}).get("items", [])
             if not items: continue
 
-            # 只取第一条（最新）动态
+            # 只取最新一条动态
             item = items[0]
             id_str = item.get("id_str")
             if not id_str or id_str in seen_dynamics[uid]:
@@ -161,46 +171,72 @@ def check_new_dynamics(header, seen_dynamics):
 
             seen_dynamics[uid].add(id_str)
 
-            # 提取具体动态内容
             dyn_text = ""
-            try:
+            try: 
                 dyn_text = item["modules"]["module_dynamic"]["desc"]["text"]
-            except:
+            except: 
                 pass
-            if not dyn_text:
-                dyn_text = "发布了新动态"
+
+            dyn_type = item.get("type")
+            attach_str = ""
+            try:
+                if dyn_type == "DYNAMIC_TYPE_AV":
+                    title = item["modules"]["module_dynamic"]["major"]["archive"]["title"]
+                    attach_str = f"🎥 视频：《{title}》"
+                elif dyn_type == "DYNAMIC_TYPE_ARTICLE":
+                    title = item["modules"]["module_dynamic"]["major"]["article"]["title"]
+                    attach_str = f"📄 专栏：《{title}》"
+                elif dyn_type == "DYNAMIC_TYPE_FORWARD":
+                    attach_str = "🔄 转发了动态"
+                elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
+                    attach_str = "🔴 开启了直播"
+            except: 
+                pass
+
+            final_desc = ""
+            if dyn_text: 
+                final_desc += f"【正文】:\n{dyn_text}\n"
+            if attach_str: 
+                final_desc += f"【附带】: {attach_str}"
+            if not final_desc: 
+                final_desc = "发布了新动态"
 
             name = str(uid)
-            try:
+            try: 
                 name = item["modules"]["module_author"]["name"]
-            except:
+            except: 
                 pass
 
-            new_alerts.append({"user": name, "message": dyn_text})
+            new_alerts.append({
+                "user": name,
+                "message": final_desc
+            })
 
-            logging.info("新动态 - %s: %s", name, dyn_text)  # 日志显示具体内容
+            logging.info("新动态 - %s: %s", name, final_desc)   # 日志显示具体内容
 
-        except:
+        except Exception:
             pass
 
     if new_alerts:
-        logging.info(f"发现 {len(new_alerts)} 条最新动态")
-        try:
+        logging.info(f"发现 {len(new_alerts)} 条最新动态！")
+        try: 
             notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
-        except:
+        except: 
             pass
 
-# 主视频评论监控
+# 主视频评论监控（保持不变）
 def scan_new_comments(oid, header, last_read_time, seen):
-    new_list = []
+    new_list =[]
     max_ctime_in_this_round = last_read_time
     safe_read_time = last_read_time - 300
+  
     pn = 1
     while pn <= 10:
         params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
         try:
             data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
-            replies = data.get("data", {}).get("replies") or []
+            if data.get("code") != 0: break
+            replies = data.get("data", {}).get("replies") or[]
             if not replies: break
             page_all_older = True
             for r_obj in replies:
@@ -232,9 +268,9 @@ def start_monitoring(header):
         oid, title = None, "待获取视频"
     last_read_time = int(time.time())
     seen = set()
-    seen_dynamics = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
+    seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("程序启动成功（仅最新动态 + 主评论内容显示）")
+    logging.info("程序启动成功（仅最新动态 + 主评论）")
     while True:
         try:
             current = time.time()
@@ -246,7 +282,7 @@ def start_monitoring(header):
                 last_heartbeat = current
 
             if is_work_time():
-                # 主评论监控
+                # 主评论监控（不变）
                 if oid:
                     new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
                     if new_last_read_time > last_read_time:
@@ -256,12 +292,12 @@ def start_monitoring(header):
                         logging.info("发现 %d 条新主评论", len(new_list))
                         for item in new_list:
                             logging.info("%s : %s", item["user"], item["message"])
-                        try:
+                        try: 
                             notifier.send_webhook_notification(title, new_list)
-                        except:
+                        except: 
                             pass
 
-                # 动态监控（仅最新一条）
+                # 动态监控（仅最新动态）
                 check_new_dynamics(header, seen_dynamics)
 
                 time.sleep(random.uniform(10, 20))
@@ -284,5 +320,5 @@ if __name__ == "__main__":
     db.init_db()
     header = get_header()
     update_wbi_keys(header)
-    logging.info("B站监控程序启动（动态仅最新 + 内容显示修复）")
+    logging.info("B站监控程序启动（动态仅最新 + 内容显示已修复）")
     start_monitoring(header)
