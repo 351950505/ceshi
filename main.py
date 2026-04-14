@@ -107,7 +107,6 @@ def is_work_time():
     return now.weekday() < 5 and 9 <= now.hour < 19
 
 def sync_latest_video(header):
-    # 此处逻辑保持不变，用于更新主监控视频
     try:
         r = requests.get(f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={TARGET_UID}", headers=header, timeout=10)
         data = r.json()
@@ -124,8 +123,23 @@ def sync_latest_video(header):
     return None, None
 
 # ------------------------
-# 深度修复：动态内容提取算法
+# 动态轮询逻辑 (含缺失的 init 函数)
 # ------------------------
+def init_extra_dynamics(header):
+    """初始化动态监控名单的 seen 列表"""
+    seen = {}
+    for uid in EXTRA_DYNAMIC_UIDS:
+        seen[uid] = set()
+        # 预抓取当前最新的一条，防止程序启动时瞬间推送旧动态
+        try:
+            r = requests.get(f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={uid}", headers=header, timeout=10)
+            data = r.json()
+            items = data.get("data", {}).get("items", [])
+            if items:
+                seen[uid].add(items[0].get("id_str"))
+        except: pass
+    return seen
+
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     now_ts = time.time()
@@ -141,11 +155,11 @@ def check_new_dynamics(header, seen_dynamics):
             items = data.get("data", {}).get("items", [])
             if not items: continue
 
-            item = items[0] # 只看最新的一条
+            item = items[0] 
             id_str = item.get("id_str")
             if not id_str or id_str in seen_dynamics[uid]: continue
 
-            # 时效性校验（修复 float-str 兼容）
+            # 时效性校验
             try:
                 pub_ts = float(item.get("modules", {}).get("module_author", {}).get("pub_ts", 0))
             except: pub_ts = 0
@@ -156,39 +170,33 @@ def check_new_dynamics(header, seen_dynamics):
 
             seen_dynamics[uid].add(id_str)
 
-            # --- 参考 API-collect 项目深度提取正文 ---
+            # --- 深度提取内容 ---
             dyn_text = ""
             module_dyn = item.get("modules", {}).get("module_dynamic", {})
             
-            # 1. 尝试获取通用发布正文 (适用于 文字、图文、转发时的评论)
             desc_node = module_dyn.get("desc")
             if desc_node and desc_node.get("text"):
                 dyn_text = desc_node["text"]
             
-            # 2. 如果是转发动态且没有评论，尝试获取转发卡片里的正文
             if not dyn_text and item.get("type") == "DYNAMIC_TYPE_FORWARD":
                 dyn_text = "转发了动态"
 
-            # 3. 提取附加卡片信息 (视频简介、专栏标题等)
             major = module_dyn.get("major", {})
             attach_str = ""
             if major:
                 if major.get("archive"): # 视频
-                    archive = major["archive"]
-                    attach_str = f"🎥 视频：《{archive.get('title')}》\n摘要：{archive.get('desc')[:50]}"
+                    arc = major["archive"]
+                    attach_str = f"🎥 视频：《{arc.get('title')}》\n简介：{arc.get('desc')[:50]}"
                 elif major.get("article"): # 专栏
-                    article = major["article"]
-                    attach_str = f"📄 专栏：《{article.get('title')}》\n摘要：{article.get('desc')[:50]}"
+                    art = major["article"]
+                    attach_str = f"📄 专栏：《{art.get('title')}》"
                 elif major.get("live_rcmd"): # 直播
                     live = major["live_rcmd"]["content"]["live_play_info"]
                     attach_str = f"🔴 直播中：{live.get('title')}"
-                elif major.get("common"): # 一般卡片
-                    attach_str = f"🔗 内容：{major['common'].get('title')}"
 
-            # 组装最终正文
             final_desc = ""
-            if dyn_text: final_desc += f"【发布正文】:\n{dyn_text}\n"
-            if attach_str: final_desc += f"【关联内容】:\n{attach_str}"
+            if dyn_text: final_desc += f"【正文】:\n{dyn_text}\n"
+            if attach_str: final_desc += f"【关联】:\n{attach_str}"
             if not final_desc: final_desc = "发布了新动态"
 
             name = str(uid)
@@ -214,7 +222,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
     safe_time = last_read_time - 300
     pn = 1
     while pn <= 5:
-        # sort=2 为时间排序，防缓存延迟
         params = {"oid": oid, "type": 1, "sort": 2, "pn": pn, "ps": 20}
         data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
         if data.get("code") != 0: break
@@ -229,7 +236,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
                 if rpid not in seen:
                     seen.add(rpid)
                     logging.info(f"成功抓取评论: {r['member']['uname']}")
-                    new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "ctime": ctime})
+                    new_list.append({"user": r["member']['uname'], "message": r["content"]["message"], "ctime": ctime})
         if page_all_older: break
         pn += 1
         time.sleep(random.uniform(0.5, 1.0))
@@ -242,9 +249,11 @@ def start_monitoring(header):
     last_v_check = 0; last_hb = time.time(); last_d_check = 0
     oid, title = sync_latest_video(header)
     last_read_time = int(time.time()); seen_comments = set()
+    
+    # 此处已补全 init 函数
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("监控程序已启动 (深度内容修复版)")
+    logging.info("监控程序已启动 (深度内容修复 + 函数补全版)")
 
     while True:
         try:
@@ -271,9 +280,9 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 定时检查视频更新
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
-                oid, title = sync_latest_video(header)
+                res = sync_latest_video(header)
+                if res: oid, title = res
                 last_v_check = now
         except Exception:
             logging.error(traceback.format_exc()); time.sleep(60)
