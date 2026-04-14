@@ -291,72 +291,116 @@ def deep_find_text(obj):
 
 
 def extract_dynamic_text(item):
-    """修复版：严防None，保守提取，详细日志"""
+    """安全增强版（多结构兼容 + 全日志 + 零崩溃）"""
     try:
+        id_str = item.get("id_str", "unknown")
+        logging.info(f"🧩 动态解析开始 ID:{id_str}")
+
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
-        content_list = []
-        id_str = item.get("id_str", "unknown")
 
-        logging.info(f"动态解析开始 ID:{id_str}")
+        results = []
 
-        # 1. 安全提取 rich_text_nodes
-        rich_nodes = []
-        if dyn and isinstance(dyn, dict):
+        # ========== 1. desc.text（最高优先级，最稳定）==========
+        try:
             desc = dyn.get("desc") or {}
             if isinstance(desc, dict):
-                rich_nodes = desc.get("rich_text_nodes") or []
-            if not rich_nodes:
-                rich_nodes = dyn.get("rich_text_nodes") or []
+                text = desc.get("text")
+                if text:
+                    results.append(str(text))
+                    logging.info("✅ 命中 desc.text")
+        except Exception as e:
+            logging.warning(f"desc.text解析失败: {e}")
 
-        if rich_nodes and isinstance(rich_nodes, list):
-            node_texts = []
-            for node in rich_nodes:
-                if isinstance(node, dict):
-                    txt = str(node.get("text") or node.get("orig_text") or "").strip()
-                    if txt:
-                        node_texts.append(txt)
-            if node_texts:
-                content_list.append("\n".join(node_texts).strip())
-                logging.info(f"✅ rich_text_nodes 提取成功 {len(node_texts)}段")
+        # ========== 2. rich_text_nodes ==========
+        try:
+            desc = dyn.get("desc") or {}
+            nodes = desc.get("rich_text_nodes") if isinstance(desc, dict) else None
 
-        # 2. major 类型补充
-        if dyn and isinstance(dyn, dict):
+            if not nodes:
+                nodes = dyn.get("rich_text_nodes")
+
+            if isinstance(nodes, list):
+                tmp = []
+                for n in nodes:
+                    if isinstance(n, dict):
+                        t = n.get("text") or n.get("orig_text")
+                        if t:
+                            tmp.append(str(t))
+
+                if tmp:
+                    results.append("\n".join(tmp))
+                    logging.info(f"✅ rich_text_nodes 命中 {len(tmp)}段")
+        except Exception as e:
+            logging.warning(f"rich_text_nodes解析失败: {e}")
+
+        # ========== 3. major.opus（新版图文）==========
+        try:
             major = dyn.get("major") or {}
-            if isinstance(major, dict):
-                mtype = major.get("type")
-                if mtype in ["MAJOR_TYPE_OPUS", "MAJOR_TYPE_DRAW"]:
-                    opus = major.get("opus") or major.get("draw")
-                    if isinstance(opus, dict):
-                        desc = opus.get("desc") or {}
-                        if isinstance(desc, dict):
-                            opus_text = str(desc.get("text") or desc.get("content") or "").strip()
-                            if opus_text:
-                                content_list.append(opus_text)
-                                logging.info(f"✅ MAJOR_TYPE_OPUS/DRAW 提取成功")
+            if major.get("type") == "MAJOR_TYPE_OPUS":
+                opus = major.get("opus") or {}
 
-        # 3. 原deep_find_text兜底
-        if not content_list:
-            text = deep_find_text(dyn)
-            if text:
-                content_list.append(text)
-                logging.info("✅ deep_find_text兜底成功")
+                for path in ["summary", "desc", "content"]:
+                    v = opus.get(path)
+                    if isinstance(v, dict):
+                        t = v.get("text") or v.get("content")
+                        if t:
+                            results.append(str(t))
 
-        # 4. 终极兜底
-        if not content_list:
-            content_list.append("发布了新动态")
-            logging.warning(f"⚠️ 动态ID:{id_str} 解析失败，使用兜底")
+                # 兼容裸字段
+                if isinstance(opus.get("content"), str):
+                    results.append(opus["content"])
 
-        final_text = "\n\n".join(content_list).strip()
+                logging.info("✅ OPUS结构解析完成")
+        except Exception as e:
+            logging.warning(f"OPUS解析失败: {e}")
+
+        # ========== 4. major.draw（图片动态）==========
+        try:
+            major = dyn.get("major") or {}
+            if major.get("type") == "MAJOR_TYPE_DRAW":
+                draw = major.get("draw") or {}
+                items = draw.get("items") or []
+
+                tmp = []
+                for it in items:
+                    if isinstance(it, dict):
+                        d = it.get("desc")
+                        if d:
+                            tmp.append(str(d))
+
+                if tmp:
+                    results.append("\n".join(tmp))
+                    logging.info(f"✅ DRAW解析 {len(tmp)}条")
+        except Exception as e:
+            logging.warning(f"DRAW解析失败: {e}")
+
+        # ========== 5. 兜底 deep scan ==========
+        if not results:
+            try:
+                fallback = deep_find_text(dyn)
+                if fallback:
+                    results.append(fallback)
+                    logging.info("🟡 deep_find_text兜底命中")
+            except Exception as e:
+                logging.warning(f"deep_find_text失败: {e}")
+
+        # ========== 6. 最终兜底 ==========
+        if not results:
+            logging.error(f"❌ 完全解析失败 ID:{id_str}")
+            return "发布了新动态"
+
+        final_text = "\n\n".join(results).strip()
 
         if len(final_text) > 1800:
-            final_text = final_text[:1800] + "\n\n...(内容过长，已安全截断)"
+            final_text = final_text[:1800] + "\n\n...(已截断)"
 
+        logging.info(f"🎯 动态解析成功 ID:{id_str} 长度:{len(final_text)}")
         return final_text
 
     except Exception as e:
-        logging.error(f"❌ extract_dynamic_text异常 ID:{item.get('id_str','unknown')}: {e}")
-        return "发布了新动态 (解析异常，已安全兜底)"
+        logging.error(f"💥 extract_dynamic_text崩溃 ID:{item.get('id_str')}: {e}\n{traceback.format_exc()}")
+        return "发布了新动态 (异常兜底)"
 
 def check_new_dynamics(header, seen_dynamics):
     alerts = []
