@@ -8,6 +8,7 @@ import logging
 import traceback
 import hashlib
 import urllib.parse
+import json
 import requests
 
 import database as db
@@ -35,9 +36,6 @@ LOG_FILE = "bili_monitor.log"
 # ==============================================
 
 
-# ------------------------
-# 日志初始化
-# ------------------------
 def init_logging():
     try:
         if os.path.exists(LOG_FILE):
@@ -59,9 +57,6 @@ def init_logging():
     logging.info("=" * 60)
 
 
-# ------------------------
-# 安全请求
-# ------------------------
 def safe_request(url, params, header, retries=3):
     h = header.copy()
     h["Connection"] = "close"
@@ -89,9 +84,7 @@ def safe_request(url, params, header, retries=3):
     return {"code": -500}
 
 
-# ------------------------
-# WBI签名
-# ------------------------
+# ---------------- WBI ----------------
 WBI_KEYS = {
     "img_key": "",
     "sub_key": "",
@@ -165,25 +158,10 @@ def wbi_request(url, params, header):
         WBI_KEYS["sub_key"]
     )
 
-    data = safe_request(url, signed, header)
-
-    if data.get("code") == -400:
-        update_wbi_keys(header)
-
-        signed = encWbi(
-            params.copy(),
-            WBI_KEYS["img_key"],
-            WBI_KEYS["sub_key"]
-        )
-
-        data = safe_request(url, signed, header)
-
-    return data
+    return safe_request(url, signed, header)
 
 
-# ------------------------
-# Header
-# ------------------------
+# ---------------- 基础 ----------------
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
@@ -201,9 +179,6 @@ def get_header():
     }
 
 
-# ------------------------
-# 时间控制
-# ------------------------
 def is_work_time():
     now = datetime.datetime.now(
         datetime.timezone.utc
@@ -212,9 +187,7 @@ def is_work_time():
     return now.weekday() < 5 and 9 <= now.hour < 19
 
 
-# ------------------------
-# 视频模块
-# ------------------------
+# ---------------- 视频 ----------------
 def get_latest_video(header):
     data = safe_request(
         "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
@@ -269,15 +242,12 @@ def sync_latest_video(header):
     if oid:
         db.clear_videos()
         db.add_video_to_db(oid, bv, title)
-        logging.info(f"监控视频切换：{title}")
         return oid, title
 
     return None, None
 
 
-# ------------------------
-# 动态模块
-# ------------------------
+# ---------------- 动态 ----------------
 def init_extra_dynamics(header):
     seen = {}
 
@@ -291,62 +261,53 @@ def init_extra_dynamics(header):
         )
 
         if data.get("code") == 0:
-            items = (data.get("data") or {}).get("items", [])
-
-            for item in items:
+            for item in (data.get("data") or {}).get("items", []):
                 if item.get("id_str"):
                     seen[uid].add(item["id_str"])
 
     return seen
 
 
+def deep_find_text(obj):
+    result = []
+
+    def walk(x):
+        if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ["text", "content", "desc", "title", "words"]:
+                    if isinstance(v, str) and v.strip():
+                        result.append(v.strip())
+                walk(v)
+
+        elif isinstance(x, list):
+            for i in x:
+                walk(i)
+
+    walk(obj)
+
+    uniq = []
+    for x in result:
+        if x not in uniq:
+            uniq.append(x)
+
+    return " ".join(uniq).strip()
+
+
 def extract_dynamic_text(item):
-    modules = item.get("modules") or {}
-    dyn = modules.get("module_dynamic") or {}
-    major = dyn.get("major") or {}
+    try:
+        modules = item.get("modules") or {}
+        dyn = modules.get("module_dynamic") or {}
 
-    text = ""
+        text = deep_find_text(dyn)
 
-    desc = dyn.get("desc") or {}
-    text = desc.get("text", "").strip()
+        if text:
+            return text[:500]
 
-    if not text:
-        nodes = desc.get("rich_text_nodes") or []
-        arr = []
+        raw = json.dumps(item, ensure_ascii=False)
+        return raw[:500]
 
-        for n in nodes:
-            t = n.get("text", "")
-            if t:
-                arr.append(t)
-
-        text = "".join(arr).strip()
-
-    if not text:
-        opus = major.get("opus") or {}
-
-        text = (
-            opus.get("summary", {})
-            .get("text", "")
-            .strip()
-        )
-
-    if not text:
-        try:
-            paras = opus.get("paragraphs") or []
-            arr = []
-
-            for p in paras:
-                for n in p.get("nodes") or []:
-                    w = n.get("word") or {}
-                    words = w.get("words", "")
-                    if words:
-                        arr.append(words)
-
-            text = "".join(arr).strip()
-        except:
-            pass
-
-    return text
+    except:
+        return "发布了新动态"
 
 
 def check_new_dynamics(header, seen_dynamics):
@@ -365,10 +326,7 @@ def check_new_dynamics(header, seen_dynamics):
             if data.get("code") != 0:
                 continue
 
-            items = (
-                (data.get("data") or {}).get("items")
-                or []
-            )
+            items = (data.get("data") or {}).get("items", [])
 
             for item in items:
                 id_str = item.get("id_str")
@@ -392,25 +350,22 @@ def check_new_dynamics(header, seen_dynamics):
                 if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                     continue
 
-                has_new = True
-
                 name = author.get("name", str(uid))
                 text = extract_dynamic_text(item)
 
-                if not text:
-                    text = "发布了新动态"
+                has_new = True
 
                 alerts.append({
                     "user": name,
-                    "message": text[:500]
+                    "message": text
                 })
 
-                logging.info(f"动态抓取 [{name}] {text[:80]}")
+                logging.info(f"动态抓取 [{name}] {text}")
 
                 break
 
         except Exception as e:
-            logging.error(f"动态检测异常 {uid}: {e}")
+            logging.error(f"动态异常 {uid}: {e}")
 
         time.sleep(random.uniform(1, 2))
 
@@ -426,9 +381,7 @@ def check_new_dynamics(header, seen_dynamics):
     return has_new
 
 
-# ------------------------
-# 评论监控（保留原逻辑）
-# ------------------------
+# ---------------- 评论 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
@@ -483,9 +436,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
     return new_list, max_ctime
 
 
-# ------------------------
-# 主循环
-# ------------------------
+# ---------------- 主循环 ----------------
 def start_monitoring(header):
     last_v_check = 0
     last_hb = time.time()
@@ -496,7 +447,6 @@ def start_monitoring(header):
 
     last_read_time = int(time.time())
     seen_comments = set()
-
     seen_dynamics = init_extra_dynamics(header)
 
     logging.info("监控服务已启动")
@@ -507,7 +457,6 @@ def start_monitoring(header):
 
             if is_work_time():
 
-                # 评论
                 if oid:
                     new_c, new_t = scan_new_comments(
                         oid,
@@ -521,13 +470,11 @@ def start_monitoring(header):
 
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-
                         notifier.send_webhook_notification(
                             title,
                             new_c
                         )
 
-                # 动态
                 interval = (
                     DYNAMIC_BURST_INTERVAL
                     if now < burst_end
@@ -543,19 +490,14 @@ def start_monitoring(header):
 
                     last_d_check = now
 
-                # 心跳
                 if now - last_hb >= HEARTBEAT_INTERVAL:
-                    try:
-                        notifier.send_webhook_notification(
-                            "心跳",
-                            [{
-                                "user": "系统",
-                                "message": "正常运行中"
-                            }]
-                        )
-                    except:
-                        pass
-
+                    notifier.send_webhook_notification(
+                        "心跳",
+                        [{
+                            "user": "系统",
+                            "message": "正常运行中"
+                        }]
+                    )
                     last_hb = now
 
                 time.sleep(random.uniform(10, 15))
@@ -563,13 +505,10 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 视频同步
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
                 res = sync_latest_video(header)
-
                 if res:
                     oid, title = res
-
                 last_v_check = now
 
         except Exception:
@@ -577,9 +516,6 @@ def start_monitoring(header):
             time.sleep(60)
 
 
-# ------------------------
-# 启动入口
-# ------------------------
 if __name__ == "__main__":
     init_logging()
     db.init_db()
