@@ -227,6 +227,25 @@ if __name__ == "__main__":
     from your_header_module import get_header  # 如果你是单文件请删掉这一行
 
     h = get_header()
+def get_header():
+    try:
+        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
 
+        logging.info("✅ cookie加载成功")
+
+    except Exception as e:
+        logging.error(f"❌ cookie读取失败: {e}")
+
+        subprocess.run([sys.executable, "login_bilibili.py"])
+
+        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
+            cookie = f.read().strip()
+
+    return {
+        "Cookie": cookie,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.bilibili.com/"
+    }
     logging.info("🚀 系统启动完成")
     start_monitoring(h)
