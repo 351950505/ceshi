@@ -19,16 +19,16 @@ HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
 # 动态监控名单
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
 DYNAMIC_CHECK_INTERVAL = 30       # 动态轮询频率
-DYNAMIC_MAX_AGE = 300             # 【已修改】动态时效性限制：300秒（5分钟）
+DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒（5分钟）
 # ==============================================
 
-# 【已修改】filemode='w' 确保每次启动都清空之前的日志内容
+# 这里的 filemode='w' 确保每次启动程序都会清空 bili_monitor.log
 logging.basicConfig(
     filename='bili_monitor.log',
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     encoding='utf-8',
-    filemode='w' 
+    filemode='w'
 )
 
 # ------------------------
@@ -114,7 +114,7 @@ def sync_latest_video(header):
                     db.add_video_to_db(aid, bv, title)
                     logging.info(f"监控目标切换: {title}")
                 return aid, title
-    except: pass
+    except Exception: pass
     return None, None
 
 # ------------------------
@@ -129,7 +129,7 @@ def init_extra_dynamics(header):
             r = requests.get(url, headers=header, params={"host_mid": uid}, timeout=10)
             items = r.json().get("data", {}).get("items", [])
             if items: seen[uid].add(items[0].get("id_str"))
-        except: pass
+        except Exception: pass
     return seen
 
 def check_new_dynamics(header, seen_dynamics):
@@ -151,9 +151,8 @@ def check_new_dynamics(header, seen_dynamics):
             author_mod = item.get("modules", {}).get("module_author", {})
             try:
                 pub_ts = float(author_mod.get("pub_ts", 0))
-            except: pub_ts = 0
+            except Exception: pub_ts = 0
 
-            # 300秒时效性校验
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
                 continue
@@ -176,7 +175,7 @@ def check_new_dynamics(header, seen_dynamics):
 
     if new_alerts:
         try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
-        except: pass
+        except Exception: pass
 
 # ------------------------
 # 视频评论扫描
@@ -190,6 +189,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
     for pn in range(1, 4):
         data = wbi_request(url, {"oid": oid, "type": 1, "sort": 2, "pn": pn, "ps": 20}, header)
         if data.get("code") != 0: break
+        
         replies = data.get("data", {}).get("replies") or []
         if not replies: break
         
@@ -218,16 +218,60 @@ def start_monitoring(header):
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
+    
     oid, title = sync_latest_video(header)
     last_read_time = int(time.time())
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("监控程序已启动 (日志自动刷新 & 5分钟时效版)")
+    logging.info("B站监控程序已启动 (网络异常静默容错 & 日志自动重置版)")
 
     while True:
         try:
             now = time.time()
             if is_work_time():
+                # 1. 评论监控
                 if oid:
+                    # 此处已修正所有中文字符逗号
                     new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
+                    if new_t > last_read_time:
+                        last_read_time = new_t
+                    if new_c:
+                        new_c.sort(key=lambda x: x["ctime"])
+                        try:
+                            notifier.send_webhook_notification(title, new_c)
+                        except Exception: pass
+
+                # 2. 动态监控 (30秒频率)
+                if now - last_d_check >= DYNAMIC_CHECK_INTERVAL:
+                    check_new_dynamics(header, seen_dynamics)
+                    last_d_check = now
+
+                # 3. 心跳监控 (10分钟)
+                if now - last_hb >= HEARTBEAT_INTERVAL:
+                    try:
+                        notifier.send_webhook_notification("心跳", [{"user": "系统", "message": "运行正常"}])
+                    except Exception: pass
+                    last_hb = now
+
+                time.sleep(random.uniform(10, 15))
+            else:
+                time.sleep(30)
+
+            # 定时更新监控视频 ID
+            if now - last_v_check > VIDEO_CHECK_INTERVAL:
+                res = sync_latest_video(header)
+                if res:
+                    oid, title = res
+                last_v_check = now
+        except Exception:
+            # 记录主循环错误并静默重试
+            logging.error(traceback.format_exc())
+            time.sleep(60)
+
+if __name__ == "__main__":
+    db.init_db()
+    h = get_header()
+    # 第一次初始化密钥
+    update_wbi_keys(h)
+    start_monitoring(h)
