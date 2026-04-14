@@ -19,15 +19,16 @@ HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
 # 动态监控名单
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
 DYNAMIC_CHECK_INTERVAL = 30       # 动态轮询频率
-DYNAMIC_MAX_AGE = 300             # 动态时效性限制：2分钟
+DYNAMIC_MAX_AGE = 300             # 【已修改】动态时效性限制：300秒（5分钟）
 # ==============================================
 
+# 【已修改】filemode='w' 确保每次启动都清空之前的日志内容
 logging.basicConfig(
     filename='bili_monitor.log',
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     encoding='utf-8',
-    filemode='a'
+    filemode='w' 
 )
 
 # ------------------------
@@ -69,22 +70,16 @@ def update_wbi_keys(header):
         WBI_KEYS["sub_key"] = wbi_img["sub_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["last_update"] = time.time()
         logging.info("Wbi 密钥已自动更新")
-    except Exception:
-        # 网络波动导致更新失败，静默跳过
-        pass
+    except Exception: pass
 
 def wbi_request(url, params, header):
     if time.time() - WBI_KEYS["last_update"] > 21600 or not WBI_KEYS["img_key"]:
         update_wbi_keys(header)
-    
     signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     try:
-        # 严格执行 10s 超时和异常补获
         r = requests.get(url, headers=header, params=signed_params, timeout=10)
         return r.json()
-    except Exception:
-        # 包含域名无法解析、超时等所有网络底层异常，统一返回 -1 静默跳过
-        return {"code": -1}
+    except Exception: return {"code": -1}
 
 # ------------------------
 # 基础辅助模块
@@ -119,8 +114,7 @@ def sync_latest_video(header):
                     db.add_video_to_db(aid, bv, title)
                     logging.info(f"监控目标切换: {title}")
                 return aid, title
-    except Exception:
-        pass
+    except: pass
     return None, None
 
 # ------------------------
@@ -144,11 +138,9 @@ def check_new_dynamics(header, seen_dynamics):
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
             url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
-            # 捕获网络底层错误，如 DNS 解析失败
             r = requests.get(url, headers=header, params={"host_mid": uid}, timeout=10)
             data = r.json()
             if data.get("code") != 0: continue
-
             items = data.get("data", {}).get("items", [])
             if not items: continue
 
@@ -161,6 +153,7 @@ def check_new_dynamics(header, seen_dynamics):
                 pub_ts = float(author_mod.get("pub_ts", 0))
             except: pub_ts = 0
 
+            # 300秒时效性校验
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
                 continue
@@ -179,13 +172,10 @@ def check_new_dynamics(header, seen_dynamics):
             msg_body = f"【正文】: {dyn_text}\n【关联】: {attach}" if attach else dyn_text
             new_alerts.append({"user": name, "message": msg_body or "发布了新动态"})
             logging.info(f"动态扫描成功: {name}")
-        except Exception:
-            # 域名解析失败等网络问题，静默跳过，不报 Traceback
-            pass
+        except Exception: pass
 
     if new_alerts:
-        try:
-            notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
+        try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
         except: pass
 
 # ------------------------
@@ -200,7 +190,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
     for pn in range(1, 4):
         data = wbi_request(url, {"oid": oid, "type": 1, "sort": 2, "pn": pn, "ps": 20}, header)
         if data.get("code") != 0: break
-        
         replies = data.get("data", {}).get("replies") or []
         if not replies: break
         
@@ -218,10 +207,8 @@ def scan_new_comments(oid, header, last_read_time, seen):
                     message = r.get("content", {}).get("message", "")
                     logging.info(f"抓取评论成功: {uname}")
                     new_list.append({"user": uname, "message": message, "ctime": ctime})
-                    
         if page_all_older: break
         time.sleep(random.uniform(0.5, 1.0))
-        
     return new_list, max_ctime
 
 # ------------------------
@@ -231,57 +218,16 @@ def start_monitoring(header):
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
-    
     oid, title = sync_latest_video(header)
     last_read_time = int(time.time())
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("B站监控程序已启动 (网络异常静默容错版)")
+    logging.info("监控程序已启动 (日志自动刷新 & 5分钟时效版)")
 
     while True:
         try:
             now = time.time()
             if is_work_time():
-                # 1. 评论
                 if oid:
                     new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
-                    if new_t > last_read_time: last_read_time = new_t
-                    if new_c:
-                        new_c.sort(key=lambda x: x["ctime"])
-                        try:
-                            notifier.send_webhook_notification(title, new_c)
-                        except: pass
-
-                # 2. 动态 (按 30s 频率执行)
-                if now - last_d_check >= DYNAMIC_CHECK_INTERVAL:
-                    check_new_dynamics(header, seen_dynamics)
-                    last_d_check = now
-
-                # 3. 心跳 (10min)
-                if now - last_hb >= HEARTBEAT_INTERVAL:
-                    try:
-                        notifier.send_webhook_notification("心跳", [{"user": "系统", "message": "运行正常"}])
-                    except: pass
-                    last_hb = now
-
-                time.sleep(random.uniform(10, 15))
-            else:
-                time.sleep(30)
-
-            # 刷新监控视频 ID
-            if now - last_v_check > VIDEO_CHECK_INTERVAL:
-                res = sync_latest_video(header)
-                if res: oid, title = res
-                last_v_check = now
-        except Exception:
-            # 万一主循环发生未知错误，记录后静默等待
-            logging.error(traceback.format_exc())
-            time.sleep(60)
-
-if __name__ == "__main__":
-    db.init_db()
-    h = get_header()
-    # 第一次初始化更新 Wbi，如果这里解析域名失败也没关系，wbi_request 内部会重试
-    update_wbi_keys(h)
-    start_monitoring(h)
