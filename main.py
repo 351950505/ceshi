@@ -13,9 +13,6 @@ import notifier
 
 
 # ================= 配置 =================
-HEARTBEAT_INTERVAL = 15
-STALL_WARNING_THRESHOLD = 60
-
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875,
     3546961271589219,
@@ -36,209 +33,42 @@ def init_logging():
         filemode="w"
     )
 
-    logging.info("=" * 70)
-    logging.info("🚀 B站监控系统运行状态增强版启动")
-    logging.info("=" * 70)
+    logging.info("=" * 80)
+    logging.info("🚀 B站监控 DEBUG最终稳定版启动")
+    logging.info("=" * 80)
 
 
-# ================= 网络层（增强版） =================
-def safe_request(url, params, headers, retries=3):
-    for i in range(retries):
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=10)
-
-            logging.info(f"🌐 请求成功 URL={url} code={r.status_code}")
-
-            txt = r.text.strip()
-            if not txt:
-                logging.warning("⚠️ 空响应")
-                continue
-
-            data = r.json()
-            return data
-
-        except requests.exceptions.Timeout:
-            logging.error(f"⏰ 超时 retry={i} URL={url}")
-
-        except requests.exceptions.ConnectionError:
-            logging.error(f"🔌 连接失败 retry={i} URL={url}")
-
-        except Exception:
-            logging.error(f"❌ 请求异常 retry={i} URL={url}\n{traceback.format_exc()}")
-
-        time.sleep(1 + i)
-
-    logging.error(f"💥 请求彻底失败 URL={url}")
-    return {"code": -500}
-
-
-# ================= 动态解析（保守版） =================
-def extract_dynamic_text(item):
+# ================= 网络（强可观测版） =================
+def safe_request(url, params, headers):
     try:
-        modules = item.get("modules") or {}
-        dyn = modules.get("module_dynamic")
+        r = requests.get(url, headers=headers, params=params, timeout=10)
 
-        if not isinstance(dyn, dict):
-            return "【DEBUG】无module_dynamic"
+        logging.info(f"🌐 请求 URL={r.url}")
+        logging.info(f"🌐 HTTP状态={r.status_code}")
 
-        content = []
+        if not r.text:
+            logging.warning("⚠️ 空响应")
+            return {"code": -1, "error": "empty response"}
 
-        desc = dyn.get("desc") or {}
-        if isinstance(desc, dict):
-            if desc.get("text"):
-                content.append(desc["text"])
-
-        major = dyn.get("major") or {}
-        if isinstance(major, dict):
-            for k in ["draw", "opus", "archive", "article"]:
-                blk = major.get(k)
-                if isinstance(blk, dict):
-
-                    # draw
-                    if k == "draw":
-                        for it in blk.get("items") or []:
-                            if isinstance(it, dict) and it.get("text"):
-                                content.append(it["text"])
-
-                    # common fallback
-                    for p in ["desc", "title"]:
-                        v = blk.get(p)
-                        if isinstance(v, str):
-                            content.append(v)
-
-        if not content:
-            content.append("【DEBUG】无文本内容")
-
-        return "\n".join(content)
+        try:
+            return r.json()
+        except Exception:
+            logging.error("❌ JSON解析失败，返回原文")
+            logging.info(r.text[:1000])
+            return {"code": -2, "raw": r.text}
 
     except Exception:
-        logging.error(traceback.format_exc())
-        return "【DEBUG】解析异常"
+        logging.error(f"❌ 请求失败\n{traceback.format_exc()}")
+        return {"code": -500}
 
 
-# ================= 动态扫描 =================
-def check_new_dynamics(header, seen):
-    start_time = time.time()
-
-    logging.info("🔁 开始动态扫描")
-
-    new_count = 0
-
-    for uid in EXTRA_DYNAMIC_UIDS:
-        try:
-            data = safe_request(
-                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-                {"host_mid": uid},
-                header
-            )
-
-            if data.get("code") != 0:
-                logging.warning(f"UID={uid} 返回异常 code={data.get('code')}")
-                continue
-
-            items = (data.get("data") or {}).get("items", [])
-
-            logging.info(f"📦 UID={uid} items={len(items)}")
-
-            for item in items:
-                id_str = item.get("id_str")
-                if not id_str:
-                    continue
-
-                if id_str in seen[uid]:
-                    continue
-
-                seen[uid].add(id_str)
-                new_count += 1
-
-                text = extract_dynamic_text(item)
-
-                logging.info("=========== NEW DYNAMIC ===========")
-                logging.info(f"UID: {uid}")
-                logging.info(f"ID: {id_str}")
-                logging.info(text)
-                logging.info("===================================")
-
-        except Exception:
-            logging.error(traceback.format_exc())
-
-    duration = time.time() - start_time
-    logging.info(f"✅ 本轮扫描完成 新动态={new_count} 耗时={duration:.2f}s")
-
-    return new_count
-
-
-# ================= 主循环（增强可观测） =================
-def start_monitoring(header):
-    seen = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
-
-    last_heartbeat = time.time()
-    last_scan = time.time()
-    loop_count = 0
-    last_log_time = time.time()
-
-    logging.info("🟢 监控系统进入主循环")
-
-    while True:
-        try:
-            loop_count += 1
-            now = time.time()
-
-            # ================= 心跳 =================
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                logging.info(
-                    f"💓 HEARTBEAT | loop={loop_count} "
-                    f"uids={len(EXTRA_DYNAMIC_UIDS)} "
-                    f"uptime={int(now)}"
-                )
-                last_heartbeat = now
-                last_log_time = now
-
-            # ================= 动态扫描 =================
-            if now - last_scan >= 10:
-                count = check_new_dynamics(header, seen)
-                last_scan = now
-
-                if count == 0:
-                    logging.info("📭 本轮无新动态")
-                else:
-                    logging.info(f"🎯 新动态数量: {count}")
-
-                last_log_time = now
-
-            # ================= 卡死检测 =================
-            if now - last_log_time > STALL_WARNING_THRESHOLD:
-                logging.error("🚨 WARNING: 系统可能卡死（无日志超过60秒）")
-                last_log_time = now
-
-            time.sleep(2)
-
-        except Exception:
-            logging.error(traceback.format_exc())
-            time.sleep(5)
-
-
-# ================= 启动 =================
-if __name__ == "__main__":
-    init_logging()
-    db.init_db()
-
-    # 你原来的 header 逻辑保留（这里假设已存在）
-    from your_header_module import get_header  # 如果你是单文件请删掉这一行
-
-    h = get_header()
+# ================= header =================
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
-
-        logging.info("✅ cookie加载成功")
-
-    except Exception as e:
-        logging.error(f"❌ cookie读取失败: {e}")
-
+    except:
         subprocess.run([sys.executable, "login_bilibili.py"])
-
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
 
@@ -247,5 +77,151 @@ def get_header():
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://www.bilibili.com/"
     }
-    logging.info("🚀 系统启动完成")
+
+
+# ================= 🔥 核心：不再“猜结构”，只做安全提取 =================
+def extract_dynamic_text(item):
+    try:
+        logging.info("📦 开始解析单条动态")
+
+        # 永远先打印结构（关键）
+        try:
+            logging.info("📦 RAW ITEM:")
+            logging.info(json.dumps(item, ensure_ascii=False, indent=2)[:3000])
+        except:
+            logging.info(str(item)[:2000])
+
+        modules = item.get("modules")
+
+        if not modules:
+            return "【无modules字段】"
+
+        dyn = modules.get("module_dynamic")
+
+        if not isinstance(dyn, dict):
+            return "【无module_dynamic】"
+
+        result = []
+
+        # ================= desc =================
+        desc = dyn.get("desc")
+        if isinstance(desc, dict):
+            t = desc.get("text")
+            if t:
+                result.append(t)
+
+        # ================= major =================
+        major = dyn.get("major") or {}
+
+        if isinstance(major, dict):
+            for k, v in major.items():
+
+                if not isinstance(v, dict):
+                    continue
+
+                # draw
+                if k == "draw":
+                    items = v.get("items") or []
+                    for it in items:
+                        if isinstance(it, dict):
+                            txt = it.get("text")
+                            if txt:
+                                result.append(txt)
+
+                # opus / article / archive
+                for field in ["title", "desc", "content"]:
+                    if field in v and isinstance(v[field], str):
+                        result.append(v[field])
+
+        # ================= 最终兜底 =================
+        if not result:
+            logging.warning("⚠️ 解析失败，返回raw结构")
+            return f"【RAW动态】{str(dyn)[:1000]}"
+
+        return "\n".join(result)
+
+    except Exception:
+        logging.error(traceback.format_exc())
+        return "【解析异常】"
+
+
+# ================= 动态扫描（保证永远有输出） =================
+def check_new_dynamics(header, seen):
+    logging.info("🔁 开始扫描动态")
+
+    total_new = 0
+
+    for uid in EXTRA_DYNAMIC_UIDS:
+        logging.info(f"➡️ 请求 UID={uid}")
+
+        data = safe_request(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+            {"host_mid": uid},
+            header
+        )
+
+        logging.info(f"UID={uid} code={data.get('code')}")
+
+        items = (data.get("data") or {}).get("items") or []
+
+        logging.info(f"UID={uid} items={len(items)}")
+
+        for item in items:
+            id_str = item.get("id_str")
+
+            if not id_str:
+                continue
+
+            if id_str in seen[uid]:
+                continue
+
+            seen[uid].add(id_str)
+            total_new += 1
+
+            logging.info("====================================")
+            logging.info(f"🆕 NEW UID={uid} ID={id_str}")
+
+            text = extract_dynamic_text(item)
+
+            logging.info("📢 FINAL OUTPUT:")
+            logging.info(text)
+            logging.info("====================================")
+
+    logging.info(f"✅ 本轮扫描结束 new={total_new}")
+
+    return total_new
+
+
+# ================= 主循环 =================
+def start_monitoring(header):
+    seen = {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
+
+    logging.info("🟢 系统进入主循环")
+
+    loop = 0
+
+    while True:
+        try:
+            loop += 1
+
+            logging.info(f"💓 LOOP {loop} alive")
+
+            check_new_dynamics(header, seen)
+
+            time.sleep(8)
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            time.sleep(5)
+
+
+# ================= main =================
+if __name__ == "__main__":
+    init_logging()
+    db.init_db()
+
+    h = get_header()
+
+    logging.info("🚀 启动完成")
+
     start_monitoring(h)
