@@ -241,83 +241,110 @@ def extract_dynamic_text(item):
         id_str = item.get("id_str", "unknown")
 
         logging.info("=" * 80)
-        logging.info(f"🔍 解析动态 ID: {id_str}")
+        logging.info(f"🔍 FINAL解析 ID: {id_str}")
 
-        logging.info("📦 FULL ITEM DUMP:")
-        try:
-            logging.info(json.dumps(item, ensure_ascii=False, indent=2)[:4000])
-        except:
-            logging.info(str(item)[:2000])
-
-        modules = item.get("modules")
-        logging.info(f"modules: {type(modules)}")
-
-        if not modules:
-            return "【DEBUG】modules为空"
-
+        modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") if isinstance(modules, dict) else None
-        logging.info(f"module_dynamic: {str(dyn)[:500]}")
+
+        if not isinstance(dyn, dict):
+            return "【DEBUG】module_dynamic缺失"
 
         content = []
 
-        # rich nodes
+        # =========================
+        # ① 最关键：desc.text（你漏掉的核心）
+        # =========================
         try:
-            rich = None
-            if isinstance(dyn, dict):
-                desc = dyn.get("desc")
-                if isinstance(desc, dict):
-                    rich = desc.get("rich_text_nodes")
+            desc = dyn.get("desc")
+            logging.info(f"desc: {desc}")
 
-            logging.info(f"rich_nodes: {rich}")
+            if isinstance(desc, dict):
+                text = desc.get("text")
+                if text:
+                    content.append(text)
+                    logging.info("✅ desc.text 命中")
 
-            if isinstance(rich, list):
-                for n in rich:
-                    if isinstance(n, dict):
-                        t = n.get("text") or n.get("orig_text")
-                        if t:
-                            content.append(t)
+                # 有些版本是 orig_text
+                orig = desc.get("orig_text")
+                if orig:
+                    content.append(orig)
+                    logging.info("✅ desc.orig_text 命中")
+
+                # 富文本
+                rich = desc.get("rich_text_nodes")
+                if isinstance(rich, list):
+                    for n in rich:
+                        if isinstance(n, dict):
+                            t = n.get("text") or n.get("orig_text")
+                            if t:
+                                content.append(t)
+
         except Exception as e:
-            logging.error(f"rich解析失败: {e}")
+            logging.error(f"desc解析失败: {e}")
 
-        # major
+        # =========================
+        # ② major（仅补充，不主依赖）
+        # =========================
         try:
-            if isinstance(dyn, dict):
-                major = dyn.get("major")
-                logging.info(f"major: {str(major)[:300]}")
+            major = dyn.get("major")
+            logging.info(f"major.type = {major.get('type') if isinstance(major, dict) else None}")
 
-                if isinstance(major, dict):
-                    for k in ["opus", "draw", "archive"]:
-                        if k in major:
-                            blk = major[k]
-                            logging.info(f"hit major.{k}")
+            if isinstance(major, dict):
+                for k in ["opus", "draw", "archive", "article"]:
+                    if k in major:
+                        blk = major.get(k)
+                        logging.info(f"hit major.{k}")
 
-                            if isinstance(blk, dict):
-                                for path in [("desc", "text"), ("desc", "content"), ("title",)]:
-                                    cur = blk
-                                    for p in path:
-                                        if isinstance(cur, dict):
-                                            cur = cur.get(p)
-                                        else:
-                                            cur = None
+                        if isinstance(blk, dict):
+                            # draw特别处理
+                            if k == "draw":
+                                items = blk.get("items") or []
+                                for it in items:
+                                    if isinstance(it, dict):
+                                        t = it.get("text")
+                                        if t:
+                                            content.append(t)
 
-                                    if isinstance(cur, str):
-                                        content.append(cur)
+                            # 通用兜底
+                            for path in [("desc", "text"), ("title",)]:
+                                cur = blk
+                                for p in path:
+                                    if isinstance(cur, dict):
+                                        cur = cur.get(p)
+                                    else:
+                                        cur = None
+
+                                if isinstance(cur, str):
+                                    content.append(cur)
+
         except Exception as e:
             logging.error(f"major解析失败: {e}")
 
+        # =========================
+        # ③ 最强兜底：全树扫描
+        # =========================
         if not content:
-            logging.warning("fallback deep_find_text")
-            content.append(deep_find_text(dyn))
+            logging.warning("⚠️ 进入 deep_find_text 全兜底")
+            try:
+                content.append(deep_find_text(dyn))
+            except:
+                pass
 
+        # =========================
+        # ④ 最终兜底
+        # =========================
         if not content:
-            return "【DEBUG】解析失败"
+            return "【DEBUG】完全解析失败"
 
-        return "\n\n".join(content)
+        final_text = "\n".join(list(dict.fromkeys(content)))
+
+        logging.info(f"✅ FINAL结果: {final_text}")
+
+        return final_text
 
     except Exception as e:
         logging.error(traceback.format_exc())
         return "【DEBUG】异常"
-
 
 # ================= 动态扫描（不推送版） =================
 def check_new_dynamics(header, seen):
