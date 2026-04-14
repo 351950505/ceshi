@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import datetime
 import subprocess
@@ -20,16 +21,28 @@ HEARTBEAT_INTERVAL = 600          # 10分钟发一次运行心跳
 EXTRA_DYNAMIC_UIDS = [3546905852250875, 3546961271589219, 3546610447419885, 285340365]
 DYNAMIC_CHECK_INTERVAL = 30       # 动态轮询频率
 DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒（5分钟）
+LOG_FILE = 'bili_monitor.log'
 # ==============================================
 
-# 这里的 filemode='w' 确保每次启动程序都会清空 bili_monitor.log
-logging.basicConfig(
-    filename='bili_monitor.log',
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    encoding='utf-8',
-    filemode='w'
-)
+# ------------------------
+# 强制日志初始化：物理级清空旧日志
+# ------------------------
+def init_logging():
+    # 物理清空文件内容
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            f.truncate()
+    
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        encoding='utf-8',
+        filemode='w'
+    )
+    logging.info("="*50)
+    logging.info("新的监控任务已启动，旧日志已物理清除")
+    logging.info("="*50)
 
 # ------------------------
 # Wbi 签名算法模块
@@ -69,7 +82,7 @@ def update_wbi_keys(header):
         WBI_KEYS["img_key"] = wbi_img["img_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["sub_key"] = wbi_img["sub_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["last_update"] = time.time()
-        logging.info("Wbi 密钥已自动更新")
+        logging.info("Wbi 密钥已成功自动更新")
     except Exception: pass
 
 def wbi_request(url, params, header):
@@ -82,7 +95,7 @@ def wbi_request(url, params, header):
     except Exception: return {"code": -1}
 
 # ------------------------
-# 基础辅助模块
+# 辅助与同步模块
 # ------------------------
 def get_header():
     try:
@@ -117,9 +130,6 @@ def sync_latest_video(header):
     except Exception: pass
     return None, None
 
-# ------------------------
-# 动态雷达
-# ------------------------
 def init_extra_dynamics(header):
     seen = {}
     for uid in EXTRA_DYNAMIC_UIDS:
@@ -132,6 +142,9 @@ def init_extra_dynamics(header):
         except Exception: pass
     return seen
 
+# ------------------------
+# 动态雷达
+# ------------------------
 def check_new_dynamics(header, seen_dynamics):
     new_alerts = []
     now_ts = time.time()
@@ -153,6 +166,7 @@ def check_new_dynamics(header, seen_dynamics):
                 pub_ts = float(author_mod.get("pub_ts", 0))
             except Exception: pub_ts = 0
 
+            # 300秒时效过滤
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
                 continue
@@ -205,14 +219,14 @@ def scan_new_comments(oid, header, last_read_time, seen):
                     seen.add(rpid)
                     uname = r.get("member", {}).get("uname", "未知用户")
                     message = r.get("content", {}).get("message", "")
-                    logging.info(f"抓取评论成功: {uname}")
+                    logging.info(f"主评论抓取成功: {uname}")
                     new_list.append({"user": uname, "message": message, "ctime": ctime})
         if page_all_older: break
         time.sleep(random.uniform(0.5, 1.0))
     return new_list, max_ctime
 
 # ------------------------
-# 主监控循环
+# 主循环
 # ------------------------
 def start_monitoring(header):
     last_v_check = 0
@@ -224,33 +238,28 @@ def start_monitoring(header):
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("B站监控程序已启动 (网络异常静默容错 & 日志自动重置版)")
-
     while True:
         try:
             now = time.time()
             if is_work_time():
-                # 1. 评论监控
+                # 1. 评论
                 if oid:
-                    # 此处已修正所有中文字符逗号
                     new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
                     if new_t > last_read_time:
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        try:
-                            notifier.send_webhook_notification(title, new_c)
+                        try: notifier.send_webhook_notification(title, new_c)
                         except Exception: pass
 
-                # 2. 动态监控 (30秒频率)
+                # 2. 动态 (30秒)
                 if now - last_d_check >= DYNAMIC_CHECK_INTERVAL:
                     check_new_dynamics(header, seen_dynamics)
                     last_d_check = now
 
-                # 3. 心跳监控 (10分钟)
+                # 3. 心跳 (10分钟)
                 if now - last_hb >= HEARTBEAT_INTERVAL:
-                    try:
-                        notifier.send_webhook_notification("心跳", [{"user": "系统", "message": "运行正常"}])
+                    try: notifier.send_webhook_notification("心跳", [{"user": "系统", "message": "运行正常"}])
                     except Exception: pass
                     last_hb = now
 
@@ -258,20 +267,17 @@ def start_monitoring(header):
             else:
                 time.sleep(30)
 
-            # 定时更新监控视频 ID
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
                 res = sync_latest_video(header)
-                if res:
-                    oid, title = res
+                if res: oid, title = res
                 last_v_check = now
         except Exception:
-            # 记录主循环错误并静默重试
             logging.error(traceback.format_exc())
             time.sleep(60)
 
 if __name__ == "__main__":
+    init_logging()  # 先物理清空并初始化日志
     db.init_db()
     h = get_header()
-    # 第一次初始化密钥
     update_wbi_keys(h)
     start_monitoring(h)
