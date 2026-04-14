@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import datetime
 import subprocess
@@ -16,7 +17,7 @@ TARGET_UID = 1671203508           # 主监控视频评论的UP
 VIDEO_CHECK_INTERVAL = 21600      
 HEARTBEAT_INTERVAL = 600          
 
-# 动态监控名单 (已添加新UID)
+# 动态监控名单
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875, 
     3546961271589219, 
@@ -27,19 +28,30 @@ EXTRA_DYNAMIC_UIDS = [
 
 DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_MAX_AGE = 300             # 动态时效性限制：300秒（5分钟）
+LOG_FILE = 'bili_monitor.log'
 # ==============================================
 
-# 确保每次启动清空旧日志
-logging.basicConfig(
-    filename='bili_monitor.log',
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    encoding='utf-8',
-    filemode='w'
-)
+# ------------------------
+# 强制日志初始化：物理清空
+# ------------------------
+def init_logging():
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE, 'w', encoding='utf-8') as f:
+            f.truncate()
+    
+    logging.basicConfig(
+        filename=LOG_FILE,
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        encoding='utf-8',
+        filemode='w'
+    )
+    logging.info("="*50)
+    logging.info("B站监控启动：旧日志已清空，300s动态时效已激活")
+    logging.info("="*50)
 
 # ------------------------
-# Wbi 签名模块 (保留原始逻辑)
+# Wbi 签名模块 (保持原样)
 # ------------------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
@@ -60,8 +72,7 @@ def encWbi(params: dict, img_key: str, sub_key: str):
     filtered_params = {}
     for k, v in params.items():
         v_str = str(v)
-        for char in "!'()*":
-            v_str = v_str.replace(char, '')
+        for char in "!'()*": v_str = v_str.replace(char, '')
         filtered_params[k] = v_str
     query = urllib.parse.urlencode(filtered_params)
     wbi_sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
@@ -78,31 +89,19 @@ def update_wbi_keys(header):
         WBI_KEYS["sub_key"] = wbi_img["sub_url"].rsplit('/', 1)[1].split('.')[0]
         WBI_KEYS["last_update"] = time.time()
         logging.info("Wbi 密钥已自动更新")
-    except Exception as e:
-        logging.error("获取 Wbi 密钥失败: %s", e)
+    except Exception: pass
 
 def wbi_request(url, params, header):
     if time.time() - WBI_KEYS["last_update"] > 21600 or not WBI_KEYS["img_key"]:
         update_wbi_keys(header)
-        time.sleep(1)
     signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     try:
         r = requests.get(url, headers=header, params=signed_params, timeout=10)
-        data = r.json()
-    except Exception:
-        return {"code": -1}
-    if data.get("code") == -400:
-        update_wbi_keys(header)
-        signed_params = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
-        try:
-            r = requests.get(url, headers=header, params=signed_params, timeout=10)
-            data = r.json()
-        except Exception:
-            return {"code": -1}
-    return data
+        return r.json()
+    except Exception: return {"code": -1}
 
 # ------------------------
-# 基础辅助模块 (保留原始逻辑)
+# 基础辅助模块 (保持原样)
 # ------------------------
 def get_header():
     try:
@@ -128,37 +127,25 @@ def get_video_info(bv, header):
     except: pass
     return None, None
 
-def get_latest_video(header):
-    url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
-    params = {"host_mid": TARGET_UID}
-    try:
-        r = requests.get(url, headers=header, params=params, timeout=10)
-        data = r.json()
-        if data.get("code") != 0: return None
-        for item in data.get("data", {}).get("items",[]):
-            if item.get("type") == "DYNAMIC_TYPE_AV":
-                return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
-    except: pass
-    return None
-
 def sync_latest_video(header):
-    for i in range(5):
-        bv = get_latest_video(header)
-        if bv:
-            videos = db.get_monitored_videos()
-            if videos and videos[0][1] == bv:
-                return videos[0][0], videos[0][2]
-            oid, title = get_video_info(bv, header)
-            if oid:
-                db.clear_videos()
-                db.add_video_to_db(oid, bv, title)
-                logging.info("开始监控视频: %s", title)
-                return oid, title
-        time.sleep(10)
+    try:
+        r = requests.get(f"https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space?host_mid={TARGET_UID}", headers=header, timeout=10)
+        data = r.json()
+        items = data.get("data", {}).get("items", [])
+        for item in items:
+            if item.get("type") == "DYNAMIC_TYPE_AV":
+                arc = item.get("modules", {}).get("module_dynamic", {}).get("major", {}).get("archive", {})
+                aid, bv, title = str(arc.get("aid")), arc.get("bvid"), arc.get("title")
+                v = db.get_monitored_videos()
+                if not v or v[0][0] != aid:
+                    db.clear_videos(); db.add_video_to_db(aid, bv, title)
+                    logging.info(f"监控视频切换: {title}")
+                return aid, title
+    except: pass
     return None, None
 
 # ------------------------
-# 动态监控逻辑：修复正文提取 + 300秒时效性
+# 深度优化：动态正文抓取逻辑
 # ------------------------
 def init_extra_dynamics(header):
     return {uid: set() for uid in EXTRA_DYNAMIC_UIDS}
@@ -173,88 +160,96 @@ def check_new_dynamics(header, seen_dynamics):
             r = requests.get(url, headers=header, params=params, timeout=10)
             data = r.json()
             if data.get("code") != 0: continue
-
             items = data.get("data", {}).get("items", [])
             if not items: continue
 
             item = items[0]
             id_str = item.get("id_str")
-            if not id_str or id_str in seen_dynamics[uid]:
-                continue
+            if not id_str or id_str in seen_dynamics[uid]: continue
 
-            # 1. 时效性校验
-            try:
-                pub_ts = float(item.get("modules", {}).get("module_author", {}).get("pub_ts", 0))
+            # 时效性校验
+            author_mod = item.get("modules", {}).get("module_author", {})
+            try: pub_ts = float(author_mod.get("pub_ts", 0))
             except: pub_ts = 0
-
             if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                 seen_dynamics[uid].add(id_str)
                 continue
 
             seen_dynamics[uid].add(id_str)
 
-            # 2. 内容提取修复
+            # --- 深度提取内容逻辑 ---
             dyn_text = ""
-            try:
-                dyn_text = item.get("modules", {}).get("module_dynamic", {}).get("desc", {}).get("text", "")
-            except: pass
-
-            dyn_type = item.get("type")
             attach_str = ""
-            try:
-                if dyn_type == "DYNAMIC_TYPE_AV":
-                    title = item["modules"]["module_dynamic"]["major"]["archive"]["title"]
-                    attach_str = f"🎥 视频：《{title}》"
-                elif dyn_type == "DYNAMIC_TYPE_ARTICLE":
-                    title = item["modules"]["module_dynamic"]["major"]["article"]["title"]
-                    attach_str = f"📄 专栏：《{title}》"
-                elif dyn_type == "DYNAMIC_TYPE_FORWARD":
-                    attach_str = "🔄 转发了动态"
-                elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
-                    attach_str = "🔴 开启了直播"
-            except: pass
+            module_dyn = item.get("modules", {}).get("module_dynamic", {})
+            
+            # 1. 提取发布者的描述文本 (通用文字/图文)
+            if module_dyn.get("desc") and module_dyn["desc"].get("text"):
+                dyn_text = module_dyn["desc"]["text"]
+            
+            # 2. 如果是新版图文 (Opus格式) 且 dyn_text 为空
+            major = module_dyn.get("major", {})
+            if major.get("opus"):
+                opus = major["opus"]
+                if not dyn_text: dyn_text = opus.get("summary", {}).get("text", "")
+            
+            # 3. 提取关联卡片信息
+            dyn_type = item.get("type")
+            if dyn_type == "DYNAMIC_TYPE_AV":
+                arc = major.get("archive", {})
+                attach_str = f"🎥 视频：《{arc.get('title')}》\n摘要：{arc.get('desc', '')[:50]}"
+            elif dyn_type == "DYNAMIC_TYPE_ARTICLE":
+                art = major.get("article", {})
+                attach_str = f"📄 专栏：《{art.get('title')}》\n摘要：{art.get('desc', '')[:50]}"
+            elif dyn_type == "DYNAMIC_TYPE_FORWARD":
+                # 处理转发：尝试抓取原作者名
+                fwd_item = item.get("orig")
+                orig_author = "未知用户"
+                try: orig_author = fwd_item["modules"]["module_author"]["name"]
+                except: pass
+                attach_str = f"🔄 转发了 {orig_author} 的内容"
+            elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
+                live = major.get("live_rcmd", {}).get("content", {}).get("live_play_info", {})
+                attach_str = f"🔴 正在直播：{live.get('title')}"
 
+            # 组装正文
             final_desc = ""
-            if dyn_text: final_desc += f"【正文】: {dyn_text}\n"
+            if dyn_text: final_desc += f"【正文】:\n{dyn_text}\n"
             if attach_str: final_desc += f"【附带】: {attach_str}"
-            if not final_desc: final_desc = "发布了新动态"
+            if not final_desc: final_desc = "发布了新内容"
 
-            name = str(uid)
-            try: name = item["modules"]["module_author"]["name"]
-            except: pass
-
+            name = author_mod.get("name", str(uid))
             new_alerts.append({"user": name, "message": final_desc})
-            logging.info(f"成功抓取动态 - {name}: {final_desc.replace(chr(10), ' ')}")
+            
+            # 日志输出：完整正文压缩为单行
+            log_content = final_desc.replace('\n', ' ')
+            logging.info(f"成功抓取动态 - [{name}] 内容: {log_content}")
 
-        except Exception:
-            pass
+        except Exception: pass
 
     if new_alerts:
         try: notifier.send_webhook_notification("💡 特别关注UP主发布新内容", new_alerts)
         except: pass
 
 # ------------------------
-# 主视频评论监控逻辑 (零修改)
+# 核心扫描：主视频评论 (零修改)
 # ------------------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    new_list =[]
-    max_ctime_in_this_round = last_read_time
-    safe_read_time = last_read_time - 300
-  
+    new_list = []
+    max_ctime = last_read_time
+    safe_time = last_read_time - 300
     pn = 1
     while pn <= 10:
         params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
         try:
             data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
             if data.get("code") != 0: break
-            replies = data.get("data", {}).get("replies") or[]
+            replies = data.get("data", {}).get("replies") or []
             if not replies: break
             page_all_older = True
             for r_obj in replies:
-                rpid = r_obj["rpid_str"]
-                r_ctime = r_obj["ctime"]
-                max_ctime_in_this_round = max(max_ctime_in_this_round, r_ctime)
-                if r_ctime > safe_read_time:
+                rpid, r_ctime = r_obj["rpid_str"], r_obj["ctime"]
+                max_ctime = max(max_ctime, r_ctime)
+                if r_ctime > safe_time:
                     page_all_older = False
                     if rpid not in seen:
                         seen.add(rpid)
@@ -266,64 +261,56 @@ def scan_new_comments(oid, header, last_read_time, seen):
             if page_all_older: break
             pn += 1
             time.sleep(random.uniform(0.5, 1.0))
-        except Exception:
-            break
-    return new_list, max_ctime_in_this_round
+        except: break
+    return new_list, max_ctime
 
 def start_monitoring(header):
-    last_check = time.time()
-    last_heartbeat = time.time()
+    last_v_check = 0; last_hb = time.time(); last_d_check = 0
     oid, title = sync_latest_video(header)
-    
-    last_read_time = int(time.time())
-    seen = set()
+    last_read_time = int(time.time()); seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
 
-    logging.info("程序启动成功：旧日志已清空，监控300秒内最新动态")
-    
+    logging.info("监控服务已启动...")
+
     while True:
         try:
-            current = time.time()
+            now = time.time()
             if is_work_time():
                 # 1. 评论监控
                 if oid:
-                    new_list, new_last_read_time = scan_new_comments(oid, header, last_read_time, seen)
-                    if new_last_read_time > last_read_time:
-                        last_read_time = new_last_read_time
-                    if new_list:
-                        new_list.sort(key=lambda x: x["ctime"])
-                        for item in new_list:
-                            logging.info(f"成功抓取评论 - {item['user']}: {item['message'][:50]}...")
-                        try: notifier.send_webhook_notification(title, new_list)
+                    new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
+                    if new_t > last_read_time: last_read_time = new_t
+                    if new_c:
+                        new_c.sort(key=lambda x: x["ctime"])
+                        for item in new_c:
+                            logging.info(f"抓取评论 - [{item['user']}]: {item['message'][:30]}...")
+                        try: notifier.send_webhook_notification(title, new_c)
                         except: pass
 
                 # 2. 动态监控
-                check_new_dynamics(header, seen_dynamics)
+                if now - last_d_check >= DYNAMIC_CHECK_INTERVAL:
+                    check_new_dynamics(header, seen_dynamics)
+                    last_d_check = now
 
                 # 3. 心跳
-                if current - last_heartbeat >= HEARTBEAT_INTERVAL:
-                    notifier.send_webhook_notification(
-                        "监控心跳",
-                        [{"user": "系统", "message": f"程序运行正常\n监控视频: {title or '待获取'}"}]
-                    )
-                    last_heartbeat = current
+                if now - last_hb >= HEARTBEAT_INTERVAL:
+                    notifier.send_webhook_notification("心跳", [{"user": "系统", "message": f"运行中\n监控: {title or '无'}"}])
+                    last_hb = now
 
                 time.sleep(random.uniform(10, 20))
             else:
                 time.sleep(30)
 
-            if time.time() - last_check > VIDEO_CHECK_INTERVAL:
-                new_oid, new_title = sync_latest_video(header)
-                if new_oid and new_oid != oid:
-                    oid, title = new_oid, new_title
-                    last_read_time = int(time.time()); seen.clear()
-                last_check = time.time()
-        except Exception as e:
-            logging.error(traceback.format_exc())
-            time.sleep(60)
+            if now - last_v_check > VIDEO_CHECK_INTERVAL:
+                res = sync_latest_video(header)
+                if res: oid, title = res
+                last_v_check = now
+        except Exception:
+            logging.error(traceback.format_exc()); time.sleep(60)
 
 if __name__ == "__main__":
+    init_logging()
     db.init_db()
-    header = get_header()
-    update_wbi_keys(header)
-    start_monitoring(header)
+    h = get_header()
+    update_wbi_keys(h)
+    start_monitoring(h)
