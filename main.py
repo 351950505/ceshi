@@ -195,24 +195,280 @@ def init_extra_dynamics(header):
         seen[uid] = set()
         data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": uid}, header)
         if data.get("code") == 0:
-            for item in (data.get("data") or {}).get("items", []):
+            for item in (data.get("data") or {}).get("items",[]):
                 if item.get("id_str"):
                     seen[uid].add(item["id_str"])
         else:
             logging.warning(f"⚠️ 初始化动态失败 UID:{uid}, Code:{data.get('code')}")
         
-        # 🌟 修复关键：增加 2~3 秒的休眠，防止启动时瞬间高并发导致被 B站拉黑 (-352)
-        time.sleep(random.uniform(2, 3))
+        # 🌟 延长休眠时间到 3~5 秒，完美规避初始化时的瞬间高并发 -352 拦截
+        time.sleep(random.uniform(3, 5))
         
     return seen
 
 
 def extract_dynamic_text(item):
-    """
-    终极富文本提取器（根据 F12 源码定制）：
-    只允许穿透 `module_dynamic` 结构，完美抓取段落中的 span/text，并杜绝 UI 词汇！
-    """
     try:
         res =[]
         dyn_type = item.get("type", "")
-        if dyn_type == "
+        if dyn_type == "DYNAMIC_TYPE_FORWARD":
+            res.append("【🔄 转发动态】")
+        elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
+            res.append("【🔴 直播推送】")
+
+        modules = item.get("modules") or {}
+        dyn_module = modules.get("module_dynamic") or {}
+
+        def harvest_texts(obj):
+            texts =[]
+            blacklist = {"展开", "收起", "网页链接", "投票", "互动抽奖", "去看看", "查看详情"}
+            
+            def walk(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if isinstance(v, str):
+                            v_str = v.strip()
+                            if v_str.startswith("{") or v_str.startswith("["):
+                                try:
+                                    walk(json.loads(v_str))
+                                    continue
+                                except:
+                                    pass
+                            
+                            if k in["text", "title", "desc", "summary", "content"]:
+                                if v_str and not v_str.startswith("http") and not v_str.startswith("//") and v_str not in blacklist:
+                                    if v_str not in texts:
+                                        texts.append(v_str)
+                        else:
+                            walk(v)
+                elif isinstance(node, list):
+                    for i in node:
+                        walk(i)
+            walk(obj)
+            return texts
+
+        main_texts = harvest_texts(dyn_module)
+        if main_texts:
+            res.append("\n".join(main_texts))
+
+        major = dyn_module.get("major") or {}
+        m_type = major.get("type", "")
+        if m_type == "MAJOR_TYPE_OPUS":
+            pics = major.get("opus", {}).get("pics") or[]
+            if pics: res.append(f"🖼️[附图 {len(pics)} 张]")
+        elif m_type == "MAJOR_TYPE_DRAW":
+            items_draw = major.get("draw", {}).get("items") or[]
+            if items_draw: res.append(f"🖼️[附图 {len(items_draw)} 张]")
+
+        orig = item.get("orig")
+        if orig:
+            res.append("\n------ 被转发内容 ------")
+            orig_author = orig.get("modules", {}).get("module_author", {}).get("name", "某用户")
+            res.append(f"@{orig_author}:")
+            
+            orig_dyn_module = orig.get("modules", {}).get("module_dynamic") or {}
+            orig_texts = harvest_texts(orig_dyn_module)
+            
+            if orig_texts:
+                res.append("\n".join(orig_texts))
+            else:
+                res.append("【原内容已被删除或为纯分享卡片】")
+                
+            o_major = orig_dyn_module.get("major") or {}
+            o_m_type = o_major.get("type", "")
+            if o_m_type == "MAJOR_TYPE_OPUS":
+                o_pics = o_major.get("opus", {}).get("pics") or[]
+                if o_pics: res.append(f"🖼️[附图 {len(o_pics)} 张]")
+            elif o_m_type == "MAJOR_TYPE_DRAW":
+                o_items_draw = o_major.get("draw", {}).get("items") or[]
+                if o_items_draw: res.append(f"🖼️[附图 {len(o_items_draw)} 张]")
+
+        final_text = "\n".join(res).strip()
+        
+        if not final_text:
+            final_text = "【特殊分享卡片/纯图片，请点击下方直达链接查看】"
+            
+        if len(final_text) > 1500:
+            final_text = final_text[:1500] + "\n\n...(内容过长，已安全保护截断)"
+            
+        return final_text
+
+    except Exception as e:
+        logging.error(f"提取动态文本发生异常: {e}\n{traceback.format_exc()}")
+        return "发布了新动态 (内容解析安全兜底)"
+
+
+def check_new_dynamics(header, seen_dynamics):
+    alerts =[]
+    has_new = False
+    now_ts = time.time()
+
+    for uid in EXTRA_DYNAMIC_UIDS:
+        try:
+            data = safe_request(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+                {"host_mid": uid},
+                header
+            )
+
+            if data.get("code") != 0:
+                logging.warning(f"⚠️ API异常! UID:{uid}, Code:{data.get('code')}, Msg:{data.get('message', '未知')}")
+                continue
+
+            items = (data.get("data") or {}).get("items",[])
+
+            for item in items:
+                id_str = item.get("id_str")
+                if not id_str: continue
+
+                if id_str in seen_dynamics[uid]: continue
+                seen_dynamics[uid].add(id_str)
+
+                modules = item.get("modules") or {}
+                author = modules.get("module_author") or {}
+
+                try: pub_ts = float(author.get("pub_ts", 0))
+                except: pub_ts = 0
+
+                name = author.get("name", str(uid))
+                time_diff = now_ts - pub_ts
+                
+                if time_diff > DYNAMIC_MAX_AGE:
+                    logging.info(f"⏭️ 忽略老动态 [{name}] ID:{id_str}, 距今 {int(time_diff)} 秒")
+                    continue
+
+                text = extract_dynamic_text(item)
+                final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"
+
+                has_new = True
+                alerts.append({
+                    "user": name,
+                    "message": final_msg
+                })
+                logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
+                break
+
+        except Exception as e:
+            logging.error(f"❌ 动态获取循环异常 {uid}: {e}\n{traceback.format_exc()}")
+
+        # 🌟 增加休眠时间到 3~4 秒，日常轮询也避免查得太快被关小黑屋
+        time.sleep(random.uniform(3, 4))
+
+    if alerts:
+        try:
+            notifier.send_webhook_notification("💡 特别关注UP主发布新内容", alerts)
+            logging.info(f"🚀 成功发送 {len(alerts)} 条 Webhook 动态通知！")
+        except Exception as e:
+            logging.error(f"❌ Webhook 发送失败（可能是文本超长或含特殊字符）: {e}\n{traceback.format_exc()}")
+
+    return has_new
+
+
+# ---------------- 评论 ----------------
+def scan_new_comments(oid, header, last_read_time, seen):
+    new_list =[]
+    max_ctime = last_read_time
+    now_ts = int(time.time())
+
+    safe_time = min(last_read_time - 300, now_ts - 600)
+
+    pn = 1
+    while pn <= 10:
+        data = wbi_request(
+            "https://api.bilibili.com/x/v2/reply",
+            {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20},
+            header
+        )
+        replies = (data.get("data") or {}).get("replies") or[]
+        if not replies: break
+        
+        page_old = True
+        for r in replies:
+            rpid = r["rpid_str"]
+            ctime = r["ctime"]
+            max_ctime = max(max_ctime, ctime)
+
+            if ctime > safe_time:
+                page_old = False
+                if rpid not in seen:
+                    seen.add(rpid)
+                    new_list.append({
+                        "user": r["member"]["uname"],
+                        "message": r["content"]["message"],
+                        "ctime": ctime
+                    })
+
+        if page_old and pn >= 3:
+            break
+
+        pn += 1
+        time.sleep(random.uniform(0.5, 1))
+
+    return new_list, max_ctime
+
+
+# ---------------- 主循环 ----------------
+def start_monitoring(header):
+    last_v_check = 0
+    last_hb = time.time()
+    last_d_check = 0
+    burst_end = 0
+
+    oid, title = sync_latest_video(header)
+
+    last_read_time = int(time.time())
+    seen_comments = set()
+    seen_dynamics = init_extra_dynamics(header)
+
+    logging.info("监控服务已启动，正在扫描新数据...")
+
+    while True:
+        try:
+            now = time.time()
+
+            if is_work_time():
+                if oid:
+                    new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
+                    if new_t > last_read_time:
+                        last_read_time = new_t
+
+                    if new_c:
+                        new_c.sort(key=lambda x: x["ctime"])
+                        try:
+                            notifier.send_webhook_notification(title, new_c)
+                        except Exception as e:
+                            logging.error(f"评论通知发送失败: {e}\n{traceback.format_exc()}")
+
+                interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
+                if now - last_d_check >= interval:
+                    if check_new_dynamics(header, seen_dynamics):
+                        burst_end = now + DYNAMIC_BURST_DURATION
+                    last_d_check = now
+
+                if now - last_hb >= HEARTBEAT_INTERVAL:
+                    try:
+                        notifier.send_webhook_notification("心跳", [{"user": "系统", "message": "正常运行中"}])
+                    except Exception:
+                        pass
+                    last_hb = now
+
+                time.sleep(random.uniform(10, 15))
+
+            else:
+                time.sleep(30)
+
+            if now - last_v_check > VIDEO_CHECK_INTERVAL:
+                res = sync_latest_video(header)
+                if res: oid, title = res
+                last_v_check = now
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            time.sleep(60)
+
+if __name__ == "__main__":
+    init_logging()
+    db.init_db()
+    h = get_header()
+    update_wbi_keys(h)
+    start_monitoring(h)
