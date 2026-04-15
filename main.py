@@ -17,7 +17,7 @@ import notifier
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 10          # 修改：心跳间隔改为10秒，并改为日志输出
+HEARTBEAT_INTERVAL = 10          # 心跳间隔10秒，改为日志输出
 
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875,
@@ -380,7 +380,10 @@ def init_extra_dynamics(header):
 def check_new_dynamics(header, seen_dynamics):
     """
     使用增量接口检测并拉取新动态，处理多条新动态，支持转发递归提取
-    修复：update_baseline 参数仅在非空时传递，避免API报错
+    修复：
+      1. update_baseline 参数仅在非空时传递，避免API报错
+      2. 去除超时动态的日志输出（改为debug级别，默认不显示）
+      3. 当 baseline 为空时，尝试重新初始化（避免反复拉取全部动态）
     """
     alerts = []
     has_new = False
@@ -395,26 +398,59 @@ def check_new_dynamics(header, seen_dynamics):
         baseline = current_state.get("baseline", "")
         offset = current_state.get("offset", "")
         
-        # 第一步：快速检测是否有新动态（仅当 baseline 非空时）
-        try:
-            if baseline:   # 修复：只有非空才传参，否则跳过检测
-                update_params = {"type": "all", "web_location": "333.1365"}
-                update_params["update_baseline"] = baseline
-                update_data = wbi_request(
-                    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
-                    update_params,
+        # 如果 baseline 为空，尝试重新初始化（防止因初始化失败导致反复拉取全量）
+        if not baseline:
+            logging.info(f"UP {uid} baseline 为空，尝试重新初始化...")
+            try:
+                params = {
+                    "host_mid": uid,
+                    "type": "all",
+                    "timezone_offset": "-480",
+                    "platform": "web",
+                    "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
+                    "web_location": "333.1365",
+                    "offset": ""
+                }
+                data = wbi_request(
+                    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
+                    params,
                     header
                 )
-                if update_data.get("code") != 0:
-                    logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
-                    # 继续拉取，不跳过
+                if data.get("code") == 0:
+                    feed_data = data.get("data") or {}
+                    new_baseline = feed_data.get("update_baseline", "")
+                    new_offset = feed_data.get("offset", "")
+                    if new_baseline:
+                        state[uid_str]["baseline"] = new_baseline
+                        baseline = new_baseline
+                    if new_offset:
+                        state[uid_str]["offset"] = new_offset
+                        offset = new_offset
+                    updated = True
+                    logging.info(f"UP {uid} 重新初始化成功: baseline={baseline}, offset={offset}")
                 else:
-                    update_num = update_data.get("data", {}).get("update_num", 0)
-                    if update_num == 0:
-                        continue  # 无新动态
+                    logging.warning(f"UP {uid} 重新初始化失败: {data.get('message')}")
+                    continue  # 跳过本次检查
+            except Exception as e:
+                logging.error(f"UP {uid} 重新初始化异常: {e}")
+                continue
+        
+        # 第一步：快速检测是否有新动态（仅当 baseline 非空时）
+        try:
+            update_params = {"type": "all", "web_location": "333.1365"}
+            update_params["update_baseline"] = baseline
+            update_data = wbi_request(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
+                update_params,
+                header
+            )
+            if update_data.get("code") != 0:
+                logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
+                # 继续拉取，不跳过
             else:
-                # baseline为空，说明可能刚初始化，直接拉取
-                logging.info(f"UP {uid} baseline 为空，跳过检测，直接拉取")
+                update_num = update_data.get("data", {}).get("update_num", 0)
+                if update_num == 0:
+                    continue  # 无新动态
         except Exception as e:
             logging.error(f"UP {uid} 检测更新异常: {e}")
             # 继续拉取
@@ -428,10 +464,9 @@ def check_new_dynamics(header, seen_dynamics):
                 "platform": "web",
                 "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
                 "web_location": "333.1365",
-                "offset": offset
+                "offset": offset,
+                "update_baseline": baseline   # 此时 baseline 一定非空
             }
-            if baseline:
-                fetch_params["update_baseline"] = baseline
             
             data = wbi_request(
                 "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
@@ -466,7 +501,8 @@ def check_new_dynamics(header, seen_dynamics):
                 pub_ts = author.get("pub_ts", 0)
                 time_diff = now_ts - pub_ts
                 if time_diff > DYNAMIC_MAX_AGE:
-                    logging.info(f"⏭️ 忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}, 距今 {int(time_diff)} 秒")
+                    # 改为 debug 级别，默认不输出（避免日志刷屏）
+                    logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}, 距今 {int(time_diff)} 秒")
                     continue
                 
                 seen_dynamics[uid].add(dyn_id)
