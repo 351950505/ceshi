@@ -10,25 +10,39 @@ import urllib.parse
 import requests
 import database as db
 import notifier
+from datetime import datetime, timezone, timedelta
 
-# ================= 全局时间补偿 =================
-TIME_OFFSET = 0
+# ================= 全局北京时间 =================
+BEIJING_TZ = timezone(timedelta(hours=8))
 
-def get_beijing_time():
-    """启动时从网络获取正确北京时间，返回时间戳"""
+def beijing_now():
+    return datetime.now(BEIJING_TZ)
+
+# ================= 日志使用北京时间 =================
+class BeijingFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = beijing_now()
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
+def init_logging():
     try:
-        r = requests.get("https://www.timeapi.io/api/Time/current/zone?timeZone=Asia/Shanghai", timeout=5)
-        if r.status_code == 200:
-            return r.json()["unixTime"] / 1000.0
+        if os.path.exists(LOG_FILE):
+            open(LOG_FILE, "w").close()
     except:
         pass
-    try:
-        r = requests.get("http://worldtimeapi.org/api/timezone/Asia/Shanghai", timeout=5)
-        if r.status_code == 200:
-            return r.json()["unixtime"]
-    except:
-        pass
-    return time.time()
+    handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    handler.setFormatter(BeijingFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+    for h in logger.handlers[:]:
+        if not isinstance(h, logging.FileHandler):
+            logger.removeHandler(h)
+    logging.info("=" * 60)
+    logging.info("B站监控系统启动（日志强制北京时间）")
+    logging.info("=" * 60)
 
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508
@@ -38,20 +52,6 @@ EXTRA_DYNAMIC_UIDS = [3546905852250875,3546961271589219,3546610447419885,2853403
 DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_MAX_AGE = 600
 LOG_FILE = "bili_monitor.log"
-
-def init_logging():
-    global TIME_OFFSET
-    TIME_OFFSET = get_beijing_time() - time.time()   # 计算补偿值
-    
-    try:
-        if os.path.exists(LOG_FILE):
-            open(LOG_FILE, "w").close()
-    except:
-        pass
-    logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", encoding="utf-8", filemode="w")
-    logging.info("=" * 60)
-    logging.info("B站监控系统启动 (时间已校准)")
-    logging.info("=" * 60)
 
 def safe_request(url, params, header, retries=3):
     h = header.copy()
@@ -191,7 +191,7 @@ def init_extra_dynamics(header):
 
 def check_new_dynamics(header, seen_dynamics):
     alerts = []
-    now_ts = time.time() + TIME_OFFSET   # 使用校准后的北京时间
+    now_ts = time.time()
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
             data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": uid}, header)
@@ -221,7 +221,7 @@ def check_new_dynamics(header, seen_dynamics):
             logging.error(f"Webhook失败: {e}")
     return bool(alerts)
 
-# ---------------- 评论（完整复原） ----------------
+# ---------------- 评论 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
@@ -250,7 +250,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
 
 # ---------------- 主循环 ----------------
 def start_monitoring(header):
-    time.sleep(random.uniform(0, 8))   # 启动随机延迟防风控
+    time.sleep(random.uniform(0, 8))
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
@@ -259,7 +259,7 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
-    logging.info("监控服务已启动（时间已校准）")
+    logging.info("监控服务已启动（日志北京时间）")
     while True:
         try:
             now = time.time()
