@@ -27,8 +27,8 @@ EXTRA_DYNAMIC_UIDS = [
     3706948578969654
 ]
 
-DYNAMIC_CHECK_INTERVAL = 30
-DYNAMIC_BURST_INTERVAL = 10
+DYNAMIC_CHECK_INTERVAL = 15      # 从30秒改为15秒，提高响应速度
+DYNAMIC_BURST_INTERVAL = 8       # 爆发模式间隔8秒
 DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
 
@@ -400,10 +400,7 @@ def fetch_dynamics_page(uid, offset, header):
 def check_new_dynamics(header, seen_dynamics):
     """
     使用增量接口检测并拉取新动态，处理多条新动态，支持转发递归提取
-    修复：
-      1. baseline 使用第一条动态的 id_str，不再依赖 API 返回的 update_baseline（可能为空）
-      2. update_baseline 参数仅在非空时传递
-      3. 去除超时动态的 INFO 日志刷屏
+    优化：一旦检测到新动态立即拉取并推送，无额外延迟
     """
     alerts = []
     has_new = False
@@ -453,7 +450,7 @@ def check_new_dynamics(header, seen_dynamics):
                 continue
         
         # 此时 baseline 非空，进行增量检测
-        # 第一步：检测是否有新动态
+        # 第一步：快速检测是否有新动态
         try:
             update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
             update_data = wbi_request(
@@ -471,7 +468,7 @@ def check_new_dynamics(header, seen_dynamics):
         except Exception as e:
             logging.error(f"UP {uid} 检测更新异常: {e}")
         
-        # 第二步：拉取增量动态
+        # 第二步：拉取增量动态（立即拉取，不等待）
         try:
             fetch_params = {
                 "host_mid": uid,
@@ -543,7 +540,7 @@ def check_new_dynamics(header, seen_dynamics):
         except Exception as e:
             logging.error(f"UP {uid} 处理动态异常: {e}\n{traceback.format_exc()}")
         
-        time.sleep(random.uniform(1, 2))
+        time.sleep(random.uniform(0.5, 1))  # UP主之间短暂延迟，避免请求过快
     
     if updated:
         save_dynamic_state(state)
@@ -678,7 +675,8 @@ def start_monitoring(header):
                     logging.info("💓 心跳: 监控系统正常运行中")
                     last_hb = now
 
-                time.sleep(random.uniform(10, 15))
+                # 优化：缩短主循环休眠时间，提高轮询频率（从10-15秒改为3-5秒）
+                time.sleep(random.uniform(3, 5))
 
             else:
                 time.sleep(30)
