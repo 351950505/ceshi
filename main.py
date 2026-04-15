@@ -47,13 +47,13 @@ def init_logging():
     logging.basicConfig(
         filename=LOG_FILE,
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s[%(levelname)s] %(message)s",
         encoding="utf-8",
         filemode="w"
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (精准解析结构版 + 全面WBI防封禁)")
+    logging.info("B站监控系统启动 (已装载新版Opus富文本递归收割机)")
     logging.info("=" * 60)
 
 
@@ -82,7 +82,7 @@ def safe_request(url, params, header, retries=3):
     return {"code": -500}
 
 
-# ---------------- WBI 签名机制 (对抗B站风控) ----------------
+# ---------------- WBI 签名机制 (仅评论接口使用) ----------------
 WBI_KEYS = {
     "img_key": "",
     "sub_key": "",
@@ -153,8 +153,7 @@ def is_work_time():
 
 # ---------------- 视频 ----------------
 def get_latest_video(header):
-    # 🌟 修复：防拉黑！视频列表请求也挂载 WBI
-    data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": TARGET_UID}, header)
+    data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": TARGET_UID}, header)
     if data.get("code") != 0:
         return None
     items = (data.get("data") or {}).get("items",[])
@@ -186,13 +185,12 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（绝对稳定的纯净解析引擎） ----------------
+# ---------------- 动态（全新富文本节点递归收割机） ----------------
 def init_extra_dynamics(header):
     seen = {}
     for uid in EXTRA_DYNAMIC_UIDS:
         seen[uid] = set()
-        # 🌟 修复：防拉黑！初始化也挂载 WBI
-        data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": uid}, header)
+        data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": uid}, header)
         if data.get("code") == 0:
             for item in (data.get("data") or {}).get("items",[]):
                 if item.get("id_str"):
@@ -201,72 +199,72 @@ def init_extra_dynamics(header):
 
 
 def extract_dynamic_text(item):
-    """参考 Bilibili_crawler，精准锁定业务数据节点，彻底杜绝 UI 词汇污染"""
+    """
+    终极富文本提取器：
+    直接对真实的动态模块（抛弃UI层）进行全深度 JSON 递归。
+    专门对付 B 站新版 Opus 编辑器把文字切碎藏进 span 节点的恶心做法。
+    """
     try:
         res =[]
         dyn_type = item.get("type", "")
-        
         if dyn_type == "DYNAMIC_TYPE_FORWARD":
             res.append("【🔄 转发动态】")
         elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
             res.append("【🔴 直播推送】")
             
         modules = item.get("modules") or {}
+        # 核心：只抓取真实动态模块，绝对不碰 module_more（删除动态等UI字眼全在里面）
         dyn_module = modules.get("module_dynamic") or {}
         
-        # 1. 精准提取外层正文 (B站官方将真实文字存放在 desc.text 中)
-        desc_text = dyn_module.get("desc", {}).get("text", "")
-        if desc_text and str(desc_text).strip():
-            res.append(str(desc_text).strip())
+        # 定义一个全自动递归爬取文字的函数
+        def harvest_texts(obj):
+            texts =[]
+            # 过滤掉 B站动态内部自带的组件按钮字眼
+            blacklist = {"展开", "收起", "全文", "网页链接", "动态", "查看详情", "去看看", "互动抽奖", "投票"}
+            
+            def walk(node):
+                if isinstance(node, dict):
+                    for k, v in node.items():
+                        if isinstance(v, str):
+                            v_str = v.strip()
+                            # 应对 B 站把直播信息打包成字符串 JSON 的情况，强行解包继续扫
+                            if v_str.startswith("{") or v_str.startswith("["):
+                                try:
+                                    walk(json.loads(v_str))
+                                    continue
+                                except: pass
+                                
+                            # 只要键名是这些，无论嵌套多少层 span 还是 paragraph，全吸出来
+                            if k in["text", "title", "desc", "summary", "content"]:
+                                # 排除空字串、网址链接和 UI 按钮
+                                if v_str and not v_str.startswith("http") and not v_str.startswith("//") and v_str not in blacklist:
+                                    # 去重防堆叠
+                                    if v_str not in texts:
+                                        texts.append(v_str)
+                        else:
+                            walk(v)
+                elif isinstance(node, list):
+                    for i in node:
+                        walk(i)
+            walk(obj)
+            return texts
 
-        # 2. 精准提取内层卡片数据 (major)
+        # 1. 收割主动态的所有真实文本
+        main_texts = harvest_texts(dyn_module)
+        if main_texts:
+            res.append("\n".join(main_texts))
+
+        # 2. 补充图片数量提示 (辅助信息)
         major = dyn_module.get("major") or {}
         m_type = major.get("type", "")
-        
-        if m_type == "MAJOR_TYPE_ARCHIVE":
-            arc = major.get("archive") or {}
-            if arc.get("title"): res.append(f"▶️ 视频: 《{arc.get('title')}》")
-            if arc.get("desc"): res.append(f"📝 简介: {arc.get('desc')}")
-            
-        elif m_type == "MAJOR_TYPE_OPUS":
-            opus = major.get("opus") or {}
-            if opus.get("title"): res.append(f"📰 图文/专栏: 《{opus.get('title')}》")
-            sum_text = opus.get("summary", {}).get("text", "")
-            if sum_text and str(sum_text).strip():
-                res.append(f"📝 摘要: {str(sum_text).strip()}")
-            if opus.get("pics"): 
-                res.append(f"🖼️ [附图 {len(opus.get('pics'))} 张]")
-                
+        if m_type == "MAJOR_TYPE_OPUS":
+            pics = major.get("opus", {}).get("pics") or []
+            if pics: res.append(f"🖼️[附图 {len(pics)} 张]")
         elif m_type == "MAJOR_TYPE_DRAW":
-            items = major.get("draw", {}).get("items") or []
-            if items: res.append(f"🖼️[共 {len(items)} 张图片]")
-            
-        elif m_type == "MAJOR_TYPE_ARTICLE":
-            art = major.get("article") or {}
-            if art.get("title"): res.append(f"📚 专栏: 《{art.get('title')}》")
-            if art.get("desc"): res.append(f"📝 摘要: {art.get('desc')}")
-            
-        elif m_type == "MAJOR_TYPE_LIVE_RCMD":
-            try:
-                live_json = json.loads(major.get("live_rcmd", {}).get("content", "{}"))
-                live_title = live_json.get("live_play_info", {}).get("title", "")
-                if live_title: res.append(f"🔴 直播间: {live_title}")
-            except: pass
-            
-        elif m_type == "MAJOR_TYPE_COMMON":
-            common = major.get("common") or {}
-            if common.get("title"): res.append(f"📌 卡片: {common.get('title')}")
-            if common.get("desc"): res.append(f"💬 内容: {common.get('desc')}")
-            
-        elif m_type in["MAJOR_TYPE_PGC", "MAJOR_TYPE_UGC_SEASON"]:
-            pgc = major.get("pgc") or major.get("ugc_season") or {}
-            if pgc.get("title"): res.append(f"🎬 合集/番剧: 《{pgc.get('title')}》")
-            
-        elif m_type == "MAJOR_TYPE_COURSES":
-            crs = major.get("courses") or {}
-            if crs.get("title"): res.append(f"👨‍🏫 课程: 《{crs.get('title')}》")
+            items_draw = major.get("draw", {}).get("items") or[]
+            if items_draw: res.append(f"🖼️ [附图 {len(items_draw)} 张]")
 
-        # 3. 提取被转发内容 (如果存在)
+        # 3. 如果是转发，收割原动态文本
         orig = item.get("orig")
         if orig:
             res.append("\n------ 被转发内容 ------")
@@ -274,23 +272,24 @@ def extract_dynamic_text(item):
             res.append(f"@{orig_author}:")
             
             orig_dyn_module = orig.get("modules", {}).get("module_dynamic") or {}
-            o_desc_text = orig_dyn_module.get("desc", {}).get("text", "")
-            if o_desc_text and str(o_desc_text).strip():
-                res.append(str(o_desc_text).strip())
-                
-            orig_major = orig_dyn_module.get("major") or {}
-            o_m_type = orig_major.get("type", "")
+            orig_texts = harvest_texts(orig_dyn_module)
             
-            if o_m_type == "MAJOR_TYPE_ARCHIVE":
-                o_arc = orig_major.get("archive") or {}
-                if o_arc.get("title"): res.append(f"▶️ 视频: 《{o_arc.get('title')}》")
-            elif o_m_type == "MAJOR_TYPE_OPUS":
-                o_opus = orig_major.get("opus") or {}
-                if o_opus.get("title"): res.append(f"📰 图文: 《{o_opus.get('title')}》")
-                o_sum = o_opus.get("summary", {}).get("text", "")
-                if o_sum and str(o_sum).strip(): res.append(f"📝 摘要: {str(o_sum).strip()}")
+            if orig_texts:
+                res.append("\n".join(orig_texts))
+            else:
+                res.append("【原内容已被删除或无文本】")
+                
+            # 原动态附图提示
+            o_major = orig_dyn_module.get("major") or {}
+            o_m_type = o_major.get("type", "")
+            if o_m_type == "MAJOR_TYPE_OPUS":
+                o_pics = o_major.get("opus", {}).get("pics") or []
+                if o_pics: res.append(f"🖼️[附图 {len(o_pics)} 张]")
+            elif o_m_type == "MAJOR_TYPE_DRAW":
+                o_items = o_major.get("draw", {}).get("items") or[]
+                if o_items: res.append(f"🖼️ [附图 {len(o_items)} 张]")
 
-        # 4. 组合并防空兜底
+        # 4. 组装并截断
         final_text = "\n".join(res).strip()
         
         if not final_text:
@@ -313,8 +312,7 @@ def check_new_dynamics(header, seen_dynamics):
 
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
-            # 🌟 修复：彻底使用 WBI 签名查询动态，防止频繁刷新被 B 站拉黑拦截
-            data = wbi_request(
+            data = safe_request(
                 "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
                 {"host_mid": uid},
                 header
@@ -355,7 +353,7 @@ def check_new_dynamics(header, seen_dynamics):
                     "message": final_msg
                 })
 
-                logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
+                logging.info(f"✅ 抓取到新动态并准备推送[{name}]:\n{final_msg}")
                 break
 
         except Exception as e:
