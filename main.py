@@ -17,7 +17,7 @@ import notifier
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 600
+HEARTBEAT_INTERVAL = 10          # 修改：心跳间隔改为10秒，并改为日志输出
 
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875,
@@ -33,7 +33,7 @@ DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
 
 LOG_FILE = "bili_monitor.log"
-DYNAMIC_STATE_FILE = "dynamic_state.json"   # 新增：保存每个UP主的baseline和offset
+DYNAMIC_STATE_FILE = "dynamic_state.json"   # 保存每个UP主的baseline和offset
 # ==============================================
 
 
@@ -380,6 +380,7 @@ def init_extra_dynamics(header):
 def check_new_dynamics(header, seen_dynamics):
     """
     使用增量接口检测并拉取新动态，处理多条新动态，支持转发递归提取
+    修复：update_baseline 参数仅在非空时传递，避免API报错
     """
     alerts = []
     has_new = False
@@ -394,28 +395,29 @@ def check_new_dynamics(header, seen_dynamics):
         baseline = current_state.get("baseline", "")
         offset = current_state.get("offset", "")
         
-        # 第一步：快速检测是否有新动态
+        # 第一步：快速检测是否有新动态（仅当 baseline 非空时）
         try:
-            update_params = {
-                "type": "all",
-                "update_baseline": baseline,
-                "web_location": "333.1365"
-            }
-            update_data = wbi_request(
-                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
-                update_params,
-                header
-            )
-            if update_data.get("code") != 0:
-                logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
-                continue
-            
-            update_num = update_data.get("data", {}).get("update_num", 0)
-            if update_num == 0:
-                continue  # 无新动态
+            if baseline:   # 修复：只有非空才传参，否则跳过检测
+                update_params = {"type": "all", "web_location": "333.1365"}
+                update_params["update_baseline"] = baseline
+                update_data = wbi_request(
+                    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
+                    update_params,
+                    header
+                )
+                if update_data.get("code") != 0:
+                    logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
+                    # 继续拉取，不跳过
+                else:
+                    update_num = update_data.get("data", {}).get("update_num", 0)
+                    if update_num == 0:
+                        continue  # 无新动态
+            else:
+                # baseline为空，说明可能刚初始化，直接拉取
+                logging.info(f"UP {uid} baseline 为空，跳过检测，直接拉取")
         except Exception as e:
             logging.error(f"UP {uid} 检测更新异常: {e}")
-            continue
+            # 继续拉取
         
         # 第二步：拉取新动态
         try:
@@ -426,9 +428,11 @@ def check_new_dynamics(header, seen_dynamics):
                 "platform": "web",
                 "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
                 "web_location": "333.1365",
-                "update_baseline": baseline,
                 "offset": offset
             }
+            if baseline:
+                fetch_params["update_baseline"] = baseline
+            
             data = wbi_request(
                 "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
                 fetch_params,
@@ -449,7 +453,7 @@ def check_new_dynamics(header, seen_dynamics):
                 updated = True
                 logging.info(f"UP {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
             
-            # 遍历所有新动态（items 按时间倒序，最新在前）
+            # 遍历所有新动态
             for item in items:
                 dyn_id = item.get("id_str")
                 if not dyn_id:
@@ -457,7 +461,6 @@ def check_new_dynamics(header, seen_dynamics):
                 if dyn_id in seen_dynamics[uid]:
                     continue
                 
-                # 超时过滤
                 modules = item.get("modules") or {}
                 author = modules.get("module_author") or {}
                 pub_ts = author.get("pub_ts", 0)
@@ -470,27 +473,21 @@ def check_new_dynamics(header, seen_dynamics):
                 name = author.get("name", str(uid))
                 text = extract_dynamic_text(item)
                 
-                # 处理转发动态：提取原始内容
+                # 处理转发动态
                 if item.get("type") == "DYNAMIC_TYPE_FORWARD":
                     orig = item.get("orig")
                     if orig:
                         orig_text = extract_dynamic_text(orig)
                         if orig_text:
-                            # 如果转发者有附言，保留；否则只显示原文
                             if text:
                                 text = f"{text}\n【转发原文】{orig_text}"
                             else:
                                 text = f"【转发原文】{orig_text}"
-                        # 可选：添加原始动态链接
                         orig_id = orig.get("id_str")
                         if orig_id:
                             text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
                 
-                # 构建推送消息
-                if text:
-                    final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-                else:
-                    final_msg = f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
+                final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
                 
                 alerts.append({
                     "user": name,
@@ -504,11 +501,9 @@ def check_new_dynamics(header, seen_dynamics):
         
         time.sleep(random.uniform(1, 2))
     
-    # 保存状态（如果有更新）
     if updated:
         save_dynamic_state(state)
     
-    # 发送通知
     if alerts:
         try:
             notifier.send_webhook_notification(
@@ -634,17 +629,9 @@ def start_monitoring(header):
 
                     last_d_check = now
 
+                # 心跳：改为仅日志输出，不再发送webhook
                 if now - last_hb >= HEARTBEAT_INTERVAL:
-                    try:
-                        notifier.send_webhook_notification(
-                            "心跳",
-                            [{
-                                "user": "系统",
-                                "message": "正常运行中"
-                            }]
-                        )
-                    except Exception:
-                        pass
+                    logging.info("💓 心跳: 监控系统正常运行中")
                     last_hb = now
 
                 time.sleep(random.uniform(10, 15))
