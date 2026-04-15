@@ -221,26 +221,33 @@ def extract_dynamic_text(item):
         desc = dyn.get("desc") or {}
         if isinstance(desc, dict):
             text = desc.get("text") or ""
-            if text:
-                content_list.append(str(text).strip())
+            if text and isinstance(text, str):
+                content_list.append(text.strip())
                 logging.info("✅ desc.text 提取成功")
             else:
                 rich_nodes = desc.get("rich_text_nodes") or []
                 if rich_nodes and isinstance(rich_nodes, list):
-                    node_texts = [str(n.get("orig_text") or n.get("text") or "").strip() for n in rich_nodes if isinstance(n, dict)]
+                    node_texts = []
+                    for n in rich_nodes:
+                        if isinstance(n, dict):
+                            txt = n.get("orig_text") or n.get("text") or ""
+                            if txt and isinstance(txt, str):
+                                node_texts.append(txt.strip())
                     if node_texts:
                         content_list.append("\n".join(node_texts))
                         logging.info("✅ rich_text_nodes 提取成功")
         major = dyn.get("major") or {}
-        if isinstance(major, dict) and major.get("type") in ["MAJOR_TYPE_OPUS", "MAJOR_TYPE_DRAW"]:
-            opus = major.get("opus") or major.get("draw") or {}
-            if isinstance(opus, dict):
-                d = opus.get("desc") or {}
-                if isinstance(d, dict):
-                    t = d.get("text") or d.get("content") or ""
-                    if t:
-                        content_list.append(str(t).strip())
-                        logging.info("✅ major opus/draw 提取成功")
+        if isinstance(major, dict):
+            mtype = major.get("type")
+            if mtype in ["MAJOR_TYPE_OPUS", "MAJOR_TYPE_DRAW"]:
+                opus = major.get("opus") or major.get("draw") or {}
+                if isinstance(opus, dict):
+                    d = opus.get("desc") or {}
+                    if isinstance(d, dict):
+                        t = d.get("text") or d.get("content") or ""
+                        if t and isinstance(t, str):
+                            content_list.append(t.strip())
+                            logging.info("✅ major opus/draw 提取成功")
         if not content_list:
             text = deep_find_text(dyn)
             if text:
