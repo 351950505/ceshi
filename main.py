@@ -17,7 +17,7 @@ import notifier
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 10          # 心跳间隔10秒，改为日志输出
+HEARTBEAT_INTERVAL = 10          # 心跳间隔10秒，仅日志
 
 EXTRA_DYNAMIC_UIDS = [
     3546905852250875,
@@ -27,13 +27,13 @@ EXTRA_DYNAMIC_UIDS = [
     3706948578969654
 ]
 
-DYNAMIC_CHECK_INTERVAL = 15      # 从30秒改为15秒，提高响应速度
+DYNAMIC_CHECK_INTERVAL = 15      # 动态检查间隔15秒（调整后可更低，如12秒）
 DYNAMIC_BURST_INTERVAL = 8       # 爆发模式间隔8秒
 DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
 
 LOG_FILE = "bili_monitor.log"
-DYNAMIC_STATE_FILE = "dynamic_state.json"   # 保存每个UP主的baseline和offset
+DYNAMIC_STATE_FILE = "dynamic_state.json"
 # ==============================================
 
 
@@ -181,7 +181,6 @@ def get_header():
 
 
 def is_work_time():
-    # 已解除时间封印，强制 24H 全天候运行
     return True
 
 
@@ -245,10 +244,8 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（优化版：增量拉取+精准文本提取+多动态处理） ----------------
-
+# ---------------- 动态 ----------------
 def load_dynamic_state():
-    """加载每个UP主的baseline和offset"""
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
@@ -262,15 +259,10 @@ def save_dynamic_state(state):
         json.dump(state, f, indent=2)
 
 def extract_dynamic_text(item):
-    """
-    根据 all.md 文档结构精准提取动态正文
-    优先级：rich_text_nodes > major > 空字符串（避免垃圾信息）
-    """
     try:
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
         
-        # 1. 从 desc.rich_text_nodes 拼接
         desc = dyn.get("desc") or {}
         nodes = desc.get("rich_text_nodes") or []
         if nodes:
@@ -279,18 +271,15 @@ def extract_dynamic_text(item):
                 if not isinstance(node, dict):
                     continue
                 node_type = node.get("type", "")
-                # 提取所有可能携带文本的节点类型
                 if node_type in ("RICH_TEXT_NODE_TYPE_TEXT", "RICH_TEXT_NODE_TYPE_TOPIC",
                                  "RICH_TEXT_NODE_TYPE_AT", "RICH_TEXT_NODE_TYPE_EMOJI"):
                     text_parts.append(node.get("text", ""))
-                # 抽奖类型也尝试提取描述
                 elif node_type == "RICH_TEXT_NODE_TYPE_LOTTERY":
                     text_parts.append(node.get("text", ""))
             full_text = "".join(text_parts).strip()
             if full_text:
                 return full_text
         
-        # 2. 没有富文本时，从 major 中提取（视频、专栏、图文等）
         major = dyn.get("major") or {}
         major_type = major.get("type", "")
         if major_type == "MAJOR_TYPE_ARCHIVE":
@@ -298,9 +287,6 @@ def extract_dynamic_text(item):
             title = archive.get("title", "")
             desc_text = archive.get("desc", "")
             return f"【视频】{title}\n{desc_text}".strip()
-        elif major_type == "MAJOR_TYPE_DRAW":
-            # 图片动态通常正文已经在 desc 中，如果走到这里说明没有正文
-            return ""
         elif major_type == "MAJOR_TYPE_ARTICLE":
             article = major.get("article") or {}
             title = article.get("title", "")
@@ -311,33 +297,21 @@ def extract_dynamic_text(item):
             nodes = summary.get("rich_text_nodes") or []
             if nodes:
                 return "".join([n.get("text", "") for n in nodes if isinstance(n, dict)]).strip()
-        elif major_type == "MAJOR_TYPE_FORWARD":
-            # 转发类型的内容在 item.orig 中，由调用方处理
-            pass
-        
-        # 3. 兜底：返回空（避免推送无意义的JSON）
         return ""
     except Exception as e:
         logging.error(f"提取动态文本异常: {e}\n{traceback.format_exc()}")
         return ""
 
 def init_extra_dynamics(header):
-    """
-    初始化 seen 集合和每个UP主的增量状态
-    使用 /feed/all 接口获取最新的动态列表，并从中提取 baseline（第一条动态的 id）
-    """
     seen = {}
     state = load_dynamic_state()
     
     for uid in EXTRA_DYNAMIC_UIDS:
         uid_str = str(uid)
         seen[uid] = set()
-        
-        # 尝试获取或初始化状态
         if uid_str not in state:
             state[uid_str] = {"baseline": "", "offset": ""}
         
-        # 拉取最新动态列表，用于建立 baseline 和 offset
         try:
             params = {
                 "host_mid": uid,
@@ -357,18 +331,11 @@ def init_extra_dynamics(header):
                 feed_data = data.get("data") or {}
                 items = feed_data.get("items", [])
                 offset = feed_data.get("offset", "")
-                
-                # 从 items 中提取 baseline（第一条动态的 id_str）
-                baseline = ""
-                if items:
-                    baseline = items[0].get("id_str", "")
-                
+                baseline = items[0].get("id_str", "") if items else ""
                 if baseline:
                     state[uid_str]["baseline"] = baseline
                 if offset:
                     state[uid_str]["offset"] = offset
-                
-                # 将所有动态 id 加入 seen，避免重复推送
                 for item in items:
                     dyn_id = item.get("id_str")
                     if dyn_id:
@@ -385,7 +352,6 @@ def init_extra_dynamics(header):
     return seen
 
 def fetch_dynamics_page(uid, offset, header):
-    """拉取一页动态（不传 update_baseline）"""
     params = {
         "host_mid": uid,
         "type": "all",
@@ -398,10 +364,6 @@ def fetch_dynamics_page(uid, offset, header):
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def check_new_dynamics(header, seen_dynamics):
-    """
-    使用增量接口检测并拉取新动态，处理多条新动态，支持转发递归提取
-    优化：一旦检测到新动态立即拉取并推送，无额外延迟
-    """
     alerts = []
     has_new = False
     now_ts = time.time()
@@ -415,7 +377,6 @@ def check_new_dynamics(header, seen_dynamics):
         baseline = current_state.get("baseline", "")
         offset = current_state.get("offset", "")
         
-        # 如果 baseline 为空，尝试从最新一页重新建立基线
         if not baseline:
             logging.info(f"UP {uid} baseline 为空，尝试建立基线...")
             try:
@@ -427,30 +388,25 @@ def check_new_dynamics(header, seen_dynamics):
                 items = feed_data.get("items", [])
                 new_offset = feed_data.get("offset", "")
                 new_baseline = items[0].get("id_str", "") if items else ""
-                
                 if new_baseline:
                     state[uid_str]["baseline"] = new_baseline
                     if new_offset:
                         state[uid_str]["offset"] = new_offset
                     updated = True
                     logging.info(f"UP {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
-                    
-                    # 处理近期动态（可选：是否推送基线建立时的动态，取决于需求）
-                    # 这里为了不刷屏，只标记 seen，不推送
                     for item in items:
                         dyn_id = item.get("id_str")
                         if dyn_id:
                             seen_dynamics[uid].add(dyn_id)
-                    continue  # 本次不检查新动态，下次循环使用新 baseline
+                    continue
                 else:
-                    logging.warning(f"UP {uid} 无法获取 baseline（无动态或解析失败）")
+                    logging.warning(f"UP {uid} 无法获取 baseline")
                     continue
             except Exception as e:
                 logging.error(f"UP {uid} 建立基线异常: {e}")
                 continue
         
-        # 此时 baseline 非空，进行增量检测
-        # 第一步：快速检测是否有新动态
+        # 增量检测
         try:
             update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
             update_data = wbi_request(
@@ -460,15 +416,13 @@ def check_new_dynamics(header, seen_dynamics):
             )
             if update_data.get("code") != 0:
                 logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
-                # 检测失败，仍然尝试拉取
             else:
                 update_num = update_data.get("data", {}).get("update_num", 0)
                 if update_num == 0:
-                    continue  # 无新动态
+                    continue
         except Exception as e:
             logging.error(f"UP {uid} 检测更新异常: {e}")
         
-        # 第二步：拉取增量动态（立即拉取，不等待）
         try:
             fetch_params = {
                 "host_mid": uid,
@@ -492,43 +446,35 @@ def check_new_dynamics(header, seen_dynamics):
             feed_data = data.get("data") or {}
             items = feed_data.get("items", [])
             new_offset = feed_data.get("offset", offset)
-            # 新的 baseline 应该是 items 中第一条动态的 id_str
             new_baseline = items[0].get("id_str", baseline) if items else baseline
             
-            # 更新状态
             if new_baseline != baseline or new_offset != offset:
                 state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
                 updated = True
                 logging.info(f"UP {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
             
-            # 处理所有新动态（items 按时间倒序，最新在前）
             for item in items:
                 dyn_id = item.get("id_str")
                 if not dyn_id or dyn_id in seen_dynamics[uid]:
                     continue
                 seen_dynamics[uid].add(dyn_id)
                 
-                # 超时过滤（仅 debug 日志）
                 modules = item.get("modules") or {}
                 author = modules.get("module_author") or {}
                 pub_ts = author.get("pub_ts", 0)
                 if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                    logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}, 距今 {int(now_ts - pub_ts)} 秒")
+                    logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}")
                     continue
                 
                 name = author.get("name", str(uid))
                 text = extract_dynamic_text(item)
                 
-                # 处理转发动态
                 if item.get("type") == "DYNAMIC_TYPE_FORWARD":
                     orig = item.get("orig")
                     if orig:
                         orig_text = extract_dynamic_text(orig)
                         if orig_text:
-                            if text:
-                                text = f"{text}\n【转发原文】{orig_text}"
-                            else:
-                                text = f"【转发原文】{orig_text}"
+                            text = f"{text}\n【转发原文】{orig_text}" if text else f"【转发原文】{orig_text}"
                         orig_id = orig.get("id_str")
                         if orig_id:
                             text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
@@ -540,7 +486,7 @@ def check_new_dynamics(header, seen_dynamics):
         except Exception as e:
             logging.error(f"UP {uid} 处理动态异常: {e}\n{traceback.format_exc()}")
         
-        time.sleep(random.uniform(0.5, 1))  # UP主之间短暂延迟，避免请求过快
+        time.sleep(random.uniform(0.5, 1))
     
     if updated:
         save_dynamic_state(state)
@@ -670,13 +616,12 @@ def start_monitoring(header):
 
                     last_d_check = now
 
-                # 心跳：改为仅日志输出，不再发送webhook
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info("💓 心跳: 监控系统正常运行中")
                     last_hb = now
 
-                # 优化：主循环休眠时间从 10-15秒 改为 12-18秒，降低请求频率
-                time.sleep(random.uniform(12, 18))
+                # 关键优化：主循环休眠时间缩短到2-4秒，让 last_d_check 能及时触发
+                time.sleep(random.uniform(2, 4))
 
             else:
                 time.sleep(30)
