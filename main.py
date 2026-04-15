@@ -27,14 +27,10 @@ EXTRA_DYNAMIC_UIDS = [
     3706948578969654
 ]
 
-DYNAMIC_CHECK_INTERVAL = 15      # 动态检查间隔15秒
+DYNAMIC_CHECK_INTERVAL = 15      # 动态检查间隔15秒（调整后可更低，如12秒）
 DYNAMIC_BURST_INTERVAL = 8       # 爆发模式间隔8秒
 DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
-
-COMMENT_SCAN_INTERVAL = 5        # 评论扫描最小间隔5秒（低延迟）
-COMMENT_MAX_PAGES = 3            # 最多扫描3页（60条评论）
-COMMENT_SAFE_WINDOW = 60         # 只处理最近60秒内的新评论
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
@@ -410,6 +406,7 @@ def check_new_dynamics(header, seen_dynamics):
                 logging.error(f"UP {uid} 建立基线异常: {e}")
                 continue
         
+        # 增量检测
         try:
             update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
             update_data = wbi_request(
@@ -507,16 +504,15 @@ def check_new_dynamics(header, seen_dynamics):
     return has_new
 
 
-# ---------------- 评论（低延迟优化版） ----------------
+# ---------------- 评论 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    """
-    优化版：减少翻页数量，缩短安全时间窗口，快速返回新评论
-    """
     new_list = []
     max_ctime = last_read_time
-    safe_time = last_read_time - COMMENT_SAFE_WINDOW  # 只取最近60秒内的评论
+    safe_time = last_read_time - 300
 
-    for pn in range(1, COMMENT_MAX_PAGES + 1):
+    pn = 1
+
+    while pn <= 10:
         data = wbi_request(
             "https://api.bilibili.com/x/v2/reply",
             {
@@ -530,31 +526,35 @@ def scan_new_comments(oid, header, last_read_time, seen):
         )
 
         replies = (data.get("data") or {}).get("replies") or []
+
         if not replies:
             break
 
-        # 检查这一页是否所有评论都太旧
-        all_old = True
+        page_old = True
+
         for r in replies:
+            rpid = r["rpid_str"]
             ctime = r["ctime"]
-            if ctime > max_ctime:
-                max_ctime = ctime
+
+            max_ctime = max(max_ctime, ctime)
+
             if ctime > safe_time:
-                all_old = False
-                rpid = r["rpid_str"]
+                page_old = False
+
                 if rpid not in seen:
                     seen.add(rpid)
+
                     new_list.append({
                         "user": r["member"]["uname"],
                         "message": r["content"]["message"],
                         "ctime": ctime
                     })
-        
-        # 如果这一页所有评论都早于 safe_time，停止翻页
-        if all_old:
+
+        if page_old:
             break
-        
-        time.sleep(random.uniform(0.3, 0.6))  # 页间短暂延迟
+
+        pn += 1
+        time.sleep(random.uniform(0.5, 1))
 
     return new_list, max_ctime
 
@@ -564,7 +564,6 @@ def start_monitoring(header):
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
-    last_comment_check = 0      # 新增：评论扫描上次时间
     burst_end = 0
 
     oid, title = sync_latest_video(header)
@@ -581,15 +580,13 @@ def start_monitoring(header):
 
             if is_work_time():
 
-                # 评论扫描：控制最小间隔 COMMENT_SCAN_INTERVAL 秒
-                if oid and (now - last_comment_check >= COMMENT_SCAN_INTERVAL):
+                if oid:
                     new_c, new_t = scan_new_comments(
                         oid,
                         header,
                         last_read_time,
                         seen_comments
                     )
-                    last_comment_check = now
 
                     if new_t > last_read_time:
                         last_read_time = new_t
@@ -601,11 +598,9 @@ def start_monitoring(header):
                                 title,
                                 new_c
                             )
-                            logging.info(f"💬 成功发送 {len(new_c)} 条新评论通知")
                         except Exception as e:
                             logging.error(f"评论通知发送失败: {e}\n{traceback.format_exc()}")
 
-                # 动态扫描
                 interval = (
                     DYNAMIC_BURST_INTERVAL
                     if now < burst_end
@@ -618,14 +613,14 @@ def start_monitoring(header):
                         seen_dynamics
                     ):
                         burst_end = now + DYNAMIC_BURST_DURATION
+
                     last_d_check = now
 
-                # 心跳日志
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info("💓 心跳: 监控系统正常运行中")
                     last_hb = now
 
-                # 主循环快速轮询（2-4秒）
+                # 关键优化：主循环休眠时间缩短到2-4秒，让 last_d_check 能及时触发
                 time.sleep(random.uniform(2, 4))
 
             else:
