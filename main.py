@@ -1,16 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-BiliBili 24h 全量监控（增量版）
-核心改动：
-- 使用 /feed/all/update 检测是否有新动态
-- 统一、容错的 HTTP 请求层 (`http_request` 装饰器)
-- 统一的动态解析 (`parse_dynamic_item`)
-- 抽奖/转发/图片动态专门处理
-- 增量基线保存到 SQLite，跨重启不丢失
-- 统一的 webhook 报警入口 `notify()`
-"""
+
 
 import sys
 import os
