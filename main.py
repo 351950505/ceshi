@@ -19,7 +19,7 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 600
 
-EXTRA_DYNAMIC_UIDS = [
+EXTRA_DYNAMIC_UIDS =[
     3546905852250875,
     3546961271589219,
     3546610447419885,
@@ -30,7 +30,8 @@ EXTRA_DYNAMIC_UIDS = [
 DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_BURST_INTERVAL = 10
 DYNAMIC_BURST_DURATION = 300
-DYNAMIC_MAX_AGE = 300
+# 🌟 修复: 从 300 (5分钟) 放宽到 1800 (30分钟)，防止 B站 feed 流缓存延迟导致漏抓动态
+DYNAMIC_MAX_AGE = 1800 
 
 LOG_FILE = "bili_monitor.log"
 # ==============================================
@@ -53,7 +54,7 @@ def init_logging():
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (24小时全天候监控模式)")
+    logging.info("B站监控系统启动 (带评论5分钟回捞 + 动态全解引擎)")
     logging.info("=" * 60)
 
 
@@ -91,7 +92,7 @@ WBI_KEYS = {
     "last_update": 0
 }
 
-mixinKeyEncTab = [
+mixinKeyEncTab =[
     46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
     27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
     37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,
@@ -180,7 +181,7 @@ def get_header():
 
 
 def is_work_time():
-    # 已解除时间封印，强制 24H 全天候运行
+    # 24H 全天候运行
     return True
 
 
@@ -195,7 +196,7 @@ def get_latest_video(header):
     if data.get("code") != 0:
         return None
 
-    items = (data.get("data") or {}).get("items", [])
+    items = (data.get("data") or {}).get("items",[])
 
     for item in items:
         try:
@@ -244,7 +245,7 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（带诊断与完整排版） ----------------
+# ---------------- 动态（结构化精准解析） ----------------
 def init_extra_dynamics(header):
     seen = {}
 
@@ -258,7 +259,7 @@ def init_extra_dynamics(header):
         )
 
         if data.get("code") == 0:
-            for item in (data.get("data") or {}).get("items", []):
+            for item in (data.get("data") or {}).get("items",[]):
                 if item.get("id_str"):
                     seen[uid].add(item["id_str"])
 
@@ -266,72 +267,111 @@ def init_extra_dynamics(header):
 
 
 def deep_find_text(obj):
-    """原版的兜底深度搜索"""
-    result = []
-
+    result =[]
     def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
-                if k in ["text", "content", "desc", "title", "words"]:
+                if k in["text", "content", "desc", "title", "words"]:
                     if isinstance(v, str) and v.strip():
                         result.append(v.strip())
                 walk(v)
         elif isinstance(x, list):
             for i in x:
                 walk(i)
-
     walk(obj)
-
-    uniq = []
+    uniq =[]
     for x in result:
         if x not in uniq:
             uniq.append(x)
-
     return " ".join(uniq).strip()
 
 
 def extract_dynamic_text(item):
-    """升级版提取：完整换行排版 + 彻底免疫NoneType + 安全截断"""
+    """🌟 修复：全类型动态精准结构化提取（解决缺失具体内容的问题）"""
     try:
-        # 1. 绝对安全的字典获取，防止 B 站接口返回 null (None)
+        content_list =[]
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
-
-        content_list = []
         
-        # 2. 安全提取 desc，如果 desc 是 null，or {} 会把它变成空字典
+        # 1. 识别是否为转发
+        if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+            content_list.append("【🔄 转发动态】")
+
+        # 2. 提取外层正文 (UP主自己写的字)
         desc = dyn.get("desc") or {}
         rich_nodes = desc.get("rich_text_nodes") or []
-        
         if rich_nodes:
-            node_texts = []
-            for node in rich_nodes:
-                if isinstance(node, dict):
-                    node_texts.append(str(node.get("text", "")))
+            node_texts =[str(n.get("text", "")) for n in rich_nodes if isinstance(n, dict)]
             parsed = "".join(node_texts).strip()
             if parsed:
                 content_list.append(parsed)
+        elif desc.get("text"):
+            content_list.append(str(desc.get("text")).strip())
+
+        # 3. 提取主体内容 (如果是发视频/发图文/发专栏)
+        major = dyn.get("major") or {}
+        if major:
+            major_type = major.get("type", "")
+            
+            if major_type == "MAJOR_TYPE_ARCHIVE":
+                # 视频投稿
+                archive = major.get("archive") or {}
+                if archive.get("title"): content_list.append(f"▶️ 视频标题: 《{archive.get('title')}》")
+                if archive.get("desc"): content_list.append(f"📝 简介: {archive.get('desc')}")
                 
-        # 3. 如果没有富文本，退回使用原版的深度搜索，搜索整个动态！
-        # （因为有些转发/视频投稿没有 desc，文字藏在 major 里）
+            elif major_type == "MAJOR_TYPE_OPUS":
+                # 新版图文 / 专栏 (Opus)
+                opus = major.get("opus") or {}
+                if opus.get("title"): content_list.append(f"📰 图文标题: 《{opus.get('title')}》")
+                
+                # 提取 Opus 正文摘要
+                summary = opus.get("summary") or {}
+                summary_text = summary.get("text", "") if isinstance(summary, dict) else opus.get("summary", "")
+                if summary_text: content_list.append(f"📝 正文摘要: {summary_text}")
+                
+            elif major_type == "MAJOR_TYPE_DRAW":
+                # 老版发图
+                draw = major.get("draw") or {}
+                if draw.get("items"): content_list.append(f"🖼️[包含 {len(draw.get('items'))} 张图片]")
+                
+            elif major_type == "MAJOR_TYPE_ARTICLE":
+                # 老版专栏
+                article = major.get("article") or {}
+                if article.get("title"): content_list.append(f"📚 专栏标题: 《{article.get('title')}》")
+                if article.get("desc"): content_list.append(f"📝 专栏摘要: {article.get('desc')}")
+
+        # 4. 如果是转发，提取被转发的原动态内容
+        orig = item.get("orig")
+        if orig:
+            content_list.append("\n------ 被转发的原内容 ------")
+            orig_modules = orig.get("modules") or {}
+            orig_author = orig_modules.get("module_author", {}).get("name", "某用户")
+            content_list.append(f"@{orig_author}:")
+            
+            orig_dyn = orig_modules.get("module_dynamic") or {}
+            orig_desc = orig_dyn.get("desc") or {}
+            if orig_desc.get("text"):
+                content_list.append(str(orig_desc.get("text")).strip())
+            
+            orig_major = orig_dyn.get("major") or {}
+            if orig_major.get("type") == "MAJOR_TYPE_ARCHIVE":
+                content_list.append(f"▶️ 视频: 《{orig_major.get('archive', {}).get('title', '')}》")
+            elif orig_major.get("type") == "MAJOR_TYPE_OPUS":
+                content_list.append(f"📰 图文: 《{orig_major.get('opus', {}).get('title', '')}》")
+
+        # 5. 最后兜底
         if not content_list:
             text = deep_find_text(dyn)
             if text:
                 content_list.append(text)
-                
-        # 4. 如果还是没有，终极兜底（原版逻辑）
-        if not content_list:
-            # 去除一些极长无意义的结构，只截取一部分 JSON 提示
-            raw = json.dumps(item, ensure_ascii=False)
-            if len(raw) > 500:
-                raw = "【特殊类型动态 / 纯转发 / 纯视频】无正文。"
-            content_list.append(raw)
-            
+            else:
+                content_list.append("【无文本或特殊动态，请点击直达链接查看】")
+
         final_text = "\n".join(content_list).strip()
         
-        # ⚠️ 安全防御：防止内容无限长导致 Webhook 崩溃（放宽至 1500 字）
+        # 安全防御截断
         if len(final_text) > 1500:
-            final_text = final_text[:1500] + "\n\n...(内容过长，为确保通知成功已安全保护截断)"
+            final_text = final_text[:1500] + "\n\n...(内容过长，已安全保护截断)"
             
         return final_text
 
@@ -341,7 +381,7 @@ def extract_dynamic_text(item):
 
 
 def check_new_dynamics(header, seen_dynamics):
-    alerts = []
+    alerts =[]
     has_new = False
     now_ts = time.time()
 
@@ -356,7 +396,7 @@ def check_new_dynamics(header, seen_dynamics):
             if data.get("code") != 0:
                 continue
 
-            items = (data.get("data") or {}).get("items", [])
+            items = (data.get("data") or {}).get("items",[])
 
             for item in items:
                 id_str = item.get("id_str")
@@ -379,27 +419,21 @@ def check_new_dynamics(header, seen_dynamics):
 
                 name = author.get("name", str(uid))
 
-                # 记录被超时丢弃的动态
                 time_diff = now_ts - pub_ts
                 if time_diff > DYNAMIC_MAX_AGE:
-                    logging.info(f"⏭️ 忽略超时动态 [{name}] ID:{id_str}, 距今 {int(time_diff)} 秒 (设定的阈值为 {DYNAMIC_MAX_AGE}秒)")
+                    logging.info(f"⏭️ 忽略超时动态[{name}] ID:{id_str}, 距今 {int(time_diff)} 秒")
                     continue
 
-                # 提取完整排版文本
                 text = extract_dynamic_text(item)
-                
-                # 追加传送门链接
                 final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"
 
                 has_new = True
-
                 alerts.append({
                     "user": name,
                     "message": final_msg
                 })
 
                 logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
-
                 break
 
         except Exception as e:
@@ -415,16 +449,20 @@ def check_new_dynamics(header, seen_dynamics):
             )
             logging.info(f"🚀 成功发送 {len(alerts)} 条 Webhook 动态通知！")
         except Exception as e:
-            logging.error(f"❌ Webhook 发送失败（可能是文本超长或含特殊字符）: {e}\n{traceback.format_exc()}")
+            logging.error(f"❌ Webhook 发送失败: {e}\n{traceback.format_exc()}")
 
     return has_new
 
 
-# ---------------- 评论 ----------------
+# ---------------- 评论（加入 5 分钟回捞容错机制） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    new_list = []
+    new_list =[]
     max_ctime = last_read_time
-    safe_time = last_read_time - 300
+    now_ts = int(time.time())
+
+    # 🌟 修复：强力回捞机制核心 1
+    # 将原本的只看最近 300 秒（5分钟），放宽到 600 秒（10分钟）内的全部扫描，保证缓存延迟出来的评论被抓到
+    safe_time = min(last_read_time - 300, now_ts - 600)
 
     pn = 1
 
@@ -441,7 +479,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
             header
         )
 
-        replies = (data.get("data") or {}).get("replies") or []
+        replies = (data.get("data") or {}).get("replies") or[]
 
         if not replies:
             break
@@ -466,7 +504,10 @@ def scan_new_comments(oid, header, last_read_time, seen):
                         "ctime": ctime
                     })
 
-        if page_old:
+        # 🌟 修复：强力回捞机制核心 2
+        # 即使发现当前页看似全是旧数据，也强制让它扫描前 3 页 (约 60 条评论)
+        # 彻底解决 B 站接口由于缓存、置顶导致的“评论顺序错乱、延迟吐出”引发的漏评论问题
+        if page_old and pn >= 3:
             break
 
         pn += 1
@@ -535,8 +576,7 @@ def start_monitoring(header):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     try:
                         notifier.send_webhook_notification(
-                            "心跳",
-                            [{
+                            "心跳",[{
                                 "user": "系统",
                                 "message": "正常运行中"
                             }]
