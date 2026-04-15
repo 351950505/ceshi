@@ -182,10 +182,7 @@ def extract_dynamic_text(item):
         rich_nodes = dyn.get("desc", {}).get("rich_text_nodes", [])
         if rich_nodes:
             txt = "".join(str(node.get("text", "")) for node in rich_nodes).strip()
-            if txt:
-                content = txt
-            else:
-                content = None
+            content = txt if txt else None
         else:
             content = None
         if not content:
@@ -211,8 +208,9 @@ def fetch_latest(uid, header):
     return (data.get("data") or {}).get("items", [])
 
 def check_new_dynamics(header, seen_dynamics):
-    alerts = []
     now_ts = time.time()
+    newest = None
+    newest_pub = 0
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
             items = fetch_latest(uid, header)
@@ -229,32 +227,30 @@ def check_new_dynamics(header, seen_dynamics):
                 except:
                     pub_ts = 0
                 if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                    logging.info(
-                        f"忽略超时动态 UID={uid} ID={id_str} 距今 {int(now_ts - pub_ts)}s"
-                    )
                     continue
                 seen_dynamics[uid].add(id_str)
-                text = extract_dynamic_text(item)
-                name = (item.get("modules") or {}) \
-                       .get("module_author", {}) \
-                       .get("name", str(uid))
-                final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"
-                alerts.append({"user": name, "message": final_msg})
-                logging.info(f"捕获新动态 [{name}] ID:{id_str}")
+                if pub_ts > newest_pub:
+                    newest_pub = pub_ts
+                    text = extract_dynamic_text(item)
+                    name = (item.get("modules") or {}) \
+                           .get("module_author", {}) \
+                           .get("name", str(uid))
+                    newest = {"user": name, "message": f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"}
                 time.sleep(random.uniform(0.5, 1.5))
         except Exception as e:
             logging.error(f"动态获取异常 UID={uid}: {e}\n{traceback.format_exc()}")
         time.sleep(random.uniform(5, 10))
-    if alerts:
+    if newest:
         try:
             notifier.send_webhook_notification(
                 "💡 特别关注 UP 主发布新内容",
-                alerts
+                [newest]
             )
-            logging.info(f"成功推送 {len(alerts)} 条动态通知")
+            logging.info("推送最新动态")
         except Exception as e:
             logging.error(f"Webhook 发送失败: {e}\n{traceback.format_exc()}")
-    return bool(alerts)
+        return True
+    return False
 
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -294,12 +290,16 @@ def scan_new_comments(oid, header, last_read_time, seen):
             break
         pn += 1
         time.sleep(random.uniform(0.5, 1))
-    return new_list, max_ctime
+    if not new_list:
+        return None, max_ctime
+    newest = max(new_list, key=lambda x: x["ctime"])
+    return newest, max_ctime
 
 def start_monitoring(header):
-    last_v_check = 0
-    last_hb = time.time()
-    last_d_check = 0
+    now = time.time()
+    last_v_check = now
+    last_hb = now
+    last_d_check = now + random.uniform(5, 15)        # 动态首次检查延迟
     burst_end = 0
     oid, title = sync_latest_video(header)
     seen_comments = set()
@@ -308,22 +308,15 @@ def start_monitoring(header):
     while True:
         try:
             now = time.time()
-            if is_work_time():
-                if oid:
-                    new_c, new_t = scan_new_comments(
-                        oid, header, int(last_hb), seen_comments
-                    )
-                    if new_t > last_hb:
-                        last_hb = new_t
-                    if new_c:
-                        new_c.sort(key=lambda x: x["ctime"])
-                        try:
-                            notifier.send_webhook_notification(
-                                title,
-                                new_c
-                            )
-                        except Exception as e:
-                            logging.error(f"评论通知发送失败: {e}\n{traceback.format_exc()}")
+            if is_work_time() and oid:
+                newest_comment, new_t = scan_new_comments(oid, header, int(last_hb), seen_comments)
+                if new_t > last_hb:
+                    last_hb = new_t
+                if newest_comment:
+                    try:
+                        notifier.send_webhook_notification(title, [newest_comment])
+                    except Exception as e:
+                        logging.error(f"评论通知发送失败: {e}\n{traceback.format_exc()}")
                 interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
                 if now - last_d_check >= interval:
                     if check_new_dynamics(header, seen_dynamics):
