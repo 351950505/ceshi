@@ -15,13 +15,7 @@ import notifier
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 600
-EXTRA_DYNAMIC_UIDS = [
-    3546905852250875,
-    3546961271589219,
-    3546610447419885,
-    285340365,
-    3706948578969654
-]
+EXTRA_DYNAMIC_UIDS = [3546905852250875,3546961271589219,3546610447419885,285340365,3706948578969654]
 DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_MAX_AGE = 600
 LOG_FILE = "bili_monitor.log"
@@ -129,7 +123,7 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
-# ---------------- 动态（极简+仅module_dynamic） ----------------
+# ---------------- 动态 ----------------
 def deep_find_text(obj):
     result = []
     def walk(x):
@@ -209,7 +203,7 @@ def check_new_dynamics(header, seen_dynamics):
             logging.error(f"Webhook失败: {e}")
     return bool(alerts)
 
-# ---------------- 评论（已完整复原原稳定版） ----------------
+# ---------------- 评论（完整复原） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
@@ -236,8 +230,9 @@ def scan_new_comments(oid, header, last_read_time, seen):
         time.sleep(random.uniform(0.5, 1))
     return new_list, max_ctime
 
-# ---------------- 主循环 ----------------
+# ---------------- 主循环（启动延迟10秒内防封） ----------------
 def start_monitoring(header):
+    time.sleep(random.uniform(0, 10))  # 启动随机延迟防352
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
