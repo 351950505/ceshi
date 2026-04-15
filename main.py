@@ -53,7 +53,7 @@ def init_logging():
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (高隐匿防封禁 + F12富文本穿透版)")
+    logging.info("B站监控系统启动 (集成 Bilibili-API-Collect 官方结构解析版)")
     logging.info("=" * 60)
 
 
@@ -188,7 +188,7 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（带 F12 富文本诊断与完全隔离排版） ----------------
+# ---------------- 动态（依 API-Collect 官方结构提取） ----------------
 def init_extra_dynamics(header):
     seen = {}
     for uid in EXTRA_DYNAMIC_UIDS:
@@ -201,13 +201,16 @@ def init_extra_dynamics(header):
         else:
             logging.warning(f"⚠️ 初始化动态失败 UID:{uid}, Code:{data.get('code')}")
         
-        # 🌟 延长休眠时间到 3~5 秒，完美规避初始化时的瞬间高并发 -352 拦截
         time.sleep(random.uniform(3, 5))
         
     return seen
 
 
 def extract_dynamic_text(item):
+    """
+    完全依照 bilibili-API-collect 提供的 module_dynamic 结构解析。
+    绝不进行胡乱递归，保证提取准确无误。
+    """
     try:
         res =[]
         dyn_type = item.get("type", "")
@@ -216,73 +219,113 @@ def extract_dynamic_text(item):
         elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
             res.append("【🔴 直播推送】")
 
-        modules = item.get("modules") or {}
-        dyn_module = modules.get("module_dynamic") or {}
+        # 【核心辅助函数1】提取 rich_text_nodes (官方文本节点)
+        def parse_rich_nodes(nodes):
+            if not nodes or not isinstance(nodes, list): return ""
+            return "".join([str(n.get("text", "")) for n in nodes if isinstance(n, dict)])
 
-        def harvest_texts(obj):
-            texts =[]
-            blacklist = {"展开", "收起", "网页链接", "投票", "互动抽奖", "去看看", "查看详情"}
+        # 【核心辅助函数2】应对 F12 中 Opus 新版 DOM 结构的底层 JSON AST
+        def parse_opus_paragraphs(paragraphs):
+            if not paragraphs or not isinstance(paragraphs, list): return ""
+            p_texts =[]
+            for p in paragraphs:
+                if isinstance(p, dict) and "children" in p:
+                    p_texts.append("".join([str(c.get("text", "")) for c in p["children"] if isinstance(c, dict)]))
+            return "\n".join(p_texts)
+
+        # 【统一解析器】解析真实的 module_dynamic
+        def parse_dyn_module(dyn_module):
+            out =[]
+            if not dyn_module: return out
             
-            def walk(node):
-                if isinstance(node, dict):
-                    for k, v in node.items():
-                        if isinstance(v, str):
-                            v_str = v.strip()
-                            if v_str.startswith("{") or v_str.startswith("["):
-                                try:
-                                    walk(json.loads(v_str))
-                                    continue
-                                except:
-                                    pass
-                            
-                            if k in["text", "title", "desc", "summary", "content"]:
-                                if v_str and not v_str.startswith("http") and not v_str.startswith("//") and v_str not in blacklist:
-                                    if v_str not in texts:
-                                        texts.append(v_str)
-                        else:
-                            walk(v)
-                elif isinstance(node, list):
-                    for i in node:
-                        walk(i)
-            walk(obj)
-            return texts
+            # 1. 提取动态外层文字 (desc)
+            desc = dyn_module.get("desc", {})
+            desc_text = parse_rich_nodes(desc.get("rich_text_nodes"))
+            if not desc_text:
+                desc_text = str(desc.get("text", ""))
+            if desc_text.strip():
+                out.append(desc_text.strip())
 
-        main_texts = harvest_texts(dyn_module)
-        if main_texts:
-            res.append("\n".join(main_texts))
+            # 2. 提取附加的卡片/图文内容 (major)
+            major = dyn_module.get("major", {})
+            m_type = major.get("type", "")
+            
+            if m_type == "MAJOR_TYPE_OPUS":
+                opus = major.get("opus", {})
+                if opus.get("title"): 
+                    out.append(f"📰 图文: 《{opus.get('title')}》")
+                
+                # 尝试一：解析 Opus 完整的 paragraphs (对应你 F12 看到的结构)
+                content_str = parse_opus_paragraphs(opus.get("content", {}).get("paragraphs",[]))
+                
+                # 尝试二：如果 API 返回的是精简版摘要
+                if not content_str:
+                    summary = opus.get("summary", {})
+                    content_str = parse_rich_nodes(summary.get("rich_text_nodes"))
+                    if not content_str:
+                        content_str = str(summary.get("text", ""))
+                
+                if content_str and content_str.strip():
+                    out.append(f"📝 正文: {content_str.strip()}")
+                
+                pics = opus.get("pics", [])
+                if pics: 
+                    out.append(f"🖼️[附图 {len(pics)} 张]")
+                    
+            elif m_type == "MAJOR_TYPE_ARCHIVE":
+                arc = major.get("archive", {})
+                if arc.get("title"): out.append(f"▶️ 视频: 《{arc.get('title')}》")
+                if arc.get("desc"): out.append(f"📝 简介: {arc.get('desc')}")
+                
+            elif m_type == "MAJOR_TYPE_DRAW":
+                items_draw = major.get("draw", {}).get("items",[])
+                if items_draw: out.append(f"🖼️ [附图 {len(items_draw)} 张]")
+                
+            elif m_type == "MAJOR_TYPE_ARTICLE":
+                art = major.get("article", {})
+                if art.get("title"): out.append(f"📚 专栏: 《{art.get('title')}》")
+                if art.get("desc"): out.append(f"📝 摘要: {art.get('desc')}")
+                
+            elif m_type == "MAJOR_TYPE_LIVE_RCMD":
+                try:
+                    live_json = json.loads(major.get("live_rcmd", {}).get("content", "{}"))
+                    live_title = live_json.get("live_play_info", {}).get("title", "")
+                    if live_title: out.append(f"🔴 直播间: {live_title}")
+                except: pass
+                
+            elif m_type == "MAJOR_TYPE_COMMON":
+                common = major.get("common", {})
+                if common.get("title"): out.append(f"📌 卡片: {common.get('title')}")
+                if common.get("desc"): out.append(f"💬 内容: {common.get('desc')}")
+                
+            elif m_type in["MAJOR_TYPE_PGC", "MAJOR_TYPE_UGC_SEASON"]:
+                pgc = major.get("pgc") or major.get("ugc_season") or {}
+                if pgc.get("title"): out.append(f"🎬 合集/番剧: 《{pgc.get('title')}》")
+                
+            elif m_type == "MAJOR_TYPE_COURSES":
+                crs = major.get("courses", {})
+                if crs.get("title"): out.append(f"👨‍🏫 课程: 《{crs.get('title')}》")
 
-        major = dyn_module.get("major") or {}
-        m_type = major.get("type", "")
-        if m_type == "MAJOR_TYPE_OPUS":
-            pics = major.get("opus", {}).get("pics") or[]
-            if pics: res.append(f"🖼️[附图 {len(pics)} 张]")
-        elif m_type == "MAJOR_TYPE_DRAW":
-            items_draw = major.get("draw", {}).get("items") or[]
-            if items_draw: res.append(f"🖼️[附图 {len(items_draw)} 张]")
+            return out
 
+        # -- 执行主解析 --
+        modules = item.get("modules", {})
+        res.extend(parse_dyn_module(modules.get("module_dynamic")))
+
+        # -- 执行转发原内容解析 --
         orig = item.get("orig")
         if orig:
             res.append("\n------ 被转发内容 ------")
             orig_author = orig.get("modules", {}).get("module_author", {}).get("name", "某用户")
             res.append(f"@{orig_author}:")
             
-            orig_dyn_module = orig.get("modules", {}).get("module_dynamic") or {}
-            orig_texts = harvest_texts(orig_dyn_module)
-            
-            if orig_texts:
-                res.append("\n".join(orig_texts))
+            orig_out = parse_dyn_module(orig.get("modules", {}).get("module_dynamic"))
+            if orig_out:
+                res.extend(orig_out)
             else:
                 res.append("【原内容已被删除或为纯分享卡片】")
-                
-            o_major = orig_dyn_module.get("major") or {}
-            o_m_type = o_major.get("type", "")
-            if o_m_type == "MAJOR_TYPE_OPUS":
-                o_pics = o_major.get("opus", {}).get("pics") or[]
-                if o_pics: res.append(f"🖼️[附图 {len(o_pics)} 张]")
-            elif o_m_type == "MAJOR_TYPE_DRAW":
-                o_items_draw = o_major.get("draw", {}).get("items") or[]
-                if o_items_draw: res.append(f"🖼️[附图 {len(o_items_draw)} 张]")
 
+        # 4. 组装与兜底
         final_text = "\n".join(res).strip()
         
         if not final_text:
@@ -351,8 +394,8 @@ def check_new_dynamics(header, seen_dynamics):
         except Exception as e:
             logging.error(f"❌ 动态获取循环异常 {uid}: {e}\n{traceback.format_exc()}")
 
-        # 🌟 增加休眠时间到 3~4 秒，日常轮询也避免查得太快被关小黑屋
-        time.sleep(random.uniform(3, 4))
+        # 防止风控封禁 (-352)
+        time.sleep(random.uniform(2, 4))
 
     if alerts:
         try:
