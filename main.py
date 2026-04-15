@@ -30,7 +30,6 @@ EXTRA_DYNAMIC_UIDS =[
 DYNAMIC_CHECK_INTERVAL = 30
 DYNAMIC_BURST_INTERVAL = 10
 DYNAMIC_BURST_DURATION = 300
-# 🌟 修复: 从 300 (5分钟) 放宽到 1800 (30分钟)，防止 B站 feed 流缓存延迟导致漏抓动态
 DYNAMIC_MAX_AGE = 1800 
 
 LOG_FILE = "bili_monitor.log"
@@ -48,13 +47,13 @@ def init_logging():
     logging.basicConfig(
         filename=LOG_FILE,
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s[%(levelname)s] %(message)s",
         encoding="utf-8",
         filemode="w"
     )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (带评论5分钟回捞 + 动态全解引擎)")
+    logging.info("B站监控系统启动 (带全类型动态深度扫描引擎)")
     logging.info("=" * 60)
 
 
@@ -181,7 +180,6 @@ def get_header():
 
 
 def is_work_time():
-    # 24H 全天候运行
     return True
 
 
@@ -245,127 +243,152 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（结构化精准解析） ----------------
+# ---------------- 动态（全新深度解析引擎） ----------------
 def init_extra_dynamics(header):
     seen = {}
-
     for uid in EXTRA_DYNAMIC_UIDS:
         seen[uid] = set()
-
         data = safe_request(
             "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
             {"host_mid": uid},
             header
         )
-
         if data.get("code") == 0:
             for item in (data.get("data") or {}).get("items",[]):
                 if item.get("id_str"):
                     seen[uid].add(item["id_str"])
-
     return seen
 
 
-def deep_find_text(obj):
-    result =[]
-    def walk(x):
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k in["text", "content", "desc", "title", "words"]:
-                    if isinstance(v, str) and v.strip():
-                        result.append(v.strip())
-                walk(v)
-        elif isinstance(x, list):
-            for i in x:
-                walk(i)
-    walk(obj)
-    uniq =[]
-    for x in result:
-        if x not in uniq:
-            uniq.append(x)
-    return " ".join(uniq).strip()
-
-
 def extract_dynamic_text(item):
-    """🌟 修复：全类型动态精准结构化提取（解决缺失具体内容的问题）"""
+    """🌟 修复：基于 bilibili-API-collect 协议的全能动态解析引擎"""
     try:
         content_list =[]
+        
+        # 1. 解析基础属性
+        dyn_type = item.get("type", "")
+        if dyn_type == "DYNAMIC_TYPE_FORWARD":
+            content_list.append("【🔄 转发动态】")
+        elif dyn_type == "DYNAMIC_TYPE_LIVE_RCMD":
+            content_list.append("【🔴 直播/首播】")
+            
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
         
-        # 1. 识别是否为转发
-        if item.get("type") == "DYNAMIC_TYPE_FORWARD":
-            content_list.append("【🔄 转发动态】")
+        # 辅助函数：解析 rich_text_nodes 
+        def parse_rich(nodes):
+            if not nodes or not isinstance(nodes, list): return ""
+            return "".join([str(n.get("text", "")) for n in nodes if isinstance(n, dict)])
 
-        # 2. 提取外层正文 (UP主自己写的字)
+        # 2. 提取最外层文案 (UP主说的话)
         desc = dyn.get("desc") or {}
-        rich_nodes = desc.get("rich_text_nodes") or []
-        if rich_nodes:
-            node_texts =[str(n.get("text", "")) for n in rich_nodes if isinstance(n, dict)]
-            parsed = "".join(node_texts).strip()
-            if parsed:
-                content_list.append(parsed)
-        elif desc.get("text"):
-            content_list.append(str(desc.get("text")).strip())
+        desc_text = parse_rich(desc.get("rich_text_nodes")) or str(desc.get("text", ""))
+        if desc_text.strip():
+            content_list.append(desc_text.strip())
 
-        # 3. 提取主体内容 (如果是发视频/发图文/发专栏)
+        # 3. 提取主体内容 (major)
         major = dyn.get("major") or {}
         if major:
-            major_type = major.get("type", "")
+            m_type = major.get("type", "")
             
-            if major_type == "MAJOR_TYPE_ARCHIVE":
-                # 视频投稿
-                archive = major.get("archive") or {}
-                if archive.get("title"): content_list.append(f"▶️ 视频标题: 《{archive.get('title')}》")
-                if archive.get("desc"): content_list.append(f"📝 简介: {archive.get('desc')}")
+            if m_type == "MAJOR_TYPE_ARCHIVE":
+                arc = major.get("archive") or {}
+                if arc.get("title"): content_list.append(f"▶️ 视频: 《{arc.get('title')}》")
+                if arc.get("desc"): content_list.append(f"📝 简介: {arc.get('desc')}")
                 
-            elif major_type == "MAJOR_TYPE_OPUS":
-                # 新版图文 / 专栏 (Opus)
+            elif m_type == "MAJOR_TYPE_OPUS":
                 opus = major.get("opus") or {}
-                if opus.get("title"): content_list.append(f"📰 图文标题: 《{opus.get('title')}》")
+                if opus.get("title"): content_list.append(f"📰 图文: 《{opus.get('title')}》")
+                sum_dict = opus.get("summary") or {}
+                sum_text = parse_rich(sum_dict.get("rich_text_nodes")) if isinstance(sum_dict, dict) else ""
+                if not sum_text: sum_text = sum_dict.get("text", "") if isinstance(sum_dict, dict) else str(sum_dict)
+                if sum_text.strip(): content_list.append(f"📝 正文: {sum_text.strip()}")
                 
-                # 提取 Opus 正文摘要
-                summary = opus.get("summary") or {}
-                summary_text = summary.get("text", "") if isinstance(summary, dict) else opus.get("summary", "")
-                if summary_text: content_list.append(f"📝 正文摘要: {summary_text}")
-                
-            elif major_type == "MAJOR_TYPE_DRAW":
-                # 老版发图
+            elif m_type == "MAJOR_TYPE_DRAW":
                 draw = major.get("draw") or {}
-                if draw.get("items"): content_list.append(f"🖼️[包含 {len(draw.get('items'))} 张图片]")
+                items = draw.get("items") or[]
+                if items: content_list.append(f"🖼️ [共 {len(items)} 张图片]")
                 
-            elif major_type == "MAJOR_TYPE_ARTICLE":
-                # 老版专栏
-                article = major.get("article") or {}
-                if article.get("title"): content_list.append(f"📚 专栏标题: 《{article.get('title')}》")
-                if article.get("desc"): content_list.append(f"📝 专栏摘要: {article.get('desc')}")
+            elif m_type == "MAJOR_TYPE_ARTICLE":
+                art = major.get("article") or {}
+                if art.get("title"): content_list.append(f"📚 专栏: 《{art.get('title')}》")
+                if art.get("desc"): content_list.append(f"📝 摘要: {art.get('desc')}")
+                
+            elif m_type == "MAJOR_TYPE_LIVE_RCMD":
+                live = major.get("live_rcmd") or {}
+                try:
+                    # 直播数据藏在字符串包裹的 JSON 中
+                    live_json = json.loads(live.get("content", "{}"))
+                    live_title = live_json.get("live_play_info", {}).get("title", "")
+                    if live_title: content_list.append(f"🔴 直播间: {live_title}")
+                except: pass
+                
+            elif m_type == "MAJOR_TYPE_COMMON": # 通用/分享/活动卡片/预约
+                common = major.get("common") or {}
+                if common.get("title"): content_list.append(f"📌 卡片: {common.get('title')}")
+                if common.get("desc"): content_list.append(f"💬 内容: {common.get('desc')}")
+                
+            elif m_type == "MAJOR_TYPE_PGC" or m_type == "MAJOR_TYPE_UGC_SEASON":
+                pgc = major.get("pgc") or major.get("ugc_season") or {}
+                if pgc.get("title"): content_list.append(f"🎬 合集/番剧: 《{pgc.get('title')}》")
+                
+            elif m_type == "MAJOR_TYPE_COURSES":
+                crs = major.get("courses") or {}
+                if crs.get("title"): content_list.append(f"👨‍🏫 课程: 《{crs.get('title')}》")
 
-        # 4. 如果是转发，提取被转发的原动态内容
+        # 4. 如果是转发，提取源动态 (orig)
         orig = item.get("orig")
         if orig:
-            content_list.append("\n------ 被转发的原内容 ------")
-            orig_modules = orig.get("modules") or {}
-            orig_author = orig_modules.get("module_author", {}).get("name", "某用户")
+            content_list.append("\n------ 被转发内容 ------")
+            orig_author = orig.get("modules", {}).get("module_author", {}).get("name", "某用户")
             content_list.append(f"@{orig_author}:")
             
-            orig_dyn = orig_modules.get("module_dynamic") or {}
+            orig_dyn = orig.get("modules", {}).get("module_dynamic") or {}
             orig_desc = orig_dyn.get("desc") or {}
-            if orig_desc.get("text"):
-                content_list.append(str(orig_desc.get("text")).strip())
+            o_desc_text = parse_rich(orig_desc.get("rich_text_nodes")) or str(orig_desc.get("text", ""))
+            if o_desc_text.strip(): content_list.append(o_desc_text.strip())
             
             orig_major = orig_dyn.get("major") or {}
-            if orig_major.get("type") == "MAJOR_TYPE_ARCHIVE":
+            o_m_type = orig_major.get("type", "")
+            if o_m_type == "MAJOR_TYPE_ARCHIVE":
                 content_list.append(f"▶️ 视频: 《{orig_major.get('archive', {}).get('title', '')}》")
-            elif orig_major.get("type") == "MAJOR_TYPE_OPUS":
+            elif o_m_type == "MAJOR_TYPE_OPUS":
                 content_list.append(f"📰 图文: 《{orig_major.get('opus', {}).get('title', '')}》")
 
-        # 5. 最后兜底
-        if not content_list:
-            text = deep_find_text(dyn)
-            if text:
-                content_list.append(text)
+        # 5. 绝对兜底扫描（上帝视角：强行搜索提取任何带有价值的文本，应对B站未知的新类型）
+        if not content_list or len("".join(content_list).strip()) < 3:
+            fallback_texts =[]
+            
+            def deep_scan(x):
+                if isinstance(x, dict):
+                    # 强行解开字符串里的 JSON
+                    for k, v in x.items():
+                        if isinstance(v, str) and (v.startswith("{") or v.startswith("[")):
+                            try: deep_scan(json.loads(v))
+                            except: pass
+                            
+                        # 抓住所有可能包含有价值文字的键名
+                        if k in["title", "text", "desc", "summary", "name", "content"]:
+                            if isinstance(v, str) and v.strip() and not v.startswith("http"):
+                                if len(v) > 1 and v.strip() not in fallback_texts:
+                                    fallback_texts.append(v.strip())
+                    for v in x.values():
+                        if isinstance(v, (dict, list)):
+                            deep_scan(v)
+                elif isinstance(x, list):
+                    for i in x:
+                        deep_scan(i)
+                        
+            deep_scan(item)
+            
+            # 过滤掉一些系统层面的废话
+            valid_fallbacks = [t for t in fallback_texts if t not in["转发动态", "动态", "投稿了视频", "发布了文章"]]
+            
+            if valid_fallbacks:
+                content_list.append("【智能扫描提取内容】")
+                content_list.extend(valid_fallbacks)
             else:
-                content_list.append("【无文本或特殊动态，请点击直达链接查看】")
+                content_list.append("【特殊互动/预告类型动态，请点击直达链接查看】")
 
         final_text = "\n".join(content_list).strip()
         
@@ -460,8 +483,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
     max_ctime = last_read_time
     now_ts = int(time.time())
 
-    # 🌟 修复：强力回捞机制核心 1
-    # 将原本的只看最近 300 秒（5分钟），放宽到 600 秒（10分钟）内的全部扫描，保证缓存延迟出来的评论被抓到
+    # 放宽到 10分钟(600秒) 内的评论全部回捞扫描
     safe_time = min(last_read_time - 300, now_ts - 600)
 
     pn = 1
@@ -504,9 +526,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
                         "ctime": ctime
                     })
 
-        # 🌟 修复：强力回捞机制核心 2
-        # 即使发现当前页看似全是旧数据，也强制让它扫描前 3 页 (约 60 条评论)
-        # 彻底解决 B 站接口由于缓存、置顶导致的“评论顺序错乱、延迟吐出”引发的漏评论问题
+        # 即使没新数据，也强制刷新前 3 页，防缓存延迟错乱
         if page_old and pn >= 3:
             break
 
