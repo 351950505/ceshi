@@ -10,13 +10,14 @@ import traceback
 import hashlib
 import urllib.parse
 import json
+import subprocess
 import requests
 
 import database as db
 import notifier
 
-# ================= 核心配置区 =================
-TARGET_UID = 1671203508               # 主监控 UP 主
+# ====================== 配置区 ======================
+TARGET_UID = 1671203508               # 主监控 UP 主（如果只想监控自己可置为 0）
 VIDEO_CHECK_INTERVAL = 21600         # 6 h 检查一次新视频
 HEARTBEAT_INTERVAL = 600             # 10 min 心跳
 
@@ -29,21 +30,21 @@ EXTRA_DYNAMIC_UIDS = [
     3706948578969654
 ]
 
-# 动态轮询相关
+# 动态轮询参数
 DYNAMIC_CHECK_INTERVAL = 30          # 常规轮询间隔（秒）
-DYNAMIC_BURST_INTERVAL = 10          # 突发模式（检测到新动态后）轮询间隔
+DYNAMIC_BURST_INTERVAL = 10          # 触发突发（检测到新动态后）轮询间隔
 DYNAMIC_BURST_DURATION = 300         # 突发模式持续时间（秒）
 DYNAMIC_MAX_AGE = 300                 # 动态最大保留时间（秒），超过则忽略
-
 LOG_FILE = "bili_monitor.log"
 
-# ---------- 新增配置 ----------
-# 1️⃣ 启动延迟（秒）——防止脚本刚启动时立刻并发大量请求
+# ----------------- 新增功能 -----------------
+# 1️⃣ 启动延迟（秒）——防止脚本刚启动时大量并发请求
 STARTUP_DELAY_SECONDS = 120          # 2 分钟
 
-# 2️⃣ 时间平移（秒）——让项目内部的“现在时间”比真实时间慢 2 分钟
-TIME_SHIFT_SECONDS = 120             # 2 分钟
-# =============================================
+# 2️⃣ 时间平移（秒）——让内部感知的“现在时间”比真实时间慢 2 分钟
+#    仅在评论轮询中使用（防止因网络时延错过刚发布的评论），动态检测不受影响
+TIME_SHIFT_SECONDS = 120
+# -------------------------------------------------
 
 def init_logging():
     """初始化日志（每次启动会覆盖旧日志）"""
@@ -61,15 +62,15 @@ def init_logging():
         encoding="utf-8",
         filemode="w"
     )
-
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (24小时全天候监控模式)")
+    logging.info("B站监控系统启动 (24 h 全天候监控)")
     logging.info(f"⚡ 项目时间已平移 {TIME_SHIFT_SECONDS}s（实际时间 = 记录时间 + {TIME_SHIFT_SECONDS}s）")
     logging.info("=" * 60)
 
 
+# ----------------- 基础请求封装 -----------------
 def safe_request(url, params, header, retries=3):
-    """带重试的 GET 请求，返回 JSON（出错返回 {'code':-500}）"""
+    """GET 请求 + 重试，返回 JSON（出错返回 {'code': -500}）"""
     h = header.copy()
     h["Connection"] = "close"
 
@@ -89,9 +90,8 @@ def safe_request(url, params, header, retries=3):
     return {"code": -500, "message": "request failed after retries"}
 
 
-# ---------------- WBI ----------------
+# ----------------- WBI（防 403） -----------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-
 mixinKeyEncTab = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
@@ -104,17 +104,14 @@ def getMixinKey(orig):
 
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
-
     params["wts"] = round(time.time())
     params = dict(sorted(params.items()))
-
     filtered = {}
     for k, v in params.items():
         v = str(v)
         for c in "!'()*":
             v = v.replace(c, "")
         filtered[k] = v
-
     query = urllib.parse.urlencode(filtered)
     sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
     filtered["w_rid"] = sign
@@ -132,43 +129,42 @@ def update_wbi_keys(header):
             WBI_KEYS["img_key"] = img["img_url"].rsplit("/", 1)[1].split(".")[0]
             WBI_KEYS["sub_key"] = img["sub_url"].rsplit("/", 1)[1].split(".")[0]
             WBI_KEYS["last_update"] = time.time()
-            logging.info("WBI密钥已更新")
+            logging.info("WBI 密钥已更新")
     except Exception:
         pass
 
 def wbi_request(url, params, header):
     if (not WBI_KEYS["img_key"]) or (time.time() - WBI_KEYS["last_update"] > 21600):
         update_wbi_keys(header)
-
     signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     return safe_request(url, signed, header)
 
 
-# ---------------- 基础 ----------------
+# ----------------- 认证 & 时间校准 -----------------
 def get_header():
-    """读取本地 cookie（若不存在自动跑一次扫码登录）"""
+    """读取本地 cookie；若不存在自动跑一次扫码登录"""
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
     except Exception:
-        # cookie 不存在或读取异常，走登录脚本
         subprocess.run([sys.executable, "login_bilibili.py"], check=True)
-
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie = f.read().strip()
-
     return {
         "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/128.0.0.0 Safari/537.36",
         "Referer": "https://www.bilibili.com/"
     }
 
+
 def is_work_time():
-    """已解除时间封印，强制 24‑h 全天候运行"""
+    """已解除时间封印，强制 24 h 全天候运行"""
     return True
 
 
-# ---------------- 视频 ----------------
+# ----------------- 视频监控（保留原有逻辑） -----------------
 def get_latest_video(header):
     data = safe_request(
         "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
@@ -177,9 +173,7 @@ def get_latest_video(header):
     )
     if data.get("code") != 0:
         return None
-
-    items = (data.get("data") or {}).get("items", [])
-    for item in items:
+    for item in (data.get("data") or {}).get("items", []):
         try:
             if item.get("type") == "DYNAMIC_TYPE_AV":
                 return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
@@ -204,12 +198,9 @@ def sync_latest_video(header):
     bv = get_latest_video(header)
     if not bv:
         return None, None
-
     videos = db.get_monitored_videos()
     if videos and videos[0][1] == bv:
-        # 已是最新视频，无需更新
-        return videos[0][0], videos[0][2]
-
+        return videos[0][0], videos[0][2]   # 已是最新视频
     oid, title = get_video_info(bv, header)
     if oid:
         db.clear_videos()
@@ -218,9 +209,9 @@ def sync_latest_video(header):
     return None, None
 
 
-# ---------------- 动态（完整排版） ----------------
+# ----------------- 动态监控（核心） -----------------
 def init_extra_dynamics(header):
-    """为每个关注的 UID 构造已看到的动态 ID 集合（第一次运行时全部标记为已读）"""
+    """初始化已读动态集合（首次运行时全部标记为已读）"""
     seen = {}
     for uid in EXTRA_DYNAMIC_UIDS:
         seen[uid] = set()
@@ -237,7 +228,7 @@ def init_extra_dynamics(header):
 
 
 def deep_find_text(obj):
-    """原版的兜底深度搜索——返回所有 text / content / desc / title / words"""
+    """兜底深度搜索文本（保留原实现）"""
     result = []
 
     def walk(x):
@@ -252,7 +243,6 @@ def deep_find_text(obj):
                 walk(i)
 
     walk(obj)
-    # 去重
     uniq = []
     for x in result:
         if x not in uniq:
@@ -262,58 +252,83 @@ def deep_find_text(obj):
 
 def extract_dynamic_text(item):
     """
-    升级版提取：完整换行排版 + 彻底免疫 NoneType + 安全截断
+    完整提取动态文字（包括富文本 + 回退），并做安全截断
     """
     try:
-        # 1️⃣ 直接取富文本节点（如果有的话）
+        # 1️⃣ 优先读取 rich_text_nodes（如果有的话）
         rich = (item.get("modules", {})
                    .get("module_dynamic", {})
                    .get("desc", {})
                    .get("rich_text_nodes", []))
-
-        content_list = []
-
         if rich:
-            node_texts = []
-            for node in rich:
-                if isinstance(node, dict):
-                    node_texts.append(str(node.get("text", "")))
-            parsed = "".join(node_texts).strip()
-            if parsed:
-                content_list.append(parsed)
+            txt = "".join([node.get("text", "") for node in rich if isinstance(node, dict)])
+            txt = txt.strip()
+        else:
+            txt = ""
 
-        # 2️⃣ 若无富文本，使用深度搜索作为兜底
-        if not content_list:
-            text = deep_find_text(item.get("modules", {}))
-            if text:
-                content_list.append(text)
+        # 2️⃣ 若没有富文本，使用深度遍历兜底
+        if not txt:
+            txt = deep_find_text(item.get("modules", {}))
 
-        # 3️⃣ 仍然为空则给一个标识
-        if not content_list:
-            raw = json.dumps(item, ensure_ascii=False)
-            if len(raw) > 500:
-                raw = "【特殊类型动态 / 纯转发 / 纯视频】无正文。"
-            content_list.append(raw)
+        # 3️⃣ 仍然为空则返回一个标识（防止出现 None）
+        if not txt:
+            txt = "[未检测到文字内容]"
 
-        final_text = "\n".join(content_list).strip()
-
-        # ⚠️ 防止超长导致 webhook 失败（放宽至 1500 字）
+        # 4️⃣ 安全截断（防止 webhook 过长）
         MAX_LEN = 1500
-        if len(final_text) > MAX_LEN:
-            final_text = final_text[:MAX_LEN] + "\n\n...(内容过长，已安全截断)"
-        return final_text
+        if len(txt) > MAX_LEN:
+            txt = txt[:MAX_LEN] + "\n\n...(内容过长，已安全截断)"
+        return txt
     except Exception as e:
-        logging.error(f"提取动态文本异常: {e}\n{traceback.format_exc()}")
-        return "发布了新动态 (内容解析失败)"
+        logging.error(f"动态文字提取异常: {e}\n{traceback.format_exc()}")
+        return "[动态文字提取失败]"
+
+
+def get_dynamic_update_number(baseline, header):
+    """
+    使用官方 “动态更新基线” 接口查询是否有新动态
+    返回 update_num（>0 表示有新动态）
+    """
+    url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update"
+    params = {
+        "update_baseline": baseline,
+        "type": "all",
+        "web_location": "333.1365"
+    }
+    data = safe_request(url, params, header)
+    if data.get("code") == 0:
+        return data.get("data", {}).get("update_num", 0)
+    return 0
+
+
+def fetch_all_dynamics(header, offset=""):
+    """
+    拉取全部动态列表（type=all），返回 items（列表）和新的 offset
+    """
+    url = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+    params = {
+        "type": "all",
+        "timezone_offset": "-480",
+        "web_location": "333.1365",
+        "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,ugcDelete"
+    }
+    if offset:
+        params["offset"] = offset
+    data = safe_request(url, params, header)
+    if data.get("code") != 0:
+        return [], ""
+    items = (data.get("data") or {}).get("items", [])
+    new_offset = (data.get("data") or {}).get("offset", "")
+    return items, new_offset
 
 
 def check_new_dynamics(header, seen_dynamics):
     """
     检查所有 EXTRA_DYNAMIC_UIDS 是否有新动态。
-    若有新动态则立即推送 webhook，并返回 True（触发突发模式）。
+    若有新动态立即推送 webhook，并返回 True（触发突发模式）。
     """
     alerts = []
-    now_ts = time.time() + TIME_SHIFT_SECONDS  # 平移后的当前时间
+    now_ts = time.time()                     # **真实时间**（不做平移）
 
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
@@ -334,120 +349,35 @@ def check_new_dynamics(header, seen_dynamics):
                 # 标记为已读
                 seen_dynamics[uid].add(id_str)
 
-                modules = item.get("modules") or {}
-                author = modules.get("module_author") or {}
+                # 动态发布时间（秒级时间戳）
+                pub_ts = float(item.get("modules", {})
+                                   .get("module_author", {})
+                                   .get("pub_ts", 0))
 
-                try:
-                    pub_ts = float(author.get("pub_ts", 0))
-                except Exception:
-                    pub_ts = 0
-
-                name = author.get("name", str(uid))
-
-                # ----- 时间阈值检查 -----
-                time_diff = now_ts - pub_ts
-                if time_diff > DYNAMIC_MAX_AGE:
+                # **时间阈值**：只保留最近 5 分钟内的动态（不受 TIME_SHIFT 影响）
+                if now_ts - pub_ts > DYNAMIC_MAX_AGE:
                     logging.info(
-                        f"⏭️ 忽略超时动态 [{name}] ID:{id_str}, "
-                        f"距今 {int(time_diff)} 秒 (阈值 {DYNAMIC_MAX_AGE}s)"
+                        f"⏭️ 忽略过旧动态 [{item['modules']['module_author']['name']}] "
+                        f"ID:{id_str} (距今 {int(now_ts - pub_ts)}s > {DYNAMIC_MAX_AGE}s)"
                     )
                     continue
 
-                # ----- 提取并构造消息 -----
+                # 提取文字
                 text = extract_dynamic_text(item)
+
+                # 拼装推送信息
                 final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{id_str}"
+                alerts.append({"user": item["modules"]["module_author"]["name"],
+                               "message": final_msg})
 
-                alerts.append({"user": name, "message": final_msg})
-                logging.info(f"✅ 抓取到新动态并准备推送 [{name}]:\n{final_msg}")
+                logging.info(f"✅ 检测到新动态 [{item['modules']['module_author']['name']}] "
+                             f"ID:{id_str}\n{final_msg}")
 
-                # 每个 UID 只取本轮的第一条新动态（防止一次轮询一次性塞满）
+                # 每个 UID 本轮只取第一条新动态，防止一次轮询一次性推送太多
                 break
 
         except Exception as e:
             logging.error(f"❌ 动态获取异常 UID={uid}: {e}\n{traceback.format_exc()}")
 
         # 随机间隔，降低风控概率
-        time.sleep(random.uniform(1, 2))
-
-    if alerts:
-        try:
-            notifier.send_webhook_notification(
-                "💡 特别关注UP主发布新内容",
-                alerts
-            )
-            logging.info(f"🚀 成功发送 {len(alerts)} 条 Webhook 动态通知！")
-        except Exception as e:
-            logging.error(f"❌ Webhook 动态发送失败: {e}\n{traceback.format_exc()}")
-
-    return bool(alerts)
-
-
-# ---------------- 评论 ----------------
-def scan_new_comments(oid, header, last_read_time, seen):
-    """
-    轮询指定 oid（视频）的最新评论。
-    返回 (new_comments_list, newest_ctime)
-    """
-    new_list = []
-    max_ctime = last_read_time
-
-    # 为了保持 “最近 5 分钟” 的范围不变，需要把安全阈值也往后平移
-    safe_time = last_read_time - 300 - TIME_SHIFT_SECONDS
-
-    pn = 1
-    while pn <= 10:  # 最多翻 10 页
-        data = wbi_request(
-            "https://api.bilibili.com/x/v2/reply",
-            {
-                "oid": oid,
-                "type": 1,
-                "sort": 0,
-                "pn": pn,
-                "ps": 20
-            },
-            header
-        )
-
-        replies = (data.get("data") or {}).get("replies") or []
-        if not replies:
-            break
-
-        page_old = True
-        for r in replies:
-            rpid = r["rpid_str"]
-            ctime = r["ctime"]
-            max_ctime = max(max_ctime, ctime)
-
-            if ctime > safe_time:
-                page_old = False
-                if rpid not in seen:
-                    seen.add(rpid)
-                    new_list.append({
-                        "user": r["member"]["uname"],
-                        "message": r["content"]["message"],
-                        "ctime": ctime
-                    })
-
-        if page_old:
-            break
-
-        pn += 1
-        time.sleep(random.uniform(0.5, 1))
-
-    return new_list, max_ctime
-
-
-# ---------------- 主循环 ----------------
-def start_monitoring(header):
-    """
-    项目入口——负责所有轮询、心跳、日志、异常捕获等。
-    """
-    # ------------------- 1️⃣ 启动延迟 -------------------
-    if STARTUP_DELAY_SECONDS > 0:
-        logging.info(f"启动延迟 {STARTUP_DELAY_SECONDS}s，等待后再开始监控...")
-        time.sleep(STARTUP_DELAY_SECONDS)
-    # ----------------------------------------------------
-
-    # 初始化时间基准（均使用平移后的时间）
-    last_v_check = 0
-    last_hb = time.time() + TIME_SHIFT
+        time.sleep
