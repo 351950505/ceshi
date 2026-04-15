@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  bili-monitor:
+    build: .
+    container_name: bili-monitor
+    restart: unless-stopped
+    env_file:
+      - .env                 # 本地 .env 会被注入容器
+    volumes:
+      # 挂载持久化文件（宿主机路径可自行改动）
+      - ./bili_monitor.log:/app/bili_monitor.log:rw
+      - ./bili_monitor.db:/app/bili_monitor.db:rw
+      - ./bili_cookie.txt:/app/bili_cookie.txt:rw
+      - ./webhook_config.txt:/app/webhook_config.txt:ro
+    # 若要对外暴露端口（比如未来加入 Flask UI），在这里添加 ports:
+    # ports:
+    #   - "8080:8080"
