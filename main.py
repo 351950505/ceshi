@@ -324,7 +324,7 @@ def extract_dynamic_text(item):
 def init_extra_dynamics(header):
     """
     初始化 seen 集合和每个UP主的增量状态
-    使用 /feed/all 接口获取最新的 update_baseline 和 offset
+    使用 /feed/all 接口获取最新的动态列表，并从中提取 baseline（第一条动态的 id）
     """
     seen = {}
     state = load_dynamic_state()
@@ -337,7 +337,7 @@ def init_extra_dynamics(header):
         if uid_str not in state:
             state[uid_str] = {"baseline": "", "offset": ""}
         
-        # 拉取一次最新动态列表，用于获取 update_baseline 和初始化 seen（避免重复推送已存在的动态）
+        # 拉取最新动态列表，用于建立 baseline 和 offset
         try:
             params = {
                 "host_mid": uid,
@@ -355,19 +355,25 @@ def init_extra_dynamics(header):
             )
             if data.get("code") == 0:
                 feed_data = data.get("data") or {}
-                new_baseline = feed_data.get("update_baseline", "")
-                new_offset = feed_data.get("offset", "")
-                # 只有当 new_baseline 非空字符串时才更新
-                if new_baseline:
-                    state[uid_str]["baseline"] = new_baseline
-                if new_offset:
-                    state[uid_str]["offset"] = new_offset
-                # 将当前列表中的所有动态id加入seen，避免重复推送
-                for item in feed_data.get("items", []):
+                items = feed_data.get("items", [])
+                offset = feed_data.get("offset", "")
+                
+                # 从 items 中提取 baseline（第一条动态的 id_str）
+                baseline = ""
+                if items:
+                    baseline = items[0].get("id_str", "")
+                
+                if baseline:
+                    state[uid_str]["baseline"] = baseline
+                if offset:
+                    state[uid_str]["offset"] = offset
+                
+                # 将所有动态 id 加入 seen，避免重复推送
+                for item in items:
                     dyn_id = item.get("id_str")
                     if dyn_id:
                         seen[uid].add(dyn_id)
-                logging.info(f"初始化 UP {uid} 状态: baseline={state[uid_str]['baseline']}, offset={state[uid_str]['offset']}, 已收录 {len(seen[uid])} 条动态")
+                logging.info(f"初始化 UP {uid}: baseline={baseline}, offset={offset}, 已收录 {len(seen[uid])} 条动态")
             else:
                 logging.warning(f"初始化 UP {uid} 失败: {data.get('message')}")
         except Exception as e:
@@ -395,9 +401,9 @@ def check_new_dynamics(header, seen_dynamics):
     """
     使用增量接口检测并拉取新动态，处理多条新动态，支持转发递归提取
     修复：
-      1. update_baseline 参数仅在非空时传递，避免API报错
-      2. 当 baseline 为空时，不使用检测接口，直接拉取并尝试建立基线
-      3. 去除超时动态的日志输出（改为debug级别，默认不显示）
+      1. baseline 使用第一条动态的 id_str，不再依赖 API 返回的 update_baseline（可能为空）
+      2. update_baseline 参数仅在非空时传递
+      3. 去除超时动态的 INFO 日志刷屏
     """
     alerts = []
     has_new = False
@@ -412,158 +418,130 @@ def check_new_dynamics(header, seen_dynamics):
         baseline = current_state.get("baseline", "")
         offset = current_state.get("offset", "")
         
-        # 情况1：baseline 非空，正常增量模式
-        if baseline:
-            # 检测是否有新动态
-            try:
-                update_params = {"type": "all", "web_location": "333.1365"}
-                update_params["update_baseline"] = baseline
-                update_data = wbi_request(
-                    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
-                    update_params,
-                    header
-                )
-                if update_data.get("code") != 0:
-                    logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
-                    # 检测失败时，直接拉取（带 baseline）尝试
-                else:
-                    update_num = update_data.get("data", {}).get("update_num", 0)
-                    if update_num == 0:
-                        continue  # 无新动态
-            except Exception as e:
-                logging.error(f"UP {uid} 检测更新异常: {e}")
-                # 继续拉取
-            
-            # 拉取增量动态（带 update_baseline）
-            try:
-                fetch_params = {
-                    "host_mid": uid,
-                    "type": "all",
-                    "timezone_offset": "-480",
-                    "platform": "web",
-                    "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
-                    "web_location": "333.1365",
-                    "offset": offset,
-                    "update_baseline": baseline
-                }
-                data = wbi_request(
-                    "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
-                    fetch_params,
-                    header
-                )
-                if data.get("code") != 0:
-                    logging.warning(f"UP {uid} 拉取动态失败: {data.get('message')}")
-                    continue
-                
-                feed_data = data.get("data") or {}
-                items = feed_data.get("items", [])
-                new_baseline = feed_data.get("update_baseline", baseline)
-                new_offset = feed_data.get("offset", offset)
-                
-                # 更新状态
-                if new_baseline != baseline or new_offset != offset:
-                    state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
-                    updated = True
-                    logging.info(f"UP {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
-                
-                # 处理新动态
-                for item in items:
-                    dyn_id = item.get("id_str")
-                    if not dyn_id or dyn_id in seen_dynamics[uid]:
-                        continue
-                    seen_dynamics[uid].add(dyn_id)
-                    # 超时过滤（仅 debug 日志）
-                    modules = item.get("modules") or {}
-                    author = modules.get("module_author") or {}
-                    pub_ts = author.get("pub_ts", 0)
-                    if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                        logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}, 距今 {int(now_ts - pub_ts)} 秒")
-                        continue
-                    
-                    name = author.get("name", str(uid))
-                    text = extract_dynamic_text(item)
-                    
-                    # 处理转发动态
-                    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
-                        orig = item.get("orig")
-                        if orig:
-                            orig_text = extract_dynamic_text(orig)
-                            if orig_text:
-                                if text:
-                                    text = f"{text}\n【转发原文】{orig_text}"
-                                else:
-                                    text = f"【转发原文】{orig_text}"
-                            orig_id = orig.get("id_str")
-                            if orig_id:
-                                text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
-                    
-                    final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-                    alerts.append({"user": name, "message": final_msg})
-                    has_new = True
-                    logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
-            except Exception as e:
-                logging.error(f"UP {uid} 处理动态异常: {e}\n{traceback.format_exc()}")
-        
-        # 情况2：baseline 为空，需要先建立基线（拉取最新一页，处理新动态，并尝试获取 baseline）
-        else:
+        # 如果 baseline 为空，尝试从最新一页重新建立基线
+        if not baseline:
             logging.info(f"UP {uid} baseline 为空，尝试建立基线...")
             try:
-                # 直接拉取第一页（不带 update_baseline）
                 data = fetch_dynamics_page(uid, "", header)
                 if data.get("code") != 0:
                     logging.warning(f"UP {uid} 建立基线失败: {data.get('message')}")
                     continue
-                
                 feed_data = data.get("data") or {}
                 items = feed_data.get("items", [])
-                new_baseline = feed_data.get("update_baseline", "")
                 new_offset = feed_data.get("offset", "")
+                new_baseline = items[0].get("id_str", "") if items else ""
                 
-                # 更新状态（只有当 new_baseline 非空时才保存，否则只保存 offset）
                 if new_baseline:
-                    state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
-                    updated = True
-                    logging.info(f"UP {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
-                else:
-                    # 如果还是没有 baseline，至少保存 offset，下次继续尝试
+                    state[uid_str]["baseline"] = new_baseline
                     if new_offset:
                         state[uid_str]["offset"] = new_offset
-                        updated = True
-                        logging.info(f"UP {uid} offset 更新为 {new_offset}，但 baseline 仍为空，下次继续尝试")
-                    else:
-                        logging.warning(f"UP {uid} 无法获取 baseline 和 offset，跳过本次")
-                        continue
-                
-                # 处理当前页的所有动态（视为新动态？谨慎：为了避免推送大量旧动态，需要检查时间）
-                # 注意：这里 items 可能包含大量旧动态，我们只处理距离现在不超过 DYNAMIC_MAX_AGE 的
-                for item in items:
-                    dyn_id = item.get("id_str")
-                    if not dyn_id or dyn_id in seen_dynamics[uid]:
-                        continue
-                    seen_dynamics[uid].add(dyn_id)
-                    modules = item.get("modules") or {}
-                    author = modules.get("module_author") or {}
-                    pub_ts = author.get("pub_ts", 0)
-                    if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                        logging.debug(f"基线建立时忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}")
-                        continue
-                    name = author.get("name", str(uid))
-                    text = extract_dynamic_text(item)
-                    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
-                        orig = item.get("orig")
-                        if orig:
-                            orig_text = extract_dynamic_text(orig)
-                            if orig_text:
-                                text = f"{text}\n【转发原文】{orig_text}" if text else f"【转发原文】{orig_text}"
-                            orig_id = orig.get("id_str")
-                            if orig_id:
-                                text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
-                    final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-                    alerts.append({"user": name, "message": final_msg})
-                    has_new = True
-                    logging.info(f"✅ 基线建立时抓取到近期动态 [{name}]: {dyn_id}")
+                    updated = True
+                    logging.info(f"UP {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
+                    
+                    # 处理近期动态（可选：是否推送基线建立时的动态，取决于需求）
+                    # 这里为了不刷屏，只标记 seen，不推送
+                    for item in items:
+                        dyn_id = item.get("id_str")
+                        if dyn_id:
+                            seen_dynamics[uid].add(dyn_id)
+                    continue  # 本次不检查新动态，下次循环使用新 baseline
+                else:
+                    logging.warning(f"UP {uid} 无法获取 baseline（无动态或解析失败）")
+                    continue
             except Exception as e:
-                logging.error(f"UP {uid} 建立基线异常: {e}\n{traceback.format_exc()}")
+                logging.error(f"UP {uid} 建立基线异常: {e}")
+                continue
+        
+        # 此时 baseline 非空，进行增量检测
+        # 第一步：检测是否有新动态
+        try:
+            update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
+            update_data = wbi_request(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update",
+                update_params,
+                header
+            )
+            if update_data.get("code") != 0:
+                logging.warning(f"UP {uid} 检测更新失败: {update_data.get('message')}")
+                # 检测失败，仍然尝试拉取
+            else:
+                update_num = update_data.get("data", {}).get("update_num", 0)
+                if update_num == 0:
+                    continue  # 无新动态
+        except Exception as e:
+            logging.error(f"UP {uid} 检测更新异常: {e}")
+        
+        # 第二步：拉取增量动态
+        try:
+            fetch_params = {
+                "host_mid": uid,
+                "type": "all",
+                "timezone_offset": "-480",
+                "platform": "web",
+                "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
+                "web_location": "333.1365",
+                "offset": offset,
+                "update_baseline": baseline
+            }
+            data = wbi_request(
+                "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all",
+                fetch_params,
+                header
+            )
+            if data.get("code") != 0:
+                logging.warning(f"UP {uid} 拉取动态失败: {data.get('message')}")
+                continue
+            
+            feed_data = data.get("data") or {}
+            items = feed_data.get("items", [])
+            new_offset = feed_data.get("offset", offset)
+            # 新的 baseline 应该是 items 中第一条动态的 id_str
+            new_baseline = items[0].get("id_str", baseline) if items else baseline
+            
+            # 更新状态
+            if new_baseline != baseline or new_offset != offset:
+                state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
+                updated = True
+                logging.info(f"UP {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
+            
+            # 处理所有新动态（items 按时间倒序，最新在前）
+            for item in items:
+                dyn_id = item.get("id_str")
+                if not dyn_id or dyn_id in seen_dynamics[uid]:
+                    continue
+                seen_dynamics[uid].add(dyn_id)
+                
+                # 超时过滤（仅 debug 日志）
+                modules = item.get("modules") or {}
+                author = modules.get("module_author") or {}
+                pub_ts = author.get("pub_ts", 0)
+                if now_ts - pub_ts > DYNAMIC_MAX_AGE:
+                    logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}, 距今 {int(now_ts - pub_ts)} 秒")
+                    continue
+                
+                name = author.get("name", str(uid))
+                text = extract_dynamic_text(item)
+                
+                # 处理转发动态
+                if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+                    orig = item.get("orig")
+                    if orig:
+                        orig_text = extract_dynamic_text(orig)
+                        if orig_text:
+                            if text:
+                                text = f"{text}\n【转发原文】{orig_text}"
+                            else:
+                                text = f"【转发原文】{orig_text}"
+                        orig_id = orig.get("id_str")
+                        if orig_id:
+                            text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
+                
+                final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
+                alerts.append({"user": name, "message": final_msg})
+                has_new = True
+                logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
+        except Exception as e:
+            logging.error(f"UP {uid} 处理动态异常: {e}\n{traceback.format_exc()}")
         
         time.sleep(random.uniform(1, 2))
     
