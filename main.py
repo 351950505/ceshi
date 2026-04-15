@@ -11,6 +11,25 @@ import requests
 import database as db
 import notifier
 
+# ================= 全局时间补偿 =================
+TIME_OFFSET = 0
+
+def get_beijing_time():
+    """启动时从网络获取正确北京时间，返回时间戳"""
+    try:
+        r = requests.get("https://www.timeapi.io/api/Time/current/zone?timeZone=Asia/Shanghai", timeout=5)
+        if r.status_code == 200:
+            return r.json()["unixTime"] / 1000.0
+    except:
+        pass
+    try:
+        r = requests.get("http://worldtimeapi.org/api/timezone/Asia/Shanghai", timeout=5)
+        if r.status_code == 200:
+            return r.json()["unixtime"]
+    except:
+        pass
+    return time.time()
+
 # ================= 核心配置区 =================
 TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
@@ -21,6 +40,9 @@ DYNAMIC_MAX_AGE = 600
 LOG_FILE = "bili_monitor.log"
 
 def init_logging():
+    global TIME_OFFSET
+    TIME_OFFSET = get_beijing_time() - time.time()   # 计算补偿值
+    
     try:
         if os.path.exists(LOG_FILE):
             open(LOG_FILE, "w").close()
@@ -28,7 +50,7 @@ def init_logging():
         pass
     logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", encoding="utf-8", filemode="w")
     logging.info("=" * 60)
-    logging.info("B站监控系统启动")
+    logging.info("B站监控系统启动 (时间已校准)")
     logging.info("=" * 60)
 
 def safe_request(url, params, header, retries=3):
@@ -169,24 +191,20 @@ def init_extra_dynamics(header):
 
 def check_new_dynamics(header, seen_dynamics):
     alerts = []
-    now_ts = time.time()
+    now_ts = time.time() + TIME_OFFSET   # 使用校准后的北京时间
     for uid in EXTRA_DYNAMIC_UIDS:
         try:
             data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": uid}, header)
-            if data.get("code") != 0:
-                continue
+            if data.get("code") != 0: continue
             items = (data.get("data") or {}).get("items", [])
-            if not items:
-                continue
+            if not items: continue
             item = items[0]
             id_str = item.get("id_str")
-            if not id_str or id_str in seen_dynamics[uid]:
-                continue
+            if not id_str or id_str in seen_dynamics[uid]: continue
             modules = item.get("modules") or {}
             author = modules.get("module_author") or {}
             pub_ts = float(author.get("pub_ts", 0))
-            if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-                continue
+            if now_ts - pub_ts > DYNAMIC_MAX_AGE: continue
             seen_dynamics[uid].add(id_str)
             name = author.get("name", str(uid))
             text = extract_dynamic_text(item)
@@ -230,9 +248,9 @@ def scan_new_comments(oid, header, last_read_time, seen):
         time.sleep(random.uniform(0.5, 1))
     return new_list, max_ctime
 
-# ---------------- 主循环（启动延迟10秒内防封） ----------------
+# ---------------- 主循环 ----------------
 def start_monitoring(header):
-    time.sleep(random.uniform(0, 10))  # 启动随机延迟防352
+    time.sleep(random.uniform(0, 8))   # 启动随机延迟防风控
     last_v_check = 0
     last_hb = time.time()
     last_d_check = 0
@@ -241,7 +259,7 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
     seen_dynamics = init_extra_dynamics(header)
-    logging.info("监控服务已启动")
+    logging.info("监控服务已启动（时间已校准）")
     while True:
         try:
             now = time.time()
