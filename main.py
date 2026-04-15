@@ -175,7 +175,7 @@ def get_header():
 
     return {
         "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.bilibili.com/"
     }
 
@@ -675,8 +675,8 @@ def start_monitoring(header):
                     logging.info("💓 心跳: 监控系统正常运行中")
                     last_hb = now
 
-                # 优化：缩短主循环休眠时间，提高轮询频率（从10-15秒改为3-5秒）
-                time.sleep(random.uniform(3, 5))
+                # 优化：主循环休眠时间从 10-15秒 改为 12-18秒，降低请求频率
+                time.sleep(random.uniform(12, 18))
 
             else:
                 time.sleep(30)
