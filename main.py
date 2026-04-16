@@ -74,8 +74,12 @@ def send_failure_notification(title, message):
     key = f"{title}:{message[:100]}"
     if should_notify(key):
         try:
-            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
-            logging.info(f"已发送失败通知: {title}")
+            # 调用改进后的 notifier，它会返回布尔值
+            success = notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
+            if success:
+                logging.info(f"已发送失败通知: {title}")
+            else:
+                logging.error(f"失败通知发送失败: {title}")
         except Exception as e:
             logging.error(f"发送失败通知异常: {e}")
 
@@ -680,10 +684,13 @@ def start_monitoring(header):
                 if new_c:
                     new_c.sort(key=lambda x: x["ctime"])
                     try:
-                        notifier.send_webhook_notification(title, new_c)
-                        logging.info(f"💬 成功发送 {len(new_c)} 条新评论通知")
+                        success = notifier.send_webhook_notification(title, new_c)
+                        if success:
+                            logging.info(f"💬 成功发送 {len(new_c)} 条新评论通知")
+                        else:
+                            logging.error(f"💬 评论通知发送失败，请检查 webhook 配置")
                     except Exception as e:
-                        logging.error(f"评论通知发送失败: {e}")
+                        logging.error(f"评论通知发送异常: {e}")
 
             # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
@@ -704,10 +711,13 @@ def start_monitoring(header):
                     save_dynamic_state(state)
                 if all_alerts:
                     try:
-                        notifier.send_webhook_notification("💡 特别关注UP主发布新内容", all_alerts)
-                        logging.info(f"🚀 成功发送 {len(all_alerts)} 条 Webhook 动态通知！")
+                        success = notifier.send_webhook_notification("💡 特别关注UP主发布新内容", all_alerts)
+                        if success:
+                            logging.info(f"🚀 成功发送 {len(all_alerts)} 条 Webhook 动态通知！")
+                        else:
+                            logging.error(f"❌ Webhook 动态通知发送失败，请检查 webhook 配置")
                     except Exception as e:
-                        logging.error(f"❌ Webhook 发送失败: {e}")
+                        logging.error(f"❌ Webhook 发送异常: {e}")
                 last_d_check = now
 
             # 心跳
