@@ -20,7 +20,7 @@ HEARTBEAT_INTERVAL = 10
 
 SOURCE_UID = 3706948578969654
 FOLLOWING_REFRESH_INTERVAL = 3600
-FALLBACK_DYNAMIC_UIDS =[
+FALLBACK_DYNAMIC_UIDS = [
     3546905852250875,
     3546961271589219,
     3546610447419885,
@@ -59,7 +59,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (修复5分钟监听漏报 + 优化风控版)")
+    logging.info("B站监控系统启动 (稳定版 - 基于pub_time判断)")
     logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒")
     logging.info("=" * 60)
 
@@ -81,7 +81,8 @@ def send_error_alert(error_code, message):
         LAST_ERROR_ALERT[error_code] = now
         try:
             notifier.send_webhook_notification(
-                f"⚠️ B站监控 API 错误",[{"user": "系统", "message": f"错误码 {error_code}: {message}"}]
+                f"⚠️ B站监控 API 错误",
+                [{"user": "系统", "message": f"错误码 {error_code}: {message}"}]
             )
             logging.info(f"已发送错误告警: {error_code}")
         except Exception as e:
@@ -126,7 +127,7 @@ def safe_request(url, params, header, retries=3):
 
 # ---------------- WBI 签名 ----------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab =[
+mixinKeyEncTab = [
     46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
     37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52
 ]
@@ -173,7 +174,7 @@ def wbi_request(url, params, header):
 
 # ---------------- 获取关注列表 ----------------
 def get_following_list(uid, header):
-    following =[]
+    following = []
     pn = 1
     ps = 50
     while True:
@@ -183,7 +184,7 @@ def get_following_list(uid, header):
             logging.warning(f"获取关注列表失败 (pn={pn}): {data.get('message')}")
             break
         info = data.get("data", {})
-        items = info.get("list",[])
+        items = info.get("list", [])
         if not items:
             break
         for item in items:
@@ -203,14 +204,14 @@ def load_following_cache():
             with open(FOLLOWING_CACHE_FILE, "r") as f:
                 return json.load(f)
         except:
-            return[]
-    return[]
+            return []
+    return []
 
 def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
 
-# ---------------- 动态监控核心 ----------------
+# ---------------- 动态监控核心（基于pub_time判断） ----------------
 def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
@@ -231,7 +232,7 @@ def extract_dynamic_text(item):
         desc = dyn.get("desc") or {}
         nodes = desc.get("rich_text_nodes") or []
         if nodes:
-            text_parts =[]
+            text_parts = []
             for node in nodes:
                 if not isinstance(node, dict):
                     continue
@@ -277,67 +278,53 @@ def fetch_latest_dynamics(uid, header):
         "web_location": "333.1365",
         "offset": ""
     }
-    # 🌟 修复关键：改回 safe_request，去除不必要的 WBI 签名，大幅度减少 -352 风控
-    return safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
+    return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
-def is_fresh_dynamic(item, adjusted_now):
+def is_fresh_by_pubtime(pub_time):
+    """根据 pub_time 字符串判断是否为刚刚发布的动态"""
+    if not pub_time:
+        return False
+    # 如果包含“刚刚”或“1分钟前”，视为新鲜
+    return "刚刚" in pub_time or "1分钟前" in pub_time
+
+def check_new_dynamics(uid, header, seen_dynamics):
     """
-    判断动态是否为最新（5分钟内）
+    直接拉取最新动态列表，与本地 ID 集合对比，
+    若发现新动态且 pub_time 包含“刚刚”或“1分钟前”，则推送
     """
-    modules = item.get("modules") or {}
-    author = modules.get("module_author") or {}
-    
-    # 1. 优先使用时间戳绝对判断 (🌟修复关键：放宽到 300 秒/5分钟，应对 B站接口延迟)
-    pub_ts = author.get("pub_ts", 0)
-    if pub_ts > 0:
-        time_diff = adjusted_now - pub_ts
-        if time_diff <= 300:  
-            return True
-        else:
-            return False
-
-    # 2. 兜底判断文本
-    pub_time = author.get("pub_time", "")
-    if isinstance(pub_time, str):
-        if "刚刚" in pub_time:
-            return True
-        if "分钟前" in pub_time:
-            try:
-                mins = int(pub_time.replace("分钟前", "").strip())
-                if mins <= 5:
-                    return True
-            except:
-                pass
-    return False
-
-def check_new_dynamics(uid, header, seen_dynamics, adjusted_now):
-    alerts =[]
+    alerts = []
     data = fetch_latest_dynamics(uid, header)
     if data.get("code") != 0:
         logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
         return alerts
 
     feed_data = data.get("data") or {}
-    items = feed_data.get("items",[])
+    items = feed_data.get("items", [])
     if not items:
         return alerts
 
+    # 按顺序处理（最新的在前面）
     for item in items:
         dyn_id = item.get("id_str")
         if not dyn_id:
             continue
+        # 已经处理过的动态跳过
         if dyn_id in seen_dynamics[uid]:
             continue
 
-        # 新动态，先判断新鲜度
-        if not is_fresh_dynamic(item, adjusted_now):
-            # 如果不新鲜（超过5分钟），记录 ID 但不推送
-            seen_dynamics[uid].add(dyn_id)
-            continue
-
-        # 新鲜动态，触发推送
+        # 获取 pub_time
         modules = item.get("modules") or {}
         author = modules.get("module_author") or {}
+        pub_time = author.get("pub_time", "")
+
+        # 判断是否新鲜
+        if not is_fresh_by_pubtime(pub_time):
+            # 不新鲜，记录 ID 但不再推送
+            seen_dynamics[uid].add(dyn_id)
+            logging.debug(f"UID {uid} 动态 {dyn_id} pub_time='{pub_time}' 不新鲜，忽略")
+            continue
+
+        # 新鲜动态，推送
         name = author.get("name", str(uid))
         text = extract_dynamic_text(item)
 
@@ -355,13 +342,13 @@ def check_new_dynamics(uid, header, seen_dynamics, adjusted_now):
         final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
         alerts.append({"user": name, "message": final_msg})
         seen_dynamics[uid].add(dyn_id)
-        logging.info(f"✅ 成功监听到 5 分钟内的新动态 [{name}]: {dyn_id} (发布时间: {author.get('pub_time')})")
+        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} (pub_time={pub_time})")
 
     return alerts
 
 # ---------------- 评论监控（保持不变） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    new_list =[]
+    new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
     for pn in range(1, COMMENT_MAX_PAGES + 1):
@@ -381,7 +368,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
         if data.get("code") != 0:
             logging.warning(f"旧版评论接口失败: {data.get('message')}")
             break
-        replies = (data.get("data") or {}).get("replies") or[]
+        replies = (data.get("data") or {}).get("replies") or []
         if not replies:
             break
         all_old = True
@@ -413,7 +400,7 @@ def get_latest_video(header):
         return None
     if data.get("code") != 0:
         return None
-    items = (data.get("data") or {}).get("items",[])
+    items = (data.get("data") or {}).get("items", [])
     for item in items:
         try:
             if item.get("type") == "DYNAMIC_TYPE_AV":
@@ -488,32 +475,32 @@ def start_monitoring(header):
     seen_dynamics = {}
     for uid in following_list:
         seen_dynamics[uid] = set()
-        # 首次拉取，将所有现有动态 ID 加入 seen，避免一启动就误推送旧动态
+        # 首次拉取，将所有现有动态 ID 加入 seen，避免误推送旧动态
         try:
             data = fetch_latest_dynamics(uid, header)
             if data.get("code") == 0:
                 feed_data = data.get("data") or {}
-                items = feed_data.get("items",[])
+                items = feed_data.get("items", [])
                 for item in items:
                     dyn_id = item.get("id_str")
                     if dyn_id:
                         seen_dynamics[uid].add(dyn_id)
-                logging.info(f"初始化 UID {uid}: 已静默收录 {len(seen_dynamics[uid])} 条历史动态")
+                logging.info(f"初始化 UID {uid}: 已收录 {len(seen_dynamics[uid])} 条动态")
             else:
                 logging.warning(f"初始化 UID {uid} 失败: {data.get('message')}")
         except Exception as e:
             logging.error(f"初始化 UID {uid} 异常: {e}")
-        time.sleep(random.uniform(0.5, 1.5))
+        time.sleep(random.uniform(0.5, 1))
 
-    logging.info("监控服务已启动，正在实时扫描新动态...")
+    logging.info("监控服务已启动，正在扫描新数据...")
 
     while True:
         try:
             now = time.time()
-            adjusted_now = now + TIME_OFFSET
 
             # 刷新关注列表（每小时）
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
+                logging.info("刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
                     if SOURCE_UID not in new_list:
@@ -531,18 +518,24 @@ def start_monitoring(header):
                                 del seen_dynamics[uid]
                         following_list = new_list
                         save_following_cache(following_list)
+                        # 新加入的 UID 初始化 seen
                         for uid in added:
                             try:
                                 data = fetch_latest_dynamics(uid, header)
                                 if data.get("code") == 0:
                                     feed_data = data.get("data") or {}
-                                    items = feed_data.get("items",[])
+                                    items = feed_data.get("items", [])
                                     for item in items:
                                         dyn_id = item.get("id_str")
                                         if dyn_id:
                                             seen_dynamics[uid].add(dyn_id)
-                            except:
-                                pass
+                                    logging.info(f"新增 UID {uid}: 已收录 {len(seen_dynamics[uid])} 条动态")
+                            except Exception as e:
+                                logging.error(f"初始化新增 UID {uid} 异常: {e}")
+                    else:
+                        logging.info("关注列表无变化")
+                else:
+                    logging.warning("刷新关注列表失败")
                 last_following_refresh = now
 
             # 评论监控
@@ -559,6 +552,49 @@ def start_monitoring(header):
                     except Exception as e:
                         logging.error(f"评论通知发送失败: {e}")
 
-            # 动态监控
+            # 动态监控（基于 pub_time 判断）
             if now - last_d_check >= DYNAMIC_CHECK_INTERVAL:
-                all_alerts =
+                logging.info(f"开始动态扫描（间隔 {DYNAMIC_CHECK_INTERVAL} 秒）")
+                all_alerts = []
+                for uid in following_list:
+                    try:
+                        alerts = check_new_dynamics(uid, header, seen_dynamics)
+                        if alerts:
+                            all_alerts.extend(alerts)
+                    except Exception as e:
+                        logging.error(f"UID {uid} 动态检查异常: {e}\n{traceback.format_exc()}")
+                    time.sleep(random.uniform(0.3, 0.6))  # 避免请求过快
+                if all_alerts:
+                    try:
+                        notifier.send_webhook_notification("💡 特别关注UP主发布新内容", all_alerts)
+                        logging.info(f"🚀 成功发送 {len(all_alerts)} 条动态通知")
+                    except Exception as e:
+                        logging.error(f"动态通知发送失败: {e}")
+                else:
+                    logging.info("本次动态扫描未发现新动态")
+                last_d_check = now
+
+            # 心跳
+            if now - last_hb >= HEARTBEAT_INTERVAL:
+                logging.info("💓 心跳: 监控系统正常运行中")
+                last_hb = now
+
+            time.sleep(random.uniform(2, 4))
+
+            # 视频检查
+            if now - last_v_check > VIDEO_CHECK_INTERVAL:
+                res = sync_latest_video(header)
+                if res:
+                    oid, title = res
+                last_v_check = now
+
+        except Exception:
+            logging.error(traceback.format_exc())
+            time.sleep(60)
+
+if __name__ == "__main__":
+    init_logging()
+    db.init_db()
+    h = get_header()
+    update_wbi_keys(h)
+    start_monitoring(h)
