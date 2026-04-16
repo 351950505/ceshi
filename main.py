@@ -42,6 +42,10 @@ TIME_OFFSET = -120
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
+
+# 错误告警去重
+LAST_ERROR_ALERT = {}
+ERROR_ALERT_INTERVAL = 300
 # =============================================
 
 def init_logging():
@@ -59,7 +63,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (同步稳定版)")
+    logging.info("B站监控系统启动 (动态监控修复版 - 评论保持稳定)")
     logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒")
     logging.info("=" * 60)
 
@@ -72,6 +76,22 @@ def refresh_cookie():
     except Exception as e:
         logging.error(f"重新登录失败: {e}")
         return False
+
+def send_error_alert(error_code, message):
+    """发送错误告警，5分钟内相同错误码不重复发送"""
+    global LAST_ERROR_ALERT
+    now = time.time()
+    last_time = LAST_ERROR_ALERT.get(error_code, 0)
+    if now - last_time >= ERROR_ALERT_INTERVAL:
+        LAST_ERROR_ALERT[error_code] = now
+        try:
+            notifier.send_webhook_notification(
+                f"⚠️ B站监控 API 错误",
+                [{"user": "系统", "message": f"错误码 {error_code}: {message}"}]
+            )
+            logging.info(f"已发送错误告警: {error_code}")
+        except Exception as e:
+            logging.error(f"发送错误告警失败: {e}")
 
 def safe_request(url, params, header, retries=3):
     h = header.copy()
@@ -97,17 +117,20 @@ def safe_request(url, params, header, retries=3):
                 time.sleep(wait)
                 continue
             if code != 0:
-                logging.warning(f"API 返回错误 {code}: {data.get('message')} | URL: {url} | Params: {params}")
+                logging.warning(f"API 返回错误 {code}: {data.get('message')} | URL: {url}")
+                send_error_alert(str(code), data.get('message', '未知错误'))
                 if i < retries - 1:
                     time.sleep(base_delay * (2 ** i))
                     continue
             return data
         except Exception as e:
             logging.error(f"请求异常: {e}")
-            time.sleep(base_delay * (2 ** i))
+            if i < retries - 1:
+                time.sleep(base_delay * (2 ** i))
+                continue
     return {"code": -500, "message": "所有重试均失败"}
 
-# ---------------- WBI 签名（与 test_wbi.py 完全一致） ----------------
+# ---------------- WBI 签名 ----------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
     46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
@@ -119,7 +142,8 @@ def getMixinKey(orig):
 
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
-    params['wts'] = int(time.time() + TIME_OFFSET)
+    adjusted_ts = int(time.time() + TIME_OFFSET)
+    params["wts"] = adjusted_ts
     params = dict(sorted(params.items()))
     filtered = {}
     for k, v in params.items():
@@ -129,7 +153,7 @@ def encWbi(params, img_key, sub_key):
         filtered[k] = v
     query = urllib.parse.urlencode(filtered, quote_via=urllib.parse.quote)
     sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
-    filtered['w_rid'] = sign
+    filtered["w_rid"] = sign
     return filtered
 
 def update_wbi_keys(header):
@@ -192,7 +216,7 @@ def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
 
-# ---------------- 动态监控核心 ----------------
+# ---------------- 动态监控核心（修复版） ----------------
 def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
@@ -249,6 +273,7 @@ def extract_dynamic_text(item):
         return ""
 
 def fetch_dynamics_page(uid, offset, header):
+    """拉取一页动态（不带 update_baseline）"""
     params = {
         "host_mid": uid,
         "type": "all",
@@ -260,6 +285,29 @@ def fetch_dynamics_page(uid, offset, header):
     }
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
+def fetch_incremental_dynamics(uid, baseline, offset, header):
+    """拉取增量动态（带 update_baseline）"""
+    params = {
+        "host_mid": uid,
+        "type": "all",
+        "timezone_offset": "-480",
+        "platform": "web",
+        "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
+        "web_location": "333.1365",
+        "offset": offset,
+        "update_baseline": baseline
+    }
+    return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
+
+def check_update_num(uid, baseline, header):
+    """检测指定 baseline 之后的新动态数量"""
+    params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
+    data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params, header)
+    if data.get("code") != 0:
+        logging.warning(f"UID {uid} 检测更新失败: {data.get('message')}")
+        return -1
+    return data.get("data", {}).get("update_num", 0)
+
 def init_dynamic_states_for_uids(uids, header):
     seen = {}
     state = load_dynamic_state()
@@ -268,6 +316,7 @@ def init_dynamic_states_for_uids(uids, header):
         seen[uid] = set()
         if uid_str not in state:
             state[uid_str] = {"baseline": "", "offset": ""}
+        # 尝试建立基线
         try:
             data = fetch_dynamics_page(uid, "", header)
             if data.get("code") == 0:
@@ -287,8 +336,6 @@ def init_dynamic_states_for_uids(uids, header):
             elif data.get("code") == -101:
                 if refresh_cookie():
                     return init_dynamic_states_for_uids(uids, get_header())
-                else:
-                    logging.warning(f"初始化 UID {uid} 失败: Cookie 无效")
             else:
                 logging.warning(f"初始化 UID {uid} 失败: {data.get('message')}")
         except Exception as e:
@@ -306,6 +353,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     has_new = False
     updated = False
 
+    # 如果 baseline 为空，尝试建立基线
     if not baseline:
         logging.info(f"UID {uid} baseline 为空，尝试建立基线...")
         data = fetch_dynamics_page(uid, "", header)
@@ -323,39 +371,45 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
                         seen_dynamics[uid].add(dyn_id)
                 logging.info(f"UID {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
             else:
-                logging.warning(f"UID {uid} 无法获取 baseline")
+                logging.warning(f"UID {uid} 无法获取 baseline (可能没有动态)")
+        else:
+            logging.warning(f"UID {uid} 建立基线失败: {data.get('message')}")
         return alerts, updated, has_new
 
-    # 增量检测
-    update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
-    update_data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", update_params, header)
-    if update_data.get("code") != 0:
-        logging.warning(f"UID {uid} 检测更新失败: {update_data.get('message')}")
-    else:
-        update_num = update_data.get("data", {}).get("update_num", 0)
-        if update_num == 0:
-            return alerts, updated, has_new
+    # 检测新动态数量
+    update_num = check_update_num(uid, baseline, header)
+    if update_num == -1:
+        # 检测失败，可能 baseline 已失效，尝试重置 baseline
+        logging.warning(f"UID {uid} 检测更新失败，尝试重置 baseline")
+        # 重新拉取第一页，更新 baseline
+        data = fetch_dynamics_page(uid, "", header)
+        if data.get("code") == 0:
+            feed_data = data.get("data") or {}
+            items = feed_data.get("items", [])
+            new_offset = feed_data.get("offset", "")
+            new_baseline = items[0].get("id_str", "") if items else ""
+            if new_baseline:
+                state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
+                updated = True
+                logging.info(f"UID {uid} baseline 已重置: {new_baseline}")
+            else:
+                logging.warning(f"UID {uid} 重置 baseline 失败")
+        return alerts, updated, has_new
+    if update_num == 0:
+        return alerts, updated, has_new
 
-    # 拉取新动态
-    fetch_params = {
-        "host_mid": uid,
-        "type": "all",
-        "timezone_offset": "-480",
-        "platform": "web",
-        "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
-        "web_location": "333.1365",
-        "offset": offset,
-        "update_baseline": baseline
-    }
-    data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", fetch_params, header)
+    # 有新动态，拉取增量
+    logging.info(f"UID {uid} 检测到 {update_num} 条新动态，正在拉取...")
+    data = fetch_incremental_dynamics(uid, baseline, offset, header)
     if data.get("code") != 0:
-        logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
+        logging.warning(f"UID {uid} 拉取增量动态失败: {data.get('message')}")
         return alerts, updated, has_new
 
     feed_data = data.get("data") or {}
     items = feed_data.get("items", [])
     new_offset = feed_data.get("offset", offset)
     new_baseline = items[0].get("id_str", baseline) if items else baseline
+
     if new_baseline != baseline or new_offset != offset:
         state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
         updated = True
@@ -389,37 +443,31 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
     return alerts, updated, has_new
 
-# ---------------- 评论监控（降级版，避免-400） ----------------
+# ---------------- 评论监控（保持不变，稳定版） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    """使用旧版翻页接口，避免懒加载接口的参数问题"""
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
-
     for pn in range(1, COMMENT_MAX_PAGES + 1):
-        data = wbi_request(
-            "https://api.bilibili.com/x/v2/reply",
-            {
-                "oid": oid,
-                "type": 1,
-                "sort": 0,
-                "pn": pn,
-                "ps": 20
-            },
-            header
-        )
+        params = {
+            "oid": oid,
+            "type": 1,
+            "sort": 0,
+            "pn": pn,
+            "ps": 20
+        }
+        data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
         if data.get("code") == -101:
             if refresh_cookie():
                 return scan_new_comments(oid, get_header(), last_read_time, seen)
-            break
+            else:
+                break
         if data.get("code") != 0:
-            logging.warning(f"评论接口失败: {data.get('message')}")
+            logging.warning(f"旧版评论接口失败: {data.get('message')}")
             break
-
         replies = (data.get("data") or {}).get("replies") or []
         if not replies:
             break
-
         all_old = True
         for r in replies:
             ctime = r.get("ctime", 0)
@@ -435,11 +483,9 @@ def scan_new_comments(oid, header, last_read_time, seen):
                         "message": r["content"]["message"],
                         "ctime": ctime
                     })
-
         if all_old:
             break
         time.sleep(random.uniform(0.3, 0.6))
-
     return new_list, max_ctime
 
 # ---------------- 视频监控 ----------------
@@ -484,7 +530,6 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
-# ---------------- 主循环 ----------------
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
@@ -499,6 +544,7 @@ def get_header():
         "Referer": "https://www.bilibili.com/"
     }
 
+# ---------------- 主循环 ----------------
 def start_monitoring(header):
     last_v_check = 0
     last_hb = time.time()
@@ -512,7 +558,6 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
 
-    # 初始化关注列表
     following_list = load_following_cache()
     if not following_list:
         following_list = get_following_list(SOURCE_UID, header)
@@ -533,9 +578,9 @@ def start_monitoring(header):
         try:
             now = time.time()
 
-            # 定时刷新关注列表
+            # 刷新关注列表（每小时）
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
-                logging.info("开始刷新关注列表...")
+                logging.info("刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
                     if SOURCE_UID not in new_list:
@@ -545,7 +590,7 @@ def start_monitoring(header):
                     added = new_set - old_set
                     removed = old_set - new_set
                     if added or removed:
-                        logging.info(f"关注列表变化: 新增 {len(added)} 个, 移除 {len(removed)} 个")
+                        logging.info(f"关注列表变化: 新增 {len(added)}, 移除 {len(removed)}")
                         for uid in added:
                             if str(uid) not in state:
                                 state[str(uid)] = {"baseline": "", "offset": ""}
@@ -559,14 +604,13 @@ def start_monitoring(header):
                         following_list = new_list
                         save_following_cache(following_list)
                         save_dynamic_state(state)
-                        logging.info(f"监控列表已更新，当前共 {len(following_list)} 个 UID")
                     else:
                         logging.info("关注列表无变化")
                 else:
-                    logging.warning("刷新关注列表失败，保持原有列表")
+                    logging.warning("刷新关注列表失败")
                 last_following_refresh = now
 
-            # 评论监控
+            # 评论监控（保持不变）
             if oid and (now - last_comment_check >= COMMENT_SCAN_INTERVAL):
                 new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
                 last_comment_check = now
@@ -591,17 +635,17 @@ def start_monitoring(header):
                         all_alerts.extend(alerts)
                     if updated:
                         state_updated = True
-                    if has_new:
+                    if has_new and not burst_end:
                         burst_end = now + DYNAMIC_BURST_DURATION
-                    time.sleep(random.uniform(0.5, 1))
+                    time.sleep(random.uniform(0.3, 0.6))
                 if state_updated:
                     save_dynamic_state(state)
                 if all_alerts:
                     try:
                         notifier.send_webhook_notification("💡 特别关注UP主发布新内容", all_alerts)
-                        logging.info(f"🚀 成功发送 {len(all_alerts)} 条 Webhook 动态通知！")
+                        logging.info(f"🚀 成功发送 {len(all_alerts)} 条动态通知")
                     except Exception as e:
-                        logging.error(f"❌ Webhook 发送失败: {e}")
+                        logging.error(f"动态通知发送失败: {e}")
                 last_d_check = now
 
             # 心跳
