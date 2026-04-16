@@ -10,6 +10,7 @@ import urllib.parse
 import json
 import requests
 from collections import defaultdict
+import datetime  # 用于工作时间判断
 
 import database as db
 import notifier
@@ -53,6 +54,7 @@ FAILURE_NOTIFY_INTERVAL = 600 # 10分钟内相同失败不重复通知
 _last_log_time = defaultdict(float)
 _last_notify_time = defaultdict(float)
 
+# ---------- 辅助函数 ----------
 def should_log(message_key, interval=LOG_DEDUP_INTERVAL):
     now = time.time()
     if now - _last_log_time[message_key] >= interval:
@@ -108,7 +110,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态关注列表模式 - 时间戳去重)")
+    logging.info("B站监控系统启动 (动态关注列表模式 - 时间戳去重 + 工作时间控制)")
     logging.info("=" * 60)
 
 def refresh_cookie():
@@ -177,7 +179,6 @@ def safe_request(url, params, header, retries=3):
     send_failure_notification("API 请求最终失败", final_msg)
     return {"code": -500, "message": final_msg}
 
-
 # ---------------- WBI 签名 ----------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
@@ -225,10 +226,8 @@ def wbi_request(url, params, header):
     signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     return safe_request(url, signed, header)
 
-
 # ---------------- 获取关注列表 ----------------
 def get_following_list(uid, header):
-    """获取用户关注的 UID 列表（字符串列表），失败返回空列表"""
     following = []
     pn = 1
     ps = 50
@@ -251,7 +250,7 @@ def get_following_list(uid, header):
         for item in items:
             mid = item.get("mid")
             if mid:
-                following.append(str(mid))   # 统一转为字符串
+                following.append(str(mid))
         total = info.get("total", 0)
         if total <= pn * ps:
             break
@@ -276,7 +275,6 @@ def load_following_cache():
 def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
-
 
 # ---------------- 动态监控核心（基于时间戳） ----------------
 def load_dynamic_state():
@@ -488,7 +486,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"UID {uid_str} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
     return alerts, True, has_new
 
-
 # ---------------- 评论监控 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -538,7 +535,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
         time.sleep(random.uniform(0.3, 0.6))
     return new_list, max_ctime
 
-
 # ---------------- 视频监控 ----------------
 def get_latest_video(header):
     data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": TARGET_UID}, header)
@@ -581,6 +577,29 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
+# ---------------- 工作时间判断 ----------------
+def is_work_time(now=None):
+    """判断当前时间是否为工作时间（周一至周五 8:30-17:00）"""
+    if now is None:
+        now = datetime.datetime.now()
+    # 星期几：周一=0，周日=6
+    if now.weekday() >= 5:  # 周六=5，周日=6
+        return False
+    time_start = datetime.time(8, 30)
+    time_end = datetime.time(17, 0)
+    return time_start <= now.time() <= time_end
+
+def get_sleep_until_work_time(now=None):
+    """计算从当前时间到下一个工作开始时间的休眠秒数"""
+    if now is None:
+        now = datetime.datetime.now()
+    target = datetime.datetime(now.year, now.month, now.day, 8, 30)
+    if now > target:
+        target += datetime.timedelta(days=1)
+    # 跳过周末
+    while target.weekday() >= 5:
+        target += datetime.timedelta(days=1)
+    return max(1, (target - now).total_seconds())
 
 # ---------------- 主循环 ----------------
 def get_header():
@@ -619,7 +638,6 @@ def start_monitoring(header):
             logging.warning("获取关注列表失败，使用备用静态列表")
             following_list = FALLBACK_DYNAMIC_UIDS.copy()
             send_failure_notification("关注列表获取失败", f"无法获取 UID {SOURCE_UID} 的关注列表，已启用静态列表: {following_list}")
-        # 确保 SOURCE_UID 自身也在列表中（如果希望监控自己）
         if str(SOURCE_UID) not in following_list:
             following_list.append(str(SOURCE_UID))
         save_following_cache(following_list)
@@ -628,14 +646,24 @@ def start_monitoring(header):
 
     logging.info(f"初始监控 UID 列表 ({len(following_list)} 个): {following_list}")
 
-    # 初始化动态状态
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
     state = load_dynamic_state()
 
-    logging.info("监控服务已启动，正在扫描新数据...")
+    logging.info("监控服务已启动，将在工作时间（周一至周五 8:30-17:00）运行")
 
     while True:
         try:
+            now_dt = datetime.datetime.now()
+            if not is_work_time(now_dt):
+                sleep_sec = get_sleep_until_work_time(now_dt)
+                logging.info(f"非工作时间，休眠 {sleep_sec/3600:.1f} 小时至 {datetime.datetime.now() + datetime.timedelta(seconds=sleep_sec)}")
+                time.sleep(sleep_sec)
+                # 休眠后刷新 header 和密钥
+                header = get_header()
+                update_wbi_keys(header)
+                continue
+
+            # ========== 工作时间内的正常监控逻辑 ==========
             now = time.time()
 
             # 日志清理（每小时检查一次）
@@ -648,7 +676,6 @@ def start_monitoring(header):
                 logging.info("开始刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
-                    # 统一转换为字符串
                     new_list = [str(uid) for uid in new_list]
                     if str(SOURCE_UID) not in new_list:
                         new_list.append(str(SOURCE_UID))
@@ -724,8 +751,6 @@ def start_monitoring(header):
                 logging.info("💓 心跳: 监控系统正常运行中")
                 last_hb = now
 
-            time.sleep(random.uniform(2, 4))
-
             # 视频检查
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
                 res = sync_latest_video(header)
@@ -733,10 +758,12 @@ def start_monitoring(header):
                     oid, title = res
                 last_v_check = now
 
+            # 工作时间内短暂休息，避免空转
+            time.sleep(random.uniform(2, 4))
+
         except Exception:
             logging.error(traceback.format_exc())
             time.sleep(60)
-
 
 if __name__ == "__main__":
     init_logging()
