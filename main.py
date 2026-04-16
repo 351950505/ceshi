@@ -43,7 +43,6 @@ LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
-# 错误告警去重
 LAST_ERROR_ALERT = {}
 ERROR_ALERT_INTERVAL = 300
 # =============================================
@@ -63,7 +62,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态监控修复版 - 评论保持稳定)")
+    logging.info("B站监控系统启动 (动态监控修复版 - 增加调试日志)")
     logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒")
     logging.info("=" * 60)
 
@@ -78,7 +77,6 @@ def refresh_cookie():
         return False
 
 def send_error_alert(error_code, message):
-    """发送错误告警，5分钟内相同错误码不重复发送"""
     global LAST_ERROR_ALERT
     now = time.time()
     last_time = LAST_ERROR_ALERT.get(error_code, 0)
@@ -216,7 +214,7 @@ def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
 
-# ---------------- 动态监控核心（修复版） ----------------
+# ---------------- 动态监控核心 ----------------
 def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
@@ -273,7 +271,6 @@ def extract_dynamic_text(item):
         return ""
 
 def fetch_dynamics_page(uid, offset, header):
-    """拉取一页动态（不带 update_baseline）"""
     params = {
         "host_mid": uid,
         "type": "all",
@@ -286,7 +283,6 @@ def fetch_dynamics_page(uid, offset, header):
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def fetch_incremental_dynamics(uid, baseline, offset, header):
-    """拉取增量动态（带 update_baseline）"""
     params = {
         "host_mid": uid,
         "type": "all",
@@ -300,7 +296,6 @@ def fetch_incremental_dynamics(uid, baseline, offset, header):
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def check_update_num(uid, baseline, header):
-    """检测指定 baseline 之后的新动态数量"""
     params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
     data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params, header)
     if data.get("code") != 0:
@@ -316,7 +311,6 @@ def init_dynamic_states_for_uids(uids, header):
         seen[uid] = set()
         if uid_str not in state:
             state[uid_str] = {"baseline": "", "offset": ""}
-        # 尝试建立基线
         try:
             data = fetch_dynamics_page(uid, "", header)
             if data.get("code") == 0:
@@ -353,7 +347,9 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     has_new = False
     updated = False
 
-    # 如果 baseline 为空，尝试建立基线
+    # 调试：打印当前状态
+    logging.debug(f"检查 UID {uid}: baseline={baseline}, offset={offset}")
+
     if not baseline:
         logging.info(f"UID {uid} baseline 为空，尝试建立基线...")
         data = fetch_dynamics_page(uid, "", header)
@@ -379,9 +375,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     # 检测新动态数量
     update_num = check_update_num(uid, baseline, header)
     if update_num == -1:
-        # 检测失败，可能 baseline 已失效，尝试重置 baseline
         logging.warning(f"UID {uid} 检测更新失败，尝试重置 baseline")
-        # 重新拉取第一页，更新 baseline
         data = fetch_dynamics_page(uid, "", header)
         if data.get("code") == 0:
             feed_data = data.get("data") or {}
@@ -396,9 +390,9 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
                 logging.warning(f"UID {uid} 重置 baseline 失败")
         return alerts, updated, has_new
     if update_num == 0:
+        logging.debug(f"UID {uid} 无新动态")
         return alerts, updated, has_new
 
-    # 有新动态，拉取增量
     logging.info(f"UID {uid} 检测到 {update_num} 条新动态，正在拉取...")
     data = fetch_incremental_dynamics(uid, baseline, offset, header)
     if data.get("code") != 0:
@@ -443,7 +437,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
     return alerts, updated, has_new
 
-# ---------------- 评论监控（保持不变，稳定版） ----------------
+# ---------------- 评论监控（保持不变） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
     max_ctime = last_read_time
@@ -573,6 +567,7 @@ def start_monitoring(header):
     state = load_dynamic_state()
 
     logging.info("监控服务已启动，正在扫描新数据...")
+    logging.info(f"动态扫描间隔: 正常模式 {DYNAMIC_CHECK_INTERVAL} 秒，爆发模式 {DYNAMIC_BURST_INTERVAL} 秒")
 
     while True:
         try:
@@ -627,6 +622,7 @@ def start_monitoring(header):
             # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
             if now - last_d_check >= interval:
+                logging.info(f"开始动态扫描 (间隔 {interval} 秒)")
                 all_alerts = []
                 state_updated = False
                 for uid in following_list:
@@ -646,6 +642,8 @@ def start_monitoring(header):
                         logging.info(f"🚀 成功发送 {len(all_alerts)} 条动态通知")
                     except Exception as e:
                         logging.error(f"动态通知发送失败: {e}")
+                else:
+                    logging.info("本次动态扫描未发现新动态")
                 last_d_check = now
 
             # 心跳
