@@ -10,7 +10,6 @@ import urllib.parse
 import json
 import requests
 from collections import defaultdict
-from datetime import datetime, timedelta
 
 import database as db
 import notifier
@@ -23,12 +22,13 @@ HEARTBEAT_INTERVAL = 10
 SOURCE_UID = 3706948578969654
 FOLLOWING_REFRESH_INTERVAL = 3600
 
+# 备用静态列表（当 API 获取失败时使用）
 FALLBACK_DYNAMIC_UIDS = [
-    3546905852250875,
-    3546961271589219,
-    3546610447419885,
-    285340365,
-    3706948578969654
+    "3546905852250875",
+    "3546961271589219",
+    "3546610447419885",
+    "285340365",
+    "3706948578969654"
 ]
 
 DYNAMIC_CHECK_INTERVAL = 15
@@ -45,7 +45,7 @@ DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
 # 日志去重与失败通知配置
-LOG_DEDUP_INTERVAL = 600      # 10秒内相同日志不重复
+LOG_DEDUP_INTERVAL = 600      # 10分钟内相同日志不重复
 FAILURE_NOTIFY_INTERVAL = 600 # 10分钟内相同失败不重复通知
 # =============================================
 
@@ -54,7 +54,6 @@ _last_log_time = defaultdict(float)
 _last_notify_time = defaultdict(float)
 
 def should_log(message_key, interval=LOG_DEDUP_INTERVAL):
-    """检查是否应该记录这条日志（10分钟内相同key不重复）"""
     now = time.time()
     if now - _last_log_time[message_key] >= interval:
         _last_log_time[message_key] = now
@@ -62,7 +61,6 @@ def should_log(message_key, interval=LOG_DEDUP_INTERVAL):
     return False
 
 def should_notify(message_key, interval=FAILURE_NOTIFY_INTERVAL):
-    """检查是否应该发送失败通知（10分钟内相同key不重复）"""
     now = time.time()
     if now - _last_notify_time[message_key] >= interval:
         _last_notify_time[message_key] = now
@@ -70,41 +68,32 @@ def should_notify(message_key, interval=FAILURE_NOTIFY_INTERVAL):
     return False
 
 def send_failure_notification(title, message):
-    """发送失败通知（去重）"""
     key = f"{title}:{message[:100]}"
     if should_notify(key):
         try:
-            # 调用改进后的 notifier，它会返回布尔值
-            success = notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
-            if success:
-                logging.info(f"已发送失败通知: {title}")
-            else:
-                logging.error(f"失败通知发送失败: {title}")
+            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
+            logging.info(f"已发送失败通知: {title}")
         except Exception as e:
             logging.error(f"发送失败通知异常: {e}")
 
 def cleanup_log_file():
-    """检查日志文件，如果超过24小时则清空重建"""
     if not os.path.exists(LOG_FILE):
         return
     try:
         mtime = os.path.getmtime(LOG_FILE)
         age = time.time() - mtime
-        if age > 86400:  # 24小时
-            # 关闭现有 logging handler
+        if age > 86400:
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
                 handler.close()
-            # 重新初始化日志（清空文件）
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.truncate()
-            init_logging()  # 重新配置日志
+            init_logging()
             logging.info("日志文件已自动清理（超过24小时）")
     except Exception as e:
         print(f"清理日志文件失败: {e}")
 
 def init_logging():
-    """初始化日志配置（清空模式）"""
     try:
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "w", encoding="utf-8") as f:
@@ -239,6 +228,7 @@ def wbi_request(url, params, header):
 
 # ---------------- 获取关注列表 ----------------
 def get_following_list(uid, header):
+    """获取用户关注的 UID 列表（字符串列表），失败返回空列表"""
     following = []
     pn = 1
     ps = 50
@@ -261,13 +251,17 @@ def get_following_list(uid, header):
         for item in items:
             mid = item.get("mid")
             if mid:
-                following.append(mid)
+                following.append(str(mid))   # 统一转为字符串
         total = info.get("total", 0)
         if total <= pn * ps:
             break
         pn += 1
         time.sleep(random.uniform(0.5, 1))
-    logging.info(f"从 UID {uid} 获取关注列表，共 {len(following)} 人")
+    if not following:
+        logging.error(f"从 UID {uid} 获取关注列表为空，请检查 Cookie 是否有权限查看该用户的关注列表")
+        send_failure_notification("关注列表获取失败", f"UID {uid} 关注列表为空")
+    else:
+        logging.info(f"从 UID {uid} 获取关注列表，共 {len(following)} 人")
     return following
 
 def load_following_cache():
@@ -375,11 +369,11 @@ def init_dynamic_states_for_uids(uids, header):
     state = load_dynamic_state()
     for uid in uids:
         uid_str = str(uid)
-        seen[uid] = set()
+        seen[uid_str] = set()
         if uid_str not in state or not isinstance(state[uid_str], dict):
             state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         try:
-            data = fetch_dynamics_page(uid, "", header)
+            data = fetch_dynamics_page(uid_str, "", header)
             if data.get("code") == 0:
                 feed_data = data.get("data") or {}
                 items = feed_data.get("items")
@@ -392,7 +386,7 @@ def init_dynamic_states_for_uids(uids, header):
                     if isinstance(item, dict):
                         dyn_id = item.get("id_str")
                         if dyn_id:
-                            seen[uid].add(dyn_id)
+                            seen[uid_str].add(dyn_id)
                         modules = item.get("modules") or {}
                         author = modules.get("module_author") or {}
                         pub_ts = author.get("pub_ts", 0)
@@ -404,16 +398,16 @@ def init_dynamic_states_for_uids(uids, header):
                     state[uid_str]["baseline"] = baseline
                 if offset:
                     state[uid_str]["offset"] = offset
-                logging.info(f"初始化 UID {uid}: last_ts={max_ts}, baseline={baseline}, offset={offset}, 已收录 {len(seen[uid])} 条动态")
+                logging.info(f"初始化 UID {uid_str}: last_ts={max_ts}, baseline={baseline}, offset={offset}, 已收录 {len(seen[uid_str])} 条动态")
             elif data.get("code") == -101:
                 if refresh_cookie():
                     return init_dynamic_states_for_uids(uids, get_header())
                 else:
-                    logging.warning(f"初始化 UID {uid} 失败: Cookie 无效")
+                    logging.warning(f"初始化 UID {uid_str} 失败: Cookie 无效")
             else:
-                logging.warning(f"初始化 UID {uid} 失败: {data.get('message')}")
+                logging.warning(f"初始化 UID {uid_str} 失败: {data.get('message')}")
         except Exception as e:
-            logging.error(f"初始化 UID {uid} 异常: {e}")
+            logging.error(f"初始化 UID {uid_str} 异常: {e}")
             if uid_str not in state or not isinstance(state[uid_str], dict):
                 state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         time.sleep(random.uniform(0.5, 1))
@@ -425,14 +419,14 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     uid_str = str(uid)
     current_state = state.get(uid_str)
     if not isinstance(current_state, dict):
-        logging.warning(f"UID {uid} 状态无效 (类型: {type(current_state).__name__})，重置")
+        logging.warning(f"UID {uid_str} 状态无效 (类型: {type(current_state).__name__})，重置")
         state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         current_state = state[uid_str]
     last_ts = current_state.get("last_ts", 0)
     offset = current_state.get("offset", "")
-    data = fetch_dynamics_page(uid, offset, header)
+    data = fetch_dynamics_page(uid_str, offset, header)
     if data.get("code") != 0:
-        logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
+        logging.warning(f"UID {uid_str} 拉取动态失败: {data.get('message')}")
         return alerts, False, False
 
     feed_data = data.get("data") or {}
@@ -457,11 +451,11 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
             max_pub_ts = pub_ts
         if pub_ts > last_ts and (now_ts - pub_ts <= DYNAMIC_MAX_AGE):
             new_items.append(item)
-            if dyn_id not in seen_dynamics[uid]:
-                seen_dynamics[uid].add(dyn_id)
+            if dyn_id not in seen_dynamics[uid_str]:
+                seen_dynamics[uid_str].add(dyn_id)
         else:
-            if dyn_id not in seen_dynamics[uid]:
-                seen_dynamics[uid].add(dyn_id)
+            if dyn_id not in seen_dynamics[uid_str]:
+                seen_dynamics[uid_str].add(dyn_id)
 
     if max_pub_ts > last_ts:
         state[uid_str]["last_ts"] = max_pub_ts
@@ -475,7 +469,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         dyn_id = item.get("id_str")
         modules = item.get("modules") or {}
         author = modules.get("module_author") or {}
-        name = author.get("name", str(uid))
+        name = author.get("name", uid_str)
         text = extract_dynamic_text(item)
         if item.get("type") == "DYNAMIC_TYPE_FORWARD":
             orig = item.get("orig")
@@ -491,7 +485,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         has_new = True
         logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={author.get('pub_ts',0)}")
     if has_new:
-        logging.info(f"UID {uid} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
+        logging.info(f"UID {uid_str} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
     return alerts, True, has_new
 
 
@@ -617,17 +611,24 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
 
+    # 获取关注列表
     following_list = load_following_cache()
     if not following_list:
         following_list = get_following_list(SOURCE_UID, header)
         if not following_list:
             logging.warning("获取关注列表失败，使用备用静态列表")
-            following_list = FALLBACK_DYNAMIC_UIDS
+            following_list = FALLBACK_DYNAMIC_UIDS.copy()
+            send_failure_notification("关注列表获取失败", f"无法获取 UID {SOURCE_UID} 的关注列表，已启用静态列表: {following_list}")
+        # 确保 SOURCE_UID 自身也在列表中（如果希望监控自己）
+        if str(SOURCE_UID) not in following_list:
+            following_list.append(str(SOURCE_UID))
         save_following_cache(following_list)
-    if SOURCE_UID not in following_list:
-        following_list.append(SOURCE_UID)
+    else:
+        logging.info(f"从缓存加载关注列表，共 {len(following_list)} 个UID")
+
     logging.info(f"初始监控 UID 列表 ({len(following_list)} 个): {following_list}")
 
+    # 初始化动态状态
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
     state = load_dynamic_state()
 
@@ -647,8 +648,10 @@ def start_monitoring(header):
                 logging.info("开始刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
-                    if SOURCE_UID not in new_list:
-                        new_list.append(SOURCE_UID)
+                    # 统一转换为字符串
+                    new_list = [str(uid) for uid in new_list]
+                    if str(SOURCE_UID) not in new_list:
+                        new_list.append(str(SOURCE_UID))
                     old_set = set(following_list)
                     new_set = set(new_list)
                     added = new_set - old_set
@@ -656,13 +659,12 @@ def start_monitoring(header):
                     if added or removed:
                         logging.info(f"关注列表变化: 新增 {len(added)} 个, 移除 {len(removed)} 个")
                         for uid in added:
-                            if str(uid) not in state or not isinstance(state.get(str(uid)), dict):
-                                state[str(uid)] = {"last_ts": 0, "baseline": "", "offset": ""}
+                            if uid not in state or not isinstance(state.get(uid), dict):
+                                state[uid] = {"last_ts": 0, "baseline": "", "offset": ""}
                             seen_dynamics[uid] = set()
                         for uid in removed:
-                            uid_str = str(uid)
-                            if uid_str in state:
-                                del state[uid_str]
+                            if uid in state:
+                                del state[uid]
                             if uid in seen_dynamics:
                                 del seen_dynamics[uid]
                         following_list = new_list
@@ -684,13 +686,10 @@ def start_monitoring(header):
                 if new_c:
                     new_c.sort(key=lambda x: x["ctime"])
                     try:
-                        success = notifier.send_webhook_notification(title, new_c)
-                        if success:
-                            logging.info(f"💬 成功发送 {len(new_c)} 条新评论通知")
-                        else:
-                            logging.error(f"💬 评论通知发送失败，请检查 webhook 配置")
+                        notifier.send_webhook_notification(title, new_c)
+                        logging.info(f"💬 成功发送 {len(new_c)} 条新评论通知")
                     except Exception as e:
-                        logging.error(f"评论通知发送异常: {e}")
+                        logging.error(f"评论通知发送失败: {e}")
 
             # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
@@ -715,7 +714,7 @@ def start_monitoring(header):
                         if success:
                             logging.info(f"🚀 成功发送 {len(all_alerts)} 条 Webhook 动态通知！")
                         else:
-                            logging.error(f"❌ Webhook 动态通知发送失败，请检查 webhook 配置")
+                            logging.error(f"❌ Webhook 动态通知发送失败")
                     except Exception as e:
                         logging.error(f"❌ Webhook 发送异常: {e}")
                 last_d_check = now
