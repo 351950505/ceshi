@@ -18,11 +18,8 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 10
 
-# 不再硬编码关注列表，而是从以下 UID 的关注列表中动态获取
-SOURCE_UID = 3706948578969654   # 用于获取关注列表的 UID（即 Cookie 对应的用户）
-FOLLOWING_REFRESH_INTERVAL = 3600  # 每小时刷新一次关注列表
-
-# 备选静态列表（当 API 获取失败时使用）
+SOURCE_UID = 3706948578969654
+FOLLOWING_REFRESH_INTERVAL = 3600
 FALLBACK_DYNAMIC_UIDS = [
     3546905852250875,
     3546961271589219,
@@ -40,14 +37,12 @@ COMMENT_SCAN_INTERVAL = 5
 COMMENT_MAX_PAGES = 3
 COMMENT_SAFE_WINDOW = 60
 
-# 服务器时间补偿（快 120 秒）
 TIME_OFFSET = -120
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
-FOLLOWING_CACHE_FILE = "following_cache.json"   # 缓存关注列表，用于恢复
+FOLLOWING_CACHE_FILE = "following_cache.json"
 # =============================================
-
 
 def init_logging():
     try:
@@ -64,10 +59,9 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态关注列表模式)")
+    logging.info("B站监控系统启动 (同步稳定版)")
     logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒")
     logging.info("=" * 60)
-
 
 def refresh_cookie():
     logging.warning("Cookie 失效，尝试重新登录...")
@@ -78,7 +72,6 @@ def refresh_cookie():
     except Exception as e:
         logging.error(f"重新登录失败: {e}")
         return False
-
 
 def safe_request(url, params, header, retries=3):
     h = header.copy()
@@ -104,7 +97,7 @@ def safe_request(url, params, header, retries=3):
                 time.sleep(wait)
                 continue
             if code != 0:
-                logging.warning(f"API 返回错误 {code}: {data.get('message')}")
+                logging.warning(f"API 返回错误 {code}: {data.get('message')} | URL: {url} | Params: {params}")
                 if i < retries - 1:
                     time.sleep(base_delay * (2 ** i))
                     continue
@@ -114,8 +107,7 @@ def safe_request(url, params, header, retries=3):
             time.sleep(base_delay * (2 ** i))
     return {"code": -500, "message": "所有重试均失败"}
 
-
-# ---------------- WBI 签名（含时间补偿） ----------------
+# ---------------- WBI 签名（与 test_wbi.py 完全一致） ----------------
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
     46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
@@ -127,8 +119,7 @@ def getMixinKey(orig):
 
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
-    adjusted_ts = int(time.time() + TIME_OFFSET)
-    params["wts"] = adjusted_ts
+    params['wts'] = int(time.time() + TIME_OFFSET)
     params = dict(sorted(params.items()))
     filtered = {}
     for k, v in params.items():
@@ -138,7 +129,7 @@ def encWbi(params, img_key, sub_key):
         filtered[k] = v
     query = urllib.parse.urlencode(filtered, quote_via=urllib.parse.quote)
     sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
-    filtered["w_rid"] = sign
+    filtered['w_rid'] = sign
     return filtered
 
 def update_wbi_keys(header):
@@ -151,7 +142,6 @@ def update_wbi_keys(header):
             WBI_KEYS["last_update"] = time.time()
             logging.info("WBI密钥已更新")
         elif data.get("code") == -101:
-            logging.error("获取WBI密钥时Cookie失效")
             if refresh_cookie():
                 update_wbi_keys(get_header())
     except Exception as e:
@@ -163,25 +153,13 @@ def wbi_request(url, params, header):
     signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     return safe_request(url, signed, header)
 
-
 # ---------------- 获取关注列表 ----------------
 def get_following_list(uid, header):
-    """
-    获取用户关注的 UID 列表（处理分页）
-    返回: list of UIDs (int)
-    """
     following = []
     pn = 1
     ps = 50
     while True:
-        params = {
-            "vmid": uid,
-            "pn": pn,
-            "ps": ps,
-            "order": "desc",
-            "order_type": "attention"
-        }
-        # 注意：此接口不需要 WBI 签名，但需要 Cookie
+        params = {"vmid": uid, "pn": pn, "ps": ps, "order": "desc", "order_type": "attention"}
         data = safe_request("https://api.bilibili.com/x/relation/followings", params, header)
         if data.get("code") != 0:
             logging.warning(f"获取关注列表失败 (pn={pn}): {data.get('message')}")
@@ -194,7 +172,6 @@ def get_following_list(uid, header):
             mid = item.get("mid")
             if mid:
                 following.append(mid)
-        # 检查是否还有下一页
         if info.get("total", 0) <= pn * ps:
             break
         pn += 1
@@ -215,8 +192,7 @@ def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
 
-
-# ---------------- 动态监控核心（支持动态 UID 列表） ----------------
+# ---------------- 动态监控核心 ----------------
 def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
@@ -285,7 +261,6 @@ def fetch_dynamics_page(uid, offset, header):
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def init_dynamic_states_for_uids(uids, header):
-    """为给定的 UID 列表初始化 seen 集合和状态文件"""
     seen = {}
     state = load_dynamic_state()
     for uid in uids:
@@ -293,7 +268,6 @@ def init_dynamic_states_for_uids(uids, header):
         seen[uid] = set()
         if uid_str not in state:
             state[uid_str] = {"baseline": "", "offset": ""}
-        # 尝试获取基线
         try:
             data = fetch_dynamics_page(uid, "", header)
             if data.get("code") == 0:
@@ -324,7 +298,6 @@ def init_dynamic_states_for_uids(uids, header):
     return seen
 
 def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
-    """检查单个 UID 的新动态，返回 (alerts, updated_flag)"""
     alerts = []
     uid_str = str(uid)
     current_state = state.get(uid_str, {"baseline": "", "offset": ""})
@@ -333,7 +306,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     has_new = False
     updated = False
 
-    # baseline 为空则尝试建立
     if not baseline:
         logging.info(f"UID {uid} baseline 为空，尝试建立基线...")
         data = fetch_dynamics_page(uid, "", header)
@@ -359,7 +331,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     update_data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", update_params, header)
     if update_data.get("code") != 0:
         logging.warning(f"UID {uid} 检测更新失败: {update_data.get('message')}")
-        # 继续拉取尝试
     else:
         update_num = update_data.get("data", {}).get("update_num", 0)
         if update_num == 0:
@@ -418,20 +389,25 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
     return alerts, updated, has_new
 
-
-# ---------------- 评论监控 ----------------
+# ---------------- 评论监控（降级版，避免-400） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
+    """使用旧版翻页接口，避免懒加载接口的参数问题"""
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
-    params = {"type": 1, "oid": oid, "mode": 2, "plat": 1, "web_location": "1315875"}
-    pagination_str = None
-    for _ in range(COMMENT_MAX_PAGES):
-        if pagination_str:
-            params["pagination_str"] = pagination_str
-        else:
-            params.pop("pagination_str", None)
-        data = wbi_request("https://api.bilibili.com/x/v2/reply/wbi/main", params, header)
+
+    for pn in range(1, COMMENT_MAX_PAGES + 1):
+        data = wbi_request(
+            "https://api.bilibili.com/x/v2/reply",
+            {
+                "oid": oid,
+                "type": 1,
+                "sort": 0,
+                "pn": pn,
+                "ps": 20
+            },
+            header
+        )
         if data.get("code") == -101:
             if refresh_cookie():
                 return scan_new_comments(oid, get_header(), last_read_time, seen)
@@ -439,10 +415,11 @@ def scan_new_comments(oid, header, last_read_time, seen):
         if data.get("code") != 0:
             logging.warning(f"评论接口失败: {data.get('message')}")
             break
-        reply_data = data.get("data", {})
-        replies = reply_data.get("replies", [])
+
+        replies = (data.get("data") or {}).get("replies") or []
         if not replies:
             break
+
         all_old = True
         for r in replies:
             ctime = r.get("ctime", 0)
@@ -458,21 +435,14 @@ def scan_new_comments(oid, header, last_read_time, seen):
                         "message": r["content"]["message"],
                         "ctime": ctime
                     })
+
         if all_old:
             break
-        cursor = reply_data.get("cursor", {})
-        pagination_reply = cursor.get("pagination_reply")
-        if pagination_reply and isinstance(pagination_reply, dict):
-            pagination_str = pagination_reply.get("next_offset")
-            if not pagination_str:
-                break
-        else:
-            break
         time.sleep(random.uniform(0.3, 0.6))
+
     return new_list, max_ctime
 
-
-# ---------------- 视频监控（保持不变） ----------------
+# ---------------- 视频监控 ----------------
 def get_latest_video(header):
     data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": TARGET_UID}, header)
     if data.get("code") == -101:
@@ -514,7 +484,6 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
-
 # ---------------- 主循环 ----------------
 def get_header():
     try:
@@ -551,14 +520,12 @@ def start_monitoring(header):
             logging.warning("获取关注列表失败，使用备用静态列表")
             following_list = FALLBACK_DYNAMIC_UIDS
         save_following_cache(following_list)
-    # 确保自身 UID 也在列表中
     if SOURCE_UID not in following_list:
         following_list.append(SOURCE_UID)
-    logging.info(f"初始监控 UID 列表 ({len(following_list)} 个): {following_list}")
+    logging.info(f"初始监控 UID 列表 ({len(following_list)} 个)")
 
-    # 初始化每个 UID 的状态
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
-    state = load_dynamic_state()   # 重新加载以确保最新
+    state = load_dynamic_state()
 
     logging.info("监控服务已启动，正在扫描新数据...")
 
@@ -566,26 +533,23 @@ def start_monitoring(header):
         try:
             now = time.time()
 
-            # 定时刷新关注列表（每小时）
+            # 定时刷新关注列表
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 logging.info("开始刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
                     if SOURCE_UID not in new_list:
                         new_list.append(SOURCE_UID)
-                    # 找出新增和移除的 UID
                     old_set = set(following_list)
                     new_set = set(new_list)
                     added = new_set - old_set
                     removed = old_set - new_set
                     if added or removed:
                         logging.info(f"关注列表变化: 新增 {len(added)} 个, 移除 {len(removed)} 个")
-                        # 为新增 UID 初始化状态
                         for uid in added:
                             if str(uid) not in state:
                                 state[str(uid)] = {"baseline": "", "offset": ""}
                             seen_dynamics[uid] = set()
-                        # 移除不再关注的 UID 的状态（可选，保留也可以）
                         for uid in removed:
                             uid_str = str(uid)
                             if uid_str in state:
@@ -616,7 +580,7 @@ def start_monitoring(header):
                     except Exception as e:
                         logging.error(f"评论通知发送失败: {e}")
 
-            # 动态监控（遍历所有关注的 UID）
+            # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
             if now - last_d_check >= interval:
                 all_alerts = []
@@ -627,9 +591,8 @@ def start_monitoring(header):
                         all_alerts.extend(alerts)
                     if updated:
                         state_updated = True
-                    if has_new and not burst_end:
+                    if has_new:
                         burst_end = now + DYNAMIC_BURST_DURATION
-                    # 避免请求过快
                     time.sleep(random.uniform(0.5, 1))
                 if state_updated:
                     save_dynamic_state(state)
@@ -641,7 +604,7 @@ def start_monitoring(header):
                         logging.error(f"❌ Webhook 发送失败: {e}")
                 last_d_check = now
 
-            # 心跳日志
+            # 心跳
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info("💓 心跳: 监控系统正常运行中")
                 last_hb = now
@@ -658,7 +621,6 @@ def start_monitoring(header):
         except Exception:
             logging.error(traceback.format_exc())
             time.sleep(60)
-
 
 if __name__ == "__main__":
     init_logging()
