@@ -9,6 +9,8 @@ import hashlib
 import urllib.parse
 import json
 import requests
+from collections import defaultdict
+from datetime import datetime, timedelta
 
 import database as db
 import notifier
@@ -32,7 +34,7 @@ FALLBACK_DYNAMIC_UIDS = [
 DYNAMIC_CHECK_INTERVAL = 15
 DYNAMIC_BURST_INTERVAL = 8
 DYNAMIC_BURST_DURATION = 300
-DYNAMIC_MAX_AGE = 300          # 只处理最近5分钟内的动态，避免历史堆积
+DYNAMIC_MAX_AGE = 300
 
 COMMENT_SCAN_INTERVAL = 5
 COMMENT_MAX_PAGES = 3
@@ -41,10 +43,64 @@ COMMENT_SAFE_WINDOW = 60
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
+
+# 日志去重与失败通知配置
+LOG_DEDUP_INTERVAL = 600      # 10秒内相同日志不重复
+FAILURE_NOTIFY_INTERVAL = 600 # 10分钟内相同失败不重复通知
 # =============================================
 
+# 全局去重记录
+_last_log_time = defaultdict(float)
+_last_notify_time = defaultdict(float)
+
+def should_log(message_key, interval=LOG_DEDUP_INTERVAL):
+    """检查是否应该记录这条日志（10分钟内相同key不重复）"""
+    now = time.time()
+    if now - _last_log_time[message_key] >= interval:
+        _last_log_time[message_key] = now
+        return True
+    return False
+
+def should_notify(message_key, interval=FAILURE_NOTIFY_INTERVAL):
+    """检查是否应该发送失败通知（10分钟内相同key不重复）"""
+    now = time.time()
+    if now - _last_notify_time[message_key] >= interval:
+        _last_notify_time[message_key] = now
+        return True
+    return False
+
+def send_failure_notification(title, message):
+    """发送失败通知（去重）"""
+    key = f"{title}:{message[:100]}"
+    if should_notify(key):
+        try:
+            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
+            logging.info(f"已发送失败通知: {title}")
+        except Exception as e:
+            logging.error(f"发送失败通知异常: {e}")
+
+def cleanup_log_file():
+    """检查日志文件，如果超过24小时则清空重建"""
+    if not os.path.exists(LOG_FILE):
+        return
+    try:
+        mtime = os.path.getmtime(LOG_FILE)
+        age = time.time() - mtime
+        if age > 86400:  # 24小时
+            # 关闭现有 logging handler
+            for handler in logging.root.handlers[:]:
+                logging.root.removeHandler(handler)
+                handler.close()
+            # 重新初始化日志（清空文件）
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.truncate()
+            init_logging()  # 重新配置日志
+            logging.info("日志文件已自动清理（超过24小时）")
+    except Exception as e:
+        print(f"清理日志文件失败: {e}")
 
 def init_logging():
+    """初始化日志配置（清空模式）"""
     try:
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, "w", encoding="utf-8") as f:
@@ -62,7 +118,6 @@ def init_logging():
     logging.info("B站监控系统启动 (动态关注列表模式 - 时间戳去重)")
     logging.info("=" * 60)
 
-
 def refresh_cookie():
     logging.warning("Cookie 失效，尝试重新登录...")
     try:
@@ -70,9 +125,10 @@ def refresh_cookie():
         logging.info("重新登录成功")
         return True
     except Exception as e:
-        logging.error(f"重新登录失败: {e}")
+        msg = f"重新登录失败: {e}"
+        logging.error(msg)
+        send_failure_notification("Cookie 刷新失败", msg)
         return False
-
 
 def safe_request(url, params, header, retries=3):
     h = header.copy()
@@ -90,26 +146,43 @@ def safe_request(url, params, header, retries=3):
             code = data.get("code")
 
             if code == -101:
-                logging.error(f"API 返回 -101，Cookie 失效: {url}")
+                msg = f"API 返回 -101，Cookie 失效: {url}"
+                logging.error(msg)
+                send_failure_notification("Cookie 失效", msg)
                 return {"code": -101, "need_refresh": True}
             if code == -400:
-                logging.error(f"API 返回 -400 请求错误: url={url}, params={params}")
+                msg = f"API 返回 -400 请求错误: url={url}, params={params}"
+                log_key = f"req_400_{url}"
+                if should_log(log_key):
+                    logging.error(msg)
+                send_failure_notification("请求参数错误", msg)
                 return data
             if code in (-799, -352, -509):
                 wait = base_delay * (2 ** i) + random.uniform(0, 2)
-                logging.warning(f"触发风控/限流 ({code})，等待 {wait:.1f} 秒后重试")
+                log_key = f"ratelimit_{code}_{url}"
+                if should_log(log_key):
+                    logging.warning(f"触发风控/限流 ({code})，等待 {wait:.1f} 秒后重试")
                 time.sleep(wait)
                 continue
             if code != 0:
-                logging.warning(f"API 返回错误 {code}: {data.get('message')}")
+                msg = f"API 返回错误 {code}: {data.get('message')}"
+                log_key = f"api_error_{code}_{url}"
+                if should_log(log_key):
+                    logging.warning(msg)
                 if i < retries - 1:
                     time.sleep(base_delay * (2 ** i))
                     continue
             return data
         except Exception as e:
-            logging.error(f"请求异常: {e}")
+            msg = f"请求异常: {e}"
+            log_key = f"req_exception_{url}"
+            if should_log(log_key):
+                logging.error(msg)
             time.sleep(base_delay * (2 ** i))
-    return {"code": -500, "message": "所有重试均失败"}
+    final_msg = "所有重试均失败"
+    logging.error(final_msg)
+    send_failure_notification("API 请求最终失败", final_msg)
+    return {"code": -500, "message": final_msg}
 
 
 # ---------------- WBI 签名 ----------------
@@ -209,7 +282,6 @@ def save_following_cache(uids):
 
 # ---------------- 动态监控核心（基于时间戳） ----------------
 def load_dynamic_state():
-    """加载状态，确保每个 UID 包含 last_ts, baseline, offset"""
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r") as f:
@@ -217,7 +289,6 @@ def load_dynamic_state():
             cleaned = {}
             for uid_str, value in state.items():
                 if isinstance(value, dict):
-                    # 兼容旧格式：补充 last_ts
                     if "last_ts" not in value:
                         value["last_ts"] = 0
                     if "baseline" not in value:
@@ -312,7 +383,6 @@ def init_dynamic_states_for_uids(uids, header):
                     items = []
                 offset = feed_data.get("offset", "")
                 baseline = items[0].get("id_str", "") if items else ""
-                # 计算当前最大 pub_ts
                 max_ts = 0
                 for item in items:
                     if isinstance(item, dict):
@@ -356,7 +426,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         current_state = state[uid_str]
     last_ts = current_state.get("last_ts", 0)
     offset = current_state.get("offset", "")
-    # 直接拉取最新动态列表（第一页）
     data = fetch_dynamics_page(uid, offset, header)
     if data.get("code") != 0:
         logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
@@ -369,7 +438,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     new_offset = feed_data.get("offset", offset)
     new_baseline = items[0].get("id_str", "") if items else ""
 
-    # 筛选新动态（基于 pub_ts）
     new_items = []
     max_pub_ts = last_ts
     for item in items:
@@ -383,27 +451,21 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         pub_ts = author.get("pub_ts", 0)
         if pub_ts > max_pub_ts:
             max_pub_ts = pub_ts
-        # 只处理时间戳大于 last_ts 的动态（且不超过 DYNAMIC_MAX_AGE 秒）
         if pub_ts > last_ts and (now_ts - pub_ts <= DYNAMIC_MAX_AGE):
             new_items.append(item)
-            # 同时更新 seen 集合（用于去重辅助）
             if dyn_id not in seen_dynamics[uid]:
                 seen_dynamics[uid].add(dyn_id)
         else:
-            # 即使时间戳不符合，也把 id 加入 seen，避免重复处理旧动态
             if dyn_id not in seen_dynamics[uid]:
                 seen_dynamics[uid].add(dyn_id)
 
-    # 更新状态中的 last_ts（取所有动态中的最大时间戳，包括旧的，避免遗漏）
     if max_pub_ts > last_ts:
         state[uid_str]["last_ts"] = max_pub_ts
-    # 更新 offset 和 baseline
     if new_offset != offset:
         state[uid_str]["offset"] = new_offset
     if new_baseline:
         state[uid_str]["baseline"] = new_baseline
 
-    # 处理新动态
     has_new = False
     for item in new_items:
         dyn_id = item.get("id_str")
@@ -426,9 +488,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={author.get('pub_ts',0)}")
     if has_new:
         logging.info(f"UID {uid} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
-    else:
-        logging.debug(f"UID {uid} 无新动态，last_ts={last_ts}, max_pub_ts={max_pub_ts}, items数量={len(items)}")
-    return alerts, True, has_new   # updated 总是设为 True 以便保存状态
+    return alerts, True, has_new
 
 
 # ---------------- 评论监控 ----------------
@@ -545,6 +605,7 @@ def start_monitoring(header):
     last_d_check = 0
     last_comment_check = 0
     last_following_refresh = 0
+    last_cleanup_check = time.time()
     burst_end = 0
 
     oid, title = sync_latest_video(header)
@@ -571,6 +632,11 @@ def start_monitoring(header):
     while True:
         try:
             now = time.time()
+
+            # 日志清理（每小时检查一次）
+            if now - last_cleanup_check >= 3600:
+                cleanup_log_file()
+                last_cleanup_check = now
 
             # 定时刷新关注列表
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
