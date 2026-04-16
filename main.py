@@ -35,7 +35,7 @@ DYNAMIC_BURST_DURATION = 300
 DYNAMIC_MAX_AGE = 300
 
 COMMENT_SCAN_INTERVAL = 5
-COMMENT_MAX_PAGES = 3
+COMMENT_MAX_PAGES = 3          # 最多翻3页，避免过度请求
 COMMENT_SAFE_WINDOW = 60
 
 LOG_FILE = "bili_monitor.log"
@@ -92,6 +92,9 @@ def safe_request(url, params, header, retries=3):
             if code == -101:
                 logging.error(f"API 返回 -101，Cookie 失效: {url}")
                 return {"code": -101, "need_refresh": True}
+            if code == -400:
+                logging.error(f"API 返回 -400 请求错误: url={url}, params={params}")
+                return data
             if code in (-799, -352, -509):
                 wait = base_delay * (2 ** i) + random.uniform(0, 2)
                 logging.warning(f"触发风控/限流 ({code})，等待 {wait:.1f} 秒后重试")
@@ -206,7 +209,6 @@ def save_following_cache(uids):
 
 # ---------------- 动态监控核心 ----------------
 def load_dynamic_state():
-    """加载状态文件，并清理无效数据（确保每个UID对应的是字典）"""
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r") as f:
@@ -214,14 +216,13 @@ def load_dynamic_state():
             cleaned = {}
             for uid_str, value in state.items():
                 if isinstance(value, dict):
-                    # 确保有 baseline 和 offset 字段
                     if "baseline" not in value:
                         value["baseline"] = ""
                     if "offset" not in value:
                         value["offset"] = ""
                     cleaned[uid_str] = value
                 else:
-                    logging.warning(f"状态文件中的 UID {uid_str} 值类型错误 ({type(value).__name__})，已重置为默认")
+                    logging.warning(f"状态文件中的 UID {uid_str} 值类型错误 ({type(value).__name__})，已重置")
                     cleaned[uid_str] = {"baseline": "", "offset": ""}
             return cleaned
         except Exception as e:
@@ -284,9 +285,10 @@ def fetch_dynamics_page(uid, offset, header):
         "timezone_offset": "-480",
         "platform": "web",
         "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
-        "web_location": "333.1365",
-        "offset": offset
+        "web_location": "333.1365"
     }
+    if offset:
+        params["offset"] = offset
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def init_dynamic_states_for_uids(uids, header):
@@ -295,7 +297,6 @@ def init_dynamic_states_for_uids(uids, header):
     for uid in uids:
         uid_str = str(uid)
         seen[uid] = set()
-        # 确保状态条目是字典
         if uid_str not in state or not isinstance(state[uid_str], dict):
             state[uid_str] = {"baseline": "", "offset": ""}
         try:
@@ -326,7 +327,6 @@ def init_dynamic_states_for_uids(uids, header):
                 logging.warning(f"初始化 UID {uid} 失败: {data.get('message')}")
         except Exception as e:
             logging.error(f"初始化 UID {uid} 异常: {e}")
-            # 确保状态字典仍然有效
             if uid_str not in state or not isinstance(state[uid_str], dict):
                 state[uid_str] = {"baseline": "", "offset": ""}
         time.sleep(random.uniform(0.5, 1))
@@ -337,7 +337,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     alerts = []
     uid_str = str(uid)
     current_state = state.get(uid_str)
-    # 防御性检查：确保 current_state 是字典
     if not isinstance(current_state, dict):
         logging.warning(f"UID {uid} 状态无效 (类型: {type(current_state).__name__})，重置")
         state[uid_str] = {"baseline": "", "offset": ""}
@@ -347,7 +346,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     has_new = False
     updated = False
 
-    # baseline 为空则尝试建立
     if not baseline:
         logging.info(f"UID {uid} baseline 为空，尝试建立基线...")
         data = fetch_dynamics_page(uid, "", header)
@@ -388,10 +386,12 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         "timezone_offset": "-480",
         "platform": "web",
         "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
-        "web_location": "333.1365",
-        "offset": offset,
-        "update_baseline": baseline
+        "web_location": "333.1365"
     }
+    if offset:
+        fetch_params["offset"] = offset
+    if baseline:
+        fetch_params["update_baseline"] = baseline
     data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", fetch_params, header)
     if data.get("code") != 0:
         logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
@@ -439,25 +439,30 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     return alerts, updated, has_new
 
 
-# ---------------- 评论监控 ----------------
+# ---------------- 评论监控（修复版） ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
+    """
+    使用标准评论区接口 x/v2/reply
+    参数参考：list.md
+    """
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
-    params = {"type": 1, "oid": oid, "mode": 2, "plat": 1, "web_location": "1315875"}
-    pagination_str = None
-    for _ in range(COMMENT_MAX_PAGES):
-        if pagination_str:
-            params["pagination_str"] = pagination_str
-        else:
-            params.pop("pagination_str", None)
-        data = wbi_request("https://api.bilibili.com/x/v2/reply/wbi/main", params, header)
-        if data.get("code") == -101:
-            if refresh_cookie():
-                return scan_new_comments(oid, get_header(), last_read_time, seen)
-            break
+    url = "https://api.bilibili.com/x/v2/reply"
+    pn = 1
+    fetched = 0
+    while fetched < COMMENT_MAX_PAGES:
+        params = {
+            "type": 1,
+            "oid": oid,
+            "sort": 0,      # 按时间排序
+            "nohot": 1,     # 不显示热评
+            "ps": 20,
+            "pn": pn
+        }
+        data = wbi_request(url, params, header)
         if data.get("code") != 0:
-            logging.warning(f"评论接口失败: {data.get('message')}")
+            logging.warning(f"评论接口失败 (pn={pn}): {data.get('message')}")
             break
         reply_data = data.get("data", {})
         replies = reply_data.get("replies", [])
@@ -470,7 +475,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
                 max_ctime = ctime
             if ctime > safe_time:
                 all_old = False
-                rpid = r.get("rpid_str", "")
+                rpid = str(r.get("rpid", ""))
                 if rpid and rpid not in seen:
                     seen.add(rpid)
                     new_list.append({
@@ -480,14 +485,11 @@ def scan_new_comments(oid, header, last_read_time, seen):
                     })
         if all_old:
             break
-        cursor = reply_data.get("cursor", {})
-        pagination_reply = cursor.get("pagination_reply")
-        if pagination_reply and isinstance(pagination_reply, dict):
-            pagination_str = pagination_reply.get("next_offset")
-            if not pagination_str:
-                break
-        else:
+        # 如果返回的评论数小于请求的每页数量，说明是最后一页
+        if len(replies) < params["ps"]:
             break
+        pn += 1
+        fetched += 1
         time.sleep(random.uniform(0.3, 0.6))
     return new_list, max_ctime
 
