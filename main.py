@@ -31,7 +31,7 @@ FALLBACK_DYNAMIC_UIDS = [
 DYNAMIC_CHECK_INTERVAL = 15
 DYNAMIC_BURST_INTERVAL = 8
 DYNAMIC_BURST_DURATION = 300
-DYNAMIC_MAX_AGE = 120   # 只处理2分钟内的新动态（原300秒改为120秒）
+DYNAMIC_MAX_AGE = 86400   # 临时设置为24小时，确保不过滤（后续可根据需要调整）
 
 COMMENT_SCAN_INTERVAL = 5
 COMMENT_MAX_PAGES = 3
@@ -62,7 +62,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态监控简化版: 直接拉取最新动态列表)")
+    logging.info("B站监控系统启动 (动态监控调试版 - 增加详细日志)")
     logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒")
     logging.info("=" * 60)
 
@@ -214,7 +214,7 @@ def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w") as f:
         json.dump(uids, f)
 
-# ---------------- 动态监控核心（简化版：直接拉取第一页对比） ----------------
+# ---------------- 动态监控核心（调试版：增加详细日志） ----------------
 def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
@@ -271,7 +271,7 @@ def extract_dynamic_text(item):
         return ""
 
 def fetch_latest_dynamics(uid, header):
-    """拉取第一页动态（最多20条）"""
+    """拉取第一页动态（最多20条），返回完整响应"""
     params = {
         "host_mid": uid,
         "type": "all",
@@ -286,26 +286,31 @@ def fetch_latest_dynamics(uid, header):
 def check_new_dynamics_simple(uid, header, seen_dynamics, state, adjusted_now):
     """
     简化版：直接拉取最新动态列表，与已记录的 ID 集合对比，发现新动态则推送。
-    adjusted_now: 已补偿过的当前时间（now + TIME_OFFSET）
+    增加详细日志输出。
     """
     alerts = []
     uid_str = str(uid)
     current_state = state.get(uid_str, {"baseline": "", "offset": ""})
+    
     # 拉取最新动态
     data = fetch_latest_dynamics(uid, header)
-    if data.get("code") != 0:
-        logging.warning(f"UID {uid} 拉取最新动态失败: {data.get('message')}")
+    code = data.get("code")
+    if code != 0:
+        logging.warning(f"UID {uid} 拉取最新动态失败: code={code}, msg={data.get('message')}")
         return alerts, False, False
 
-    feed_data = data.get("data") or {}
+    feed_data = data.get("data", {})
     items = feed_data.get("items", [])
     new_offset = feed_data.get("offset", "")
     new_baseline = items[0].get("id_str", "") if items else ""
 
-    # 更新状态中的 baseline 和 offset（用于重启后恢复）
+    logging.info(f"UID {uid} 拉取到 {len(items)} 条动态，最新动态ID: {new_baseline}")
+
+    # 更新状态中的 baseline 和 offset
     if new_baseline != current_state.get("baseline", "") or new_offset != current_state.get("offset", ""):
         state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
         updated = True
+        logging.info(f"UID {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
     else:
         updated = False
 
@@ -318,6 +323,9 @@ def check_new_dynamics_simple(uid, header, seen_dynamics, state, adjusted_now):
         if dyn_id not in seen_dynamics[uid]:
             new_dyn_ids.append(dyn_id)
             seen_dynamics[uid].add(dyn_id)
+            logging.info(f"UID {uid} 发现新动态ID: {dyn_id}")
+        else:
+            logging.debug(f"UID {uid} 已见过动态ID: {dyn_id}")
 
     if not new_dyn_ids:
         return alerts, updated, False
@@ -330,9 +338,9 @@ def check_new_dynamics_simple(uid, header, seen_dynamics, state, adjusted_now):
         modules = item.get("modules") or {}
         author = modules.get("module_author") or {}
         pub_ts = author.get("pub_ts", 0)
-        # 使用补偿后的时间判断是否超时
+        # 时间过滤（使用补偿后的当前时间）
         if adjusted_now - pub_ts > DYNAMIC_MAX_AGE:
-            logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id} (发布时间 {adjusted_now - pub_ts} 秒前)")
+            logging.warning(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id} (发布时间 {adjusted_now - pub_ts} 秒前，超过阈值 {DYNAMIC_MAX_AGE})")
             continue
         name = author.get("name", str(uid))
         text = extract_dynamic_text(item)
@@ -483,8 +491,7 @@ def start_monitoring(header):
     for uid in following_list:
         uid_str = str(uid)
         seen_dynamics[uid] = set()
-        # 如果状态中已有 baseline，尝试用已有的 seen 集合？但我们直接重新拉取一次来初始化 seen 更可靠
-        # 为了减少初始化时的推送，先拉取一次并将所有动态 ID 加入 seen
+        # 拉取一次最新动态来初始化 seen 集合
         try:
             data = fetch_latest_dynamics(uid, header)
             if data.get("code") == 0:
@@ -512,7 +519,7 @@ def start_monitoring(header):
         try:
             now = time.time()
             # 补偿后的时间戳（与 B 站服务器时间对齐）
-            adjusted_now = now + TIME_OFFSET   # TIME_OFFSET = -120，即 now - 120
+            adjusted_now = now + TIME_OFFSET
 
             # 刷新关注列表（每小时）
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
