@@ -36,6 +36,10 @@ COMMENT_SCAN_INTERVAL = 5        # 评论扫描最小间隔5秒
 COMMENT_MAX_PAGES = 3            # 最多扫描3页（每页20条）
 COMMENT_SAFE_WINDOW = 60         # 只处理最近60秒内的新评论
 
+# ========== 服务器时间补偿（解决WBI签名因时间偏差返回-352） ==========
+# 服务器时间比实际时间快 120 秒，因此生成 wts 时减去 120 秒
+TIME_OFFSET = -120   # 单位：秒
+
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 # ==============================================
@@ -59,6 +63,7 @@ def init_logging():
 
     logging.info("=" * 60)
     logging.info("B站监控系统启动 (24小时全天候监控模式)")
+    logging.info(f"服务器时间补偿: {TIME_OFFSET} 秒 (服务器时间 { '快' if TIME_OFFSET < 0 else '慢' } {abs(TIME_OFFSET)} 秒)")
     logging.info("=" * 60)
 
 
@@ -150,14 +155,22 @@ def getMixinKey(orig):
 
 
 def encWbi(params, img_key, sub_key):
+    """
+    使用时间补偿后的时间戳生成 WBI 签名
+    """
     mixin_key = getMixinKey(img_key + sub_key)
 
-    params["wts"] = round(time.time())
+    # 关键修复：使用补偿后的时间戳
+    adjusted_ts = int(time.time() + TIME_OFFSET)
+    params["wts"] = adjusted_ts
+
+    # 排序参数
     params = dict(sorted(params.items()))
 
     filtered = {}
     for k, v in params.items():
         v = str(v)
+        # 对参数值进行严格编码，符合 B 站签名要求
         for c in "!'()*":
             v = v.replace(c, "")
         filtered[k] = v
@@ -578,7 +591,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
         if pagination_str:
             params["pagination_str"] = pagination_str
         else:
-            # 第一页不传 pagination_str
             params.pop("pagination_str", None)
 
         data = wbi_request("https://api.bilibili.com/x/v2/reply/wbi/main", params, header)
