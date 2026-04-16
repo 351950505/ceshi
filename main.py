@@ -18,11 +18,9 @@ TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 10
 
-# 不再硬编码关注列表，而是从以下 UID 的关注列表中动态获取
-SOURCE_UID = 3706948578969654   # 用于获取关注列表的 UID（即 Cookie 对应的用户）
-FOLLOWING_REFRESH_INTERVAL = 3600  # 每小时刷新一次关注列表
+SOURCE_UID = 3706948578969654
+FOLLOWING_REFRESH_INTERVAL = 3600
 
-# 备选静态列表（当 API 获取失败时使用）
 FALLBACK_DYNAMIC_UIDS = [
     3546905852250875,
     3546961271589219,
@@ -42,7 +40,7 @@ COMMENT_SAFE_WINDOW = 60
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
-FOLLOWING_CACHE_FILE = "following_cache.json"   # 缓存关注列表，用于恢复
+FOLLOWING_CACHE_FILE = "following_cache.json"
 # =============================================
 
 
@@ -161,10 +159,6 @@ def wbi_request(url, params, header):
 
 # ---------------- 获取关注列表 ----------------
 def get_following_list(uid, header):
-    """
-    获取用户关注的 UID 列表（处理分页）
-    返回: list of UIDs (int)
-    """
     following = []
     pn = 1
     ps = 50
@@ -188,7 +182,6 @@ def get_following_list(uid, header):
             mid = item.get("mid")
             if mid:
                 following.append(mid)
-        # 检查是否还有下一页
         total = info.get("total", 0)
         if total <= pn * ps:
             break
@@ -211,13 +204,28 @@ def save_following_cache(uids):
         json.dump(uids, f)
 
 
-# ---------------- 动态监控核心（支持动态 UID 列表） ----------------
+# ---------------- 动态监控核心 ----------------
 def load_dynamic_state():
+    """加载状态文件，并清理无效数据（确保每个UID对应的是字典）"""
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r") as f:
-                return json.load(f)
-        except:
+                state = json.load(f)
+            cleaned = {}
+            for uid_str, value in state.items():
+                if isinstance(value, dict):
+                    # 确保有 baseline 和 offset 字段
+                    if "baseline" not in value:
+                        value["baseline"] = ""
+                    if "offset" not in value:
+                        value["offset"] = ""
+                    cleaned[uid_str] = value
+                else:
+                    logging.warning(f"状态文件中的 UID {uid_str} 值类型错误 ({type(value).__name__})，已重置为默认")
+                    cleaned[uid_str] = {"baseline": "", "offset": ""}
+            return cleaned
+        except Exception as e:
+            logging.error(f"加载状态文件失败: {e}")
             return {}
     return {}
 
@@ -231,7 +239,7 @@ def extract_dynamic_text(item):
         dyn = modules.get("module_dynamic") or {}
         desc = dyn.get("desc") or {}
         nodes = desc.get("rich_text_nodes") or []
-        if nodes:
+        if nodes and isinstance(nodes, list):
             text_parts = []
             for node in nodes:
                 if not isinstance(node, dict):
@@ -246,6 +254,8 @@ def extract_dynamic_text(item):
             if full_text:
                 return full_text
         major = dyn.get("major") or {}
+        if not isinstance(major, dict):
+            return ""
         major_type = major.get("type", "")
         if major_type == "MAJOR_TYPE_ARCHIVE":
             archive = major.get("archive") or {}
@@ -260,7 +270,7 @@ def extract_dynamic_text(item):
             opus = major.get("opus") or {}
             summary = opus.get("summary") or {}
             nodes = summary.get("rich_text_nodes") or []
-            if nodes:
+            if nodes and isinstance(nodes, list):
                 return "".join([n.get("text", "") for n in nodes if isinstance(n, dict)]).strip()
         return ""
     except Exception as e:
@@ -280,20 +290,21 @@ def fetch_dynamics_page(uid, offset, header):
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
 def init_dynamic_states_for_uids(uids, header):
-    """为给定的 UID 列表初始化 seen 集合和状态文件"""
     seen = {}
     state = load_dynamic_state()
     for uid in uids:
         uid_str = str(uid)
         seen[uid] = set()
-        if uid_str not in state:
+        # 确保状态条目是字典
+        if uid_str not in state or not isinstance(state[uid_str], dict):
             state[uid_str] = {"baseline": "", "offset": ""}
-        # 尝试获取基线
         try:
             data = fetch_dynamics_page(uid, "", header)
             if data.get("code") == 0:
                 feed_data = data.get("data") or {}
-                items = feed_data.get("items", [])
+                items = feed_data.get("items")
+                if not isinstance(items, list):
+                    items = []
                 offset = feed_data.get("offset", "")
                 baseline = items[0].get("id_str", "") if items else ""
                 if baseline:
@@ -301,9 +312,10 @@ def init_dynamic_states_for_uids(uids, header):
                 if offset:
                     state[uid_str]["offset"] = offset
                 for item in items:
-                    dyn_id = item.get("id_str")
-                    if dyn_id:
-                        seen[uid].add(dyn_id)
+                    if isinstance(item, dict):
+                        dyn_id = item.get("id_str")
+                        if dyn_id:
+                            seen[uid].add(dyn_id)
                 logging.info(f"初始化 UID {uid}: baseline={baseline}, offset={offset}, 已收录 {len(seen[uid])} 条动态")
             elif data.get("code") == -101:
                 if refresh_cookie():
@@ -314,15 +326,22 @@ def init_dynamic_states_for_uids(uids, header):
                 logging.warning(f"初始化 UID {uid} 失败: {data.get('message')}")
         except Exception as e:
             logging.error(f"初始化 UID {uid} 异常: {e}")
+            # 确保状态字典仍然有效
+            if uid_str not in state or not isinstance(state[uid_str], dict):
+                state[uid_str] = {"baseline": "", "offset": ""}
         time.sleep(random.uniform(0.5, 1))
     save_dynamic_state(state)
     return seen
 
 def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
-    """检查单个 UID 的新动态，返回 (alerts, updated_flag)"""
     alerts = []
     uid_str = str(uid)
-    current_state = state.get(uid_str, {"baseline": "", "offset": ""})
+    current_state = state.get(uid_str)
+    # 防御性检查：确保 current_state 是字典
+    if not isinstance(current_state, dict):
+        logging.warning(f"UID {uid} 状态无效 (类型: {type(current_state).__name__})，重置")
+        state[uid_str] = {"baseline": "", "offset": ""}
+        current_state = state[uid_str]
     baseline = current_state.get("baseline", "")
     offset = current_state.get("offset", "")
     has_new = False
@@ -334,16 +353,19 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         data = fetch_dynamics_page(uid, "", header)
         if data.get("code") == 0:
             feed_data = data.get("data") or {}
-            items = feed_data.get("items", [])
+            items = feed_data.get("items")
+            if not isinstance(items, list):
+                items = []
             new_offset = feed_data.get("offset", "")
             new_baseline = items[0].get("id_str", "") if items else ""
             if new_baseline:
                 state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
                 updated = True
                 for item in items:
-                    dyn_id = item.get("id_str")
-                    if dyn_id:
-                        seen_dynamics[uid].add(dyn_id)
+                    if isinstance(item, dict):
+                        dyn_id = item.get("id_str")
+                        if dyn_id:
+                            seen_dynamics[uid].add(dyn_id)
                 logging.info(f"UID {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
             else:
                 logging.warning(f"UID {uid} 无法获取 baseline")
@@ -354,7 +376,6 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     update_data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", update_params, header)
     if update_data.get("code") != 0:
         logging.warning(f"UID {uid} 检测更新失败: {update_data.get('message')}")
-        # 继续拉取尝试
     else:
         update_num = update_data.get("data", {}).get("update_num", 0)
         if update_num == 0:
@@ -377,7 +398,9 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         return alerts, updated, has_new
 
     feed_data = data.get("data") or {}
-    items = feed_data.get("items", [])
+    items = feed_data.get("items")
+    if not isinstance(items, list):
+        items = []
     new_offset = feed_data.get("offset", offset)
     new_baseline = items[0].get("id_str", baseline) if items else baseline
     if new_baseline != baseline or new_offset != offset:
@@ -386,6 +409,8 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         logging.info(f"UID {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
 
     for item in items:
+        if not isinstance(item, dict):
+            continue
         dyn_id = item.get("id_str")
         if not dyn_id or dyn_id in seen_dynamics[uid]:
             continue
@@ -400,7 +425,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         text = extract_dynamic_text(item)
         if item.get("type") == "DYNAMIC_TYPE_FORWARD":
             orig = item.get("orig")
-            if orig:
+            if orig and isinstance(orig, dict):
                 orig_text = extract_dynamic_text(orig)
                 if orig_text:
                     text = f"{text}\n【转发原文】{orig_text}" if text else f"【转发原文】{orig_text}"
@@ -467,7 +492,7 @@ def scan_new_comments(oid, header, last_read_time, seen):
     return new_list, max_ctime
 
 
-# ---------------- 视频监控（保持不变） ----------------
+# ---------------- 视频监控 ----------------
 def get_latest_video(header):
     data = safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", {"host_mid": TARGET_UID}, header)
     if data.get("code") == -101:
@@ -538,7 +563,6 @@ def start_monitoring(header):
     last_read_time = int(time.time())
     seen_comments = set()
 
-    # 初始化关注列表
     following_list = load_following_cache()
     if not following_list:
         following_list = get_following_list(SOURCE_UID, header)
@@ -546,14 +570,12 @@ def start_monitoring(header):
             logging.warning("获取关注列表失败，使用备用静态列表")
             following_list = FALLBACK_DYNAMIC_UIDS
         save_following_cache(following_list)
-    # 确保自身 UID 也在列表中
     if SOURCE_UID not in following_list:
         following_list.append(SOURCE_UID)
     logging.info(f"初始监控 UID 列表 ({len(following_list)} 个): {following_list}")
 
-    # 初始化每个 UID 的状态
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
-    state = load_dynamic_state()   # 重新加载以确保最新
+    state = load_dynamic_state()
 
     logging.info("监控服务已启动，正在扫描新数据...")
 
@@ -561,26 +583,23 @@ def start_monitoring(header):
         try:
             now = time.time()
 
-            # 定时刷新关注列表（每小时）
+            # 定时刷新关注列表
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 logging.info("开始刷新关注列表...")
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
                     if SOURCE_UID not in new_list:
                         new_list.append(SOURCE_UID)
-                    # 找出新增和移除的 UID
                     old_set = set(following_list)
                     new_set = set(new_list)
                     added = new_set - old_set
                     removed = old_set - new_set
                     if added or removed:
                         logging.info(f"关注列表变化: 新增 {len(added)} 个, 移除 {len(removed)} 个")
-                        # 为新增 UID 初始化状态
                         for uid in added:
-                            if str(uid) not in state:
+                            if str(uid) not in state or not isinstance(state.get(str(uid)), dict):
                                 state[str(uid)] = {"baseline": "", "offset": ""}
                             seen_dynamics[uid] = set()
-                        # 移除不再关注的 UID 的状态（可选，保留也可以）
                         for uid in removed:
                             uid_str = str(uid)
                             if uid_str in state:
@@ -611,7 +630,7 @@ def start_monitoring(header):
                     except Exception as e:
                         logging.error(f"评论通知发送失败: {e}")
 
-            # 动态监控（遍历所有关注的 UID）
+            # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
             if now - last_d_check >= interval:
                 all_alerts = []
@@ -624,7 +643,6 @@ def start_monitoring(header):
                         state_updated = True
                     if has_new and not burst_end:
                         burst_end = now + DYNAMIC_BURST_DURATION
-                    # 避免请求过快
                     time.sleep(random.uniform(0.5, 1))
                 if state_updated:
                     save_dynamic_state(state)
@@ -636,7 +654,7 @@ def start_monitoring(header):
                         logging.error(f"❌ Webhook 发送失败: {e}")
                 last_d_check = now
 
-            # 心跳日志
+            # 心跳
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info("💓 心跳: 监控系统正常运行中")
                 last_hb = now
