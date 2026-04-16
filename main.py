@@ -261,30 +261,54 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
-# ==========================================================
-# 评论监控
-# ==========================================================
-def scan_new_comments(oid, header, last_time, seen):
+# ---------------- 评论 ----------------
+def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
-    max_time = last_time
-    for pn in range(1, COMMENT_MAX_PAGES+1):
-        params = {"oid": oid, "type": 1, "sort": 0, "pn": pn, "ps": 20}
-        data = wbi_request("https://api.bilibili.com/x/v2/reply", params, header)
-        if data.get("code") != 0:
-            break
-        replies = data.get("data", {}).get("replies") or []
-        for r in replies:
-            ctime = r.get("ctime", 0)
-            if ctime > max_time:
-                max_time = ctime
-            rpid = r.get("rpid_str")
-            if rpid and rpid not in seen:
-                seen.add(rpid)
-                new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "ctime": ctime})
+    max_ctime = last_read_time
+    safe_time = last_read_time - 300  # 首次启动忽略超过 5 分钟前的评论
+
+    pn = 1
+    while pn <= 10:
+        data = wbi_request(
+            "https://api.bilibili.com/x/v2/reply",
+            {
+                "oid": oid,
+                "type": 1,
+                "sort": 0,
+                "pn": pn,
+                "ps": 20
+            },
+            header
+        )
+
+        replies = (data.get("data") or {}).get("replies") or []
         if not replies:
             break
-        time.sleep(random.uniform(0.3,0.6))
-    return new_list, max_time
+
+        page_old = True
+        for r in replies:
+            rpid = r["rpid_str"]
+            ctime = r["ctime"]
+
+            max_ctime = max(max_ctime, ctime)
+
+            if ctime > safe_time:
+                page_old = False
+                if rpid not in seen:
+                    seen.add(rpid)
+                    new_list.append({
+                        "user": r["member"]["uname"],
+                        "message": r["content"]["message"],
+                        "ctime": ctime
+                    })
+
+        if page_old:
+            break
+
+        pn += 1
+        time.sleep(random.uniform(0.5, 1))
+
+    return new_list, max_ctime
 
 # ==========================================================
 # 主循环
