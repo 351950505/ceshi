@@ -32,10 +32,10 @@ FALLBACK_DYNAMIC_UIDS = [
 DYNAMIC_CHECK_INTERVAL = 15
 DYNAMIC_BURST_INTERVAL = 8
 DYNAMIC_BURST_DURATION = 300
-DYNAMIC_MAX_AGE = 300
+DYNAMIC_MAX_AGE = 300          # 只处理最近5分钟内的动态，避免历史堆积
 
 COMMENT_SCAN_INTERVAL = 5
-COMMENT_MAX_PAGES = 3          # 最多翻3页，避免过度请求
+COMMENT_MAX_PAGES = 3
 COMMENT_SAFE_WINDOW = 60
 
 LOG_FILE = "bili_monitor.log"
@@ -59,7 +59,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态关注列表模式)")
+    logging.info("B站监控系统启动 (动态关注列表模式 - 时间戳去重)")
     logging.info("=" * 60)
 
 
@@ -207,8 +207,9 @@ def save_following_cache(uids):
         json.dump(uids, f)
 
 
-# ---------------- 动态监控核心 ----------------
+# ---------------- 动态监控核心（基于时间戳） ----------------
 def load_dynamic_state():
+    """加载状态，确保每个 UID 包含 last_ts, baseline, offset"""
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r") as f:
@@ -216,6 +217,9 @@ def load_dynamic_state():
             cleaned = {}
             for uid_str, value in state.items():
                 if isinstance(value, dict):
+                    # 兼容旧格式：补充 last_ts
+                    if "last_ts" not in value:
+                        value["last_ts"] = 0
                     if "baseline" not in value:
                         value["baseline"] = ""
                     if "offset" not in value:
@@ -223,7 +227,7 @@ def load_dynamic_state():
                     cleaned[uid_str] = value
                 else:
                     logging.warning(f"状态文件中的 UID {uid_str} 值类型错误 ({type(value).__name__})，已重置")
-                    cleaned[uid_str] = {"baseline": "", "offset": ""}
+                    cleaned[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
             return cleaned
         except Exception as e:
             logging.error(f"加载状态文件失败: {e}")
@@ -298,7 +302,7 @@ def init_dynamic_states_for_uids(uids, header):
         uid_str = str(uid)
         seen[uid] = set()
         if uid_str not in state or not isinstance(state[uid_str], dict):
-            state[uid_str] = {"baseline": "", "offset": ""}
+            state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         try:
             data = fetch_dynamics_page(uid, "", header)
             if data.get("code") == 0:
@@ -308,16 +312,25 @@ def init_dynamic_states_for_uids(uids, header):
                     items = []
                 offset = feed_data.get("offset", "")
                 baseline = items[0].get("id_str", "") if items else ""
-                if baseline:
-                    state[uid_str]["baseline"] = baseline
-                if offset:
-                    state[uid_str]["offset"] = offset
+                # 计算当前最大 pub_ts
+                max_ts = 0
                 for item in items:
                     if isinstance(item, dict):
                         dyn_id = item.get("id_str")
                         if dyn_id:
                             seen[uid].add(dyn_id)
-                logging.info(f"初始化 UID {uid}: baseline={baseline}, offset={offset}, 已收录 {len(seen[uid])} 条动态")
+                        modules = item.get("modules") or {}
+                        author = modules.get("module_author") or {}
+                        pub_ts = author.get("pub_ts", 0)
+                        if pub_ts > max_ts:
+                            max_ts = pub_ts
+                if max_ts > 0:
+                    state[uid_str]["last_ts"] = max_ts
+                if baseline:
+                    state[uid_str]["baseline"] = baseline
+                if offset:
+                    state[uid_str]["offset"] = offset
+                logging.info(f"初始化 UID {uid}: last_ts={max_ts}, baseline={baseline}, offset={offset}, 已收录 {len(seen[uid])} 条动态")
             elif data.get("code") == -101:
                 if refresh_cookie():
                     return init_dynamic_states_for_uids(uids, get_header())
@@ -328,7 +341,7 @@ def init_dynamic_states_for_uids(uids, header):
         except Exception as e:
             logging.error(f"初始化 UID {uid} 异常: {e}")
             if uid_str not in state or not isinstance(state[uid_str], dict):
-                state[uid_str] = {"baseline": "", "offset": ""}
+                state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         time.sleep(random.uniform(0.5, 1))
     save_dynamic_state(state)
     return seen
@@ -339,88 +352,63 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
     current_state = state.get(uid_str)
     if not isinstance(current_state, dict):
         logging.warning(f"UID {uid} 状态无效 (类型: {type(current_state).__name__})，重置")
-        state[uid_str] = {"baseline": "", "offset": ""}
+        state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         current_state = state[uid_str]
-    baseline = current_state.get("baseline", "")
+    last_ts = current_state.get("last_ts", 0)
     offset = current_state.get("offset", "")
-    has_new = False
-    updated = False
-
-    if not baseline:
-        logging.info(f"UID {uid} baseline 为空，尝试建立基线...")
-        data = fetch_dynamics_page(uid, "", header)
-        if data.get("code") == 0:
-            feed_data = data.get("data") or {}
-            items = feed_data.get("items")
-            if not isinstance(items, list):
-                items = []
-            new_offset = feed_data.get("offset", "")
-            new_baseline = items[0].get("id_str", "") if items else ""
-            if new_baseline:
-                state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
-                updated = True
-                for item in items:
-                    if isinstance(item, dict):
-                        dyn_id = item.get("id_str")
-                        if dyn_id:
-                            seen_dynamics[uid].add(dyn_id)
-                logging.info(f"UID {uid} 基线建立成功: baseline={new_baseline}, offset={new_offset}")
-            else:
-                logging.warning(f"UID {uid} 无法获取 baseline")
-        return alerts, updated, has_new
-
-    # 增量检测
-    update_params = {"type": "all", "web_location": "333.1365", "update_baseline": baseline}
-    update_data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", update_params, header)
-    if update_data.get("code") != 0:
-        logging.warning(f"UID {uid} 检测更新失败: {update_data.get('message')}")
-    else:
-        update_num = update_data.get("data", {}).get("update_num", 0)
-        if update_num == 0:
-            return alerts, updated, has_new
-
-    # 拉取新动态
-    fetch_params = {
-        "host_mid": uid,
-        "type": "all",
-        "timezone_offset": "-480",
-        "platform": "web",
-        "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
-        "web_location": "333.1365"
-    }
-    if offset:
-        fetch_params["offset"] = offset
-    if baseline:
-        fetch_params["update_baseline"] = baseline
-    data = wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", fetch_params, header)
+    # 直接拉取最新动态列表（第一页）
+    data = fetch_dynamics_page(uid, offset, header)
     if data.get("code") != 0:
         logging.warning(f"UID {uid} 拉取动态失败: {data.get('message')}")
-        return alerts, updated, has_new
+        return alerts, False, False
 
     feed_data = data.get("data") or {}
     items = feed_data.get("items")
     if not isinstance(items, list):
         items = []
     new_offset = feed_data.get("offset", offset)
-    new_baseline = items[0].get("id_str", baseline) if items else baseline
-    if new_baseline != baseline or new_offset != offset:
-        state[uid_str] = {"baseline": new_baseline, "offset": new_offset}
-        updated = True
-        logging.info(f"UID {uid} 状态更新: baseline={new_baseline}, offset={new_offset}")
+    new_baseline = items[0].get("id_str", "") if items else ""
 
+    # 筛选新动态（基于 pub_ts）
+    new_items = []
+    max_pub_ts = last_ts
     for item in items:
         if not isinstance(item, dict):
             continue
         dyn_id = item.get("id_str")
-        if not dyn_id or dyn_id in seen_dynamics[uid]:
+        if not dyn_id:
             continue
-        seen_dynamics[uid].add(dyn_id)
         modules = item.get("modules") or {}
         author = modules.get("module_author") or {}
         pub_ts = author.get("pub_ts", 0)
-        if now_ts - pub_ts > DYNAMIC_MAX_AGE:
-            logging.debug(f"忽略超时动态 [{author.get('name', uid)}] ID:{dyn_id}")
-            continue
+        if pub_ts > max_pub_ts:
+            max_pub_ts = pub_ts
+        # 只处理时间戳大于 last_ts 的动态（且不超过 DYNAMIC_MAX_AGE 秒）
+        if pub_ts > last_ts and (now_ts - pub_ts <= DYNAMIC_MAX_AGE):
+            new_items.append(item)
+            # 同时更新 seen 集合（用于去重辅助）
+            if dyn_id not in seen_dynamics[uid]:
+                seen_dynamics[uid].add(dyn_id)
+        else:
+            # 即使时间戳不符合，也把 id 加入 seen，避免重复处理旧动态
+            if dyn_id not in seen_dynamics[uid]:
+                seen_dynamics[uid].add(dyn_id)
+
+    # 更新状态中的 last_ts（取所有动态中的最大时间戳，包括旧的，避免遗漏）
+    if max_pub_ts > last_ts:
+        state[uid_str]["last_ts"] = max_pub_ts
+    # 更新 offset 和 baseline
+    if new_offset != offset:
+        state[uid_str]["offset"] = new_offset
+    if new_baseline:
+        state[uid_str]["baseline"] = new_baseline
+
+    # 处理新动态
+    has_new = False
+    for item in new_items:
+        dyn_id = item.get("id_str")
+        modules = item.get("modules") or {}
+        author = modules.get("module_author") or {}
         name = author.get("name", str(uid))
         text = extract_dynamic_text(item)
         if item.get("type") == "DYNAMIC_TYPE_FORWARD":
@@ -435,16 +423,16 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
         alerts.append({"user": name, "message": final_msg})
         has_new = True
-        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id}")
-    return alerts, updated, has_new
+        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={author.get('pub_ts',0)}")
+    if has_new:
+        logging.info(f"UID {uid} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
+    else:
+        logging.debug(f"UID {uid} 无新动态，last_ts={last_ts}, max_pub_ts={max_pub_ts}, items数量={len(items)}")
+    return alerts, True, has_new   # updated 总是设为 True 以便保存状态
 
 
-# ---------------- 评论监控（修复版） ----------------
+# ---------------- 评论监控 ----------------
 def scan_new_comments(oid, header, last_read_time, seen):
-    """
-    使用标准评论区接口 x/v2/reply
-    参数参考：list.md
-    """
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
@@ -455,8 +443,8 @@ def scan_new_comments(oid, header, last_read_time, seen):
         params = {
             "type": 1,
             "oid": oid,
-            "sort": 0,      # 按时间排序
-            "nohot": 1,     # 不显示热评
+            "sort": 0,
+            "nohot": 1,
             "ps": 20,
             "pn": pn
         }
@@ -485,7 +473,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
                     })
         if all_old:
             break
-        # 如果返回的评论数小于请求的每页数量，说明是最后一页
         if len(replies) < params["ps"]:
             break
         pn += 1
@@ -600,7 +587,7 @@ def start_monitoring(header):
                         logging.info(f"关注列表变化: 新增 {len(added)} 个, 移除 {len(removed)} 个")
                         for uid in added:
                             if str(uid) not in state or not isinstance(state.get(str(uid)), dict):
-                                state[str(uid)] = {"baseline": "", "offset": ""}
+                                state[str(uid)] = {"last_ts": 0, "baseline": "", "offset": ""}
                             seen_dynamics[uid] = set()
                         for uid in removed:
                             uid_str = str(uid)
@@ -635,9 +622,10 @@ def start_monitoring(header):
             # 动态监控
             interval = DYNAMIC_BURST_INTERVAL if now < burst_end else DYNAMIC_CHECK_INTERVAL
             if now - last_d_check >= interval:
+                logging.info(f"开始动态扫描，当前监控 {len(following_list)} 个UID")
                 all_alerts = []
                 state_updated = False
-                for uid in following_list:
+                for idx, uid in enumerate(following_list):
                     alerts, updated, has_new = check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now)
                     if alerts:
                         all_alerts.extend(alerts)
