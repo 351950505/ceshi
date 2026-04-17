@@ -120,7 +120,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (高频UP实时队列版 + 动态时间跟随推送)")
+    logging.info("B站监控系统启动 (高频UP实时队列版 + 动态/评论时间显示)")
     logging.info("=" * 60)
 
 def refresh_cookie():
@@ -408,23 +408,18 @@ def init_dynamic_states_for_uids(uids, header):
     return seen
 
 def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
-    alerts = []
     uid_str = str(uid)
     current_state = state.get(uid_str)
     if not isinstance(current_state, dict):
-        logging.warning(f"UID {uid_str} 状态无效 (类型: {type(current_state).__name__})，重置")
         state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
         current_state = state[uid_str]
     last_ts = current_state.get("last_ts", 0)
     offset = current_state.get("offset", "")
     data = fetch_dynamics_page(uid_str, offset, header)
     if data.get("code") != 0:
-        logging.warning(f"UID {uid_str} 拉取动态失败: {data.get('message')}")
-        return alerts, False, False
+        return [], False, False
     feed_data = data.get("data") or {}
-    items = feed_data.get("items")
-    if not isinstance(items, list):
-        items = []
+    items = feed_data.get("items") or []
     new_offset = feed_data.get("offset", offset)
     new_baseline = items[0].get("id_str", "") if items else ""
     new_items = []
@@ -442,11 +437,11 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
             max_pub_ts = pub_ts
         if pub_ts > last_ts and (now_ts - pub_ts <= DYNAMIC_MAX_AGE):
             new_items.append(item)
-            if dyn_id not in seen_dynamics[uid_str]:
-                seen_dynamics[uid_str].add(dyn_id)
+            if dyn_id not in seen_dynamics.get(uid_str, set()):
+                seen_dynamics.setdefault(uid_str, set()).add(dyn_id)
         else:
-            if dyn_id not in seen_dynamics[uid_str]:
-                seen_dynamics[uid_str].add(dyn_id)
+            if dyn_id not in seen_dynamics.get(uid_str, set()):
+                seen_dynamics.setdefault(uid_str, set()).add(dyn_id)
     if max_pub_ts > last_ts:
         state[uid_str]["last_ts"] = max_pub_ts
     if new_offset != offset:
@@ -475,10 +470,10 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         msg = {"user": name, "message": final_msg}
         push_queue.put(msg)
         has_new = True
-        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={pub_ts}")
+        logging.info(f"✅ 新动态 [{name}]: {dyn_id}")
     if has_new:
-        logging.info(f"UID {uid_str} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
-    return alerts, True, has_new
+        save_dynamic_state(state)
+    return [], True, has_new
 
 def scan_new_comments(oid, header, last_read_time, seen):
     new_list = []
@@ -491,7 +486,6 @@ def scan_new_comments(oid, header, last_read_time, seen):
         params = {"type": 1, "oid": oid, "sort": 0, "nohot": 1, "ps": 20, "pn": pn}
         data = wbi_request(url, params, header)
         if data.get("code") != 0:
-            logging.warning(f"评论接口失败 (pn={pn}): {data.get('message')}")
             break
         reply_data = data.get("data", {})
         replies = reply_data.get("replies", [])
@@ -507,7 +501,12 @@ def scan_new_comments(oid, header, last_read_time, seen):
                 rpid = str(r.get("rpid", ""))
                 if rpid and rpid not in seen:
                     seen.add(rpid)
-                    new_list.append({"user": r["member"]["uname"], "message": r["content"]["message"], "ctime": ctime})
+                    comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
+                    new_list.append({
+                        "user": f"[{comment_time}] {r['member']['uname']}",
+                        "message": r["content"]["message"],
+                        "ctime": ctime
+                    })
         if all_old:
             break
         if len(replies) < params["ps"]:
@@ -624,7 +623,7 @@ def start_monitoring(header):
     batch_index = 0
     push_thread = threading.Thread(target=push_worker, daemon=True)
     push_thread.start()
-    logging.info("🚀 实时推送线程已启动（发现即推 + 动态时间）")
+    logging.info("🚀 实时推送线程已启动（动态+评论带时间）")
     logging.info("监控服务已启动，将在工作时间（周一至周五 8:30-17:00）运行")
     while True:
         try:
