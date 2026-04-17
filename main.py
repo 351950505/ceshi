@@ -120,7 +120,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (高频UP实时队列版)")
+    logging.info("B站监控系统启动 (高频UP实时队列版 + 动态时间跟随推送)")
     logging.info("=" * 60)
 
 def refresh_cookie():
@@ -135,16 +135,16 @@ def refresh_cookie():
         send_failure_notification("Cookie 刷新失败", msg)
         return False
 
-def safe_request(url, params, header, retries=3):
+def safe_request(url, params, header, retries=5):
     h = header.copy()
     h["Connection"] = "close"
-    base_delay = 2
+    base_delay = 3
     for i in range(retries):
         try:
             r = requests.get(url, headers=h, params=params, timeout=10)
             txt = r.text.strip()
             if not txt:
-                time.sleep(base_delay * (2 ** i))
+                time.sleep(base_delay * (2 ** i) + random.uniform(0.5, 2))
                 continue
             data = r.json()
             code = data.get("code")
@@ -161,7 +161,7 @@ def safe_request(url, params, header, retries=3):
                 send_failure_notification("请求参数错误", msg)
                 return data
             if code in (-799, -352, -509):
-                wait = base_delay * (2 ** i) + random.uniform(0, 2)
+                wait = base_delay * (2 ** i) + random.uniform(1.5, 4)
                 log_key = f"ratelimit_{code}_{url}"
                 if should_log(log_key):
                     logging.warning(f"触发风控/限流 ({code})，等待 {wait:.1f} 秒后重试")
@@ -173,7 +173,7 @@ def safe_request(url, params, header, retries=3):
                 if should_log(log_key):
                     logging.warning(msg)
                 if i < retries - 1:
-                    time.sleep(base_delay * (2 ** i))
+                    time.sleep(base_delay * (2 ** i) + random.uniform(0.5, 1.5))
                     continue
             return data
         except Exception as e:
@@ -181,7 +181,7 @@ def safe_request(url, params, header, retries=3):
             log_key = f"req_exception_{url}"
             if should_log(log_key):
                 logging.error(msg)
-            time.sleep(base_delay * (2 ** i))
+            time.sleep(base_delay * (2 ** i) + random.uniform(0.5, 2))
     final_msg = "所有重试均失败"
     logging.error(final_msg)
     send_failure_notification("API 请求最终失败", final_msg)
@@ -403,7 +403,7 @@ def init_dynamic_states_for_uids(uids, header):
             logging.error(f"初始化 UID {uid_str} 异常: {e}")
             if uid_str not in state or not isinstance(state[uid_str], dict):
                 state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
-        time.sleep(random.uniform(0.5, 1))
+        time.sleep(random.uniform(2.5, 4.5))
     save_dynamic_state(state)
     return seen
 
@@ -459,6 +459,7 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
         modules = item.get("modules") or {}
         author = modules.get("module_author") or {}
         name = author.get("name", uid_str)
+        pub_ts = author.get("pub_ts", 0)
         text = extract_dynamic_text(item)
         if item.get("type") == "DYNAMIC_TYPE_FORWARD":
             orig = item.get("orig")
@@ -469,11 +470,12 @@ def check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now_ts):
                 orig_id = orig.get("id_str")
                 if orig_id:
                     text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
-        final_msg = f"{text}\n\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"🔗 直达链接: https://t.bilibili.com/{dyn_id}"
+        time_str = datetime.datetime.fromtimestamp(pub_ts).strftime('%Y-%m-%d %H:%M:%S') if pub_ts > 0 else "未知时间"
+        final_msg = f"{text}\n\n📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}" if text else f"📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
         msg = {"user": name, "message": final_msg}
         push_queue.put(msg)
         has_new = True
-        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={author.get('pub_ts',0)}")
+        logging.info(f"✅ 抓取到新动态 [{name}]: {dyn_id} pub_ts={pub_ts}")
     if has_new:
         logging.info(f"UID {uid_str} 本次发现 {len(new_items)} 条新动态，更新 last_ts 为 {max_pub_ts}")
     return alerts, True, has_new
@@ -622,7 +624,7 @@ def start_monitoring(header):
     batch_index = 0
     push_thread = threading.Thread(target=push_worker, daemon=True)
     push_thread.start()
-    logging.info("🚀 实时推送线程已启动（发现即推）")
+    logging.info("🚀 实时推送线程已启动（发现即推 + 动态时间）")
     logging.info("监控服务已启动，将在工作时间（周一至周五 8:30-17:00）运行")
     while True:
         try:
