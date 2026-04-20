@@ -34,12 +34,12 @@ LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
-# 优化参数
+# 最稳参数
 INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.0, 6.0
 STATE_SAVE_INTERVAL = 30
-BURST_MODE_DURATION = 25
-BURST_INTERVAL = 1.1
-NORMAL_INTERVAL = 1.7
+BURST_MODE_DURATION = 18      # 爆发模式持续时间
+BURST_INTERVAL = 1.5          # 爆发模式扫描间隔（最稳）
+NORMAL_INTERVAL = 1.8         # 普通模式扫描间隔
 MAX_SEEN_PER_UID = 800
 # =============================================
 
@@ -70,7 +70,7 @@ def init_logging():
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         encoding="utf-8", filemode="w")
     logging.info("="*60)
-    logging.info("B站监控系统启动 (扫描推送彻底分离 + 爆发防漏)")
+    logging.info("B站监控系统启动 (最稳方案 + 工作时间限制)")
     logging.info("="*60)
 
 def safe_request(url, params, header, retries=5):
@@ -242,7 +242,6 @@ def init_dynamic_states_for_uids(uids, header):
                 for item in items:
                     if isinstance(item,dict) and item.get("id_str"):
                         seen[uid_str].add(item["id_str"])
-                logging.info(f"初始化 UID {uid_str}: last_ts={max_ts}, 已收录 {len(seen[uid_str])} 条")
         except Exception as e:
             logging.error(f"初始化 UID {uid_str} 异常: {e}")
         time.sleep(random.uniform(INIT_SLEEP_MIN, INIT_SLEEP_MAX))
@@ -421,16 +420,16 @@ def start_monitoring(header):
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
     state = load_dynamic_state()
     threading.Thread(target=push_worker, daemon=True).start()
-    logging.info("✅ 扫描与推送线程已彻底分离")
+    logging.info("✅ 扫描与推送线程已彻底分离（最稳方案）")
     batch_index = 0
     while True:
         try:
             now_dt = datetime.datetime.now()
-            # if not is_work_time(now_dt):   # 注释掉这行，实现24小时运行
-            #     time.sleep(get_sleep_until_work_time(now_dt))
-            #     header = get_header()
-            #     update_wbi_keys(header)
-            #     continue
+            if not is_work_time(now_dt):
+                time.sleep(get_sleep_until_work_time(now_dt))
+                header = get_header()
+                update_wbi_keys(header)
+                continue
             now = time.time()
             if now - last_d_check >= get_scan_interval():
                 batch_size = 28 if 928 <= (now_dt.hour*100 + now_dt.minute) <= 1000 else 20
@@ -448,7 +447,6 @@ def start_monitoring(header):
                 batch_index = (batch_index + 1) % max(1, len(following_list)//batch_size + 1)
                 last_d_check = now
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
-                # 关注列表刷新逻辑（略，保持上一版）
                 last_following_refresh = now
             if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
                 new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
@@ -468,7 +466,7 @@ def start_monitoring(header):
             if now - last_seen_clean > 3600:
                 clean_old_seen(seen_dynamics)
                 last_seen_clean = now
-            time.sleep(0.15)
+            time.sleep(0.2)
         except Exception:
             logging.error(traceback.format_exc())
             time.sleep(5)
