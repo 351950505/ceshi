@@ -425,12 +425,12 @@ def start_monitoring(header):
     batch_index = 0
     while True:
         try:
-            now_dt = datetime.datetime.now()
-            if not is_work_time(now_dt):
-                time.sleep(get_sleep_until_work_time(now_dt))
-                header = get_header()
-                update_wbi_keys(header)
-                continue
+                        now_dt = datetime.datetime.now()
+            # if not is_work_time(now_dt):   # 注释掉这行，实现24小时运行
+            #     time.sleep(get_sleep_until_work_time(now_dt))
+            #     header = get_header()
+            #     update_wbi_keys(header)
+            #     continue
             now = time.time()
             if now - last_d_check >= get_scan_interval():
                 batch_size = 28 if 928 <= (now_dt.hour*100 + now_dt.minute) <= 1000 else 20
