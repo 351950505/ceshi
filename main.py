@@ -39,14 +39,28 @@ LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
-# 动态参数
+# ===== 动态参数 / 智能爆发模式 =====
 INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
 STATE_SAVE_INTERVAL = 30
-BURST_MODE_DURATION = 18
+
+BURST_MODE_DURATION = 12
+BURST_COOLDOWN = 20
+BURST_MAX_CHAIN = 3
+
 BURST_INTERVAL_MIN = 1.4
 BURST_INTERVAL_MAX = 1.9
-NORMAL_INTERVAL_MIN = 1.8
-NORMAL_INTERVAL_MAX = 2.4
+
+NORMAL_INTERVAL_MIN = 1.9
+NORMAL_INTERVAL_MAX = 2.6
+
+IDLE_INTERVAL_MIN = 2.4
+IDLE_INTERVAL_MAX = 3.2
+IDLE_MODE_THRESHOLD = 300
+
+FAILURE_EXIT_BURST = 2
+FAILURE_SLOWDOWN_THRESHOLD = 3
+FAILURE_SLOW_INTERVAL_MIN = 3.5
+FAILURE_SLOW_INTERVAL_MAX = 5.0
 
 MAX_SEEN_DYNAMIC_IDS = 3000
 DYNAMIC_NEW_WINDOW = 300
@@ -57,10 +71,20 @@ LAST_TS_IDS_LIMIT = 100
 # =============================================
 
 push_queue = queue.Queue()
+
 burst_end_time = 0
+last_burst_trigger_time = 0
+burst_chain_count = 0
+consecutive_failures = 0
+last_new_dynamic_time = 0
+
 last_state_save = time.time()
 last_seen_clean = time.time()
 _last_notify_time = {}
+
+WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
+mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
+
 
 def push_worker():
     while True:
@@ -73,11 +97,50 @@ def push_worker():
         except Exception as e:
             logging.error(f"推送失败: {e}")
 
+
 def get_scan_interval():
-    global burst_end_time
-    if time.time() < burst_end_time:
+    global burst_end_time, consecutive_failures, last_new_dynamic_time
+
+    now = time.time()
+
+    if consecutive_failures >= FAILURE_SLOWDOWN_THRESHOLD:
+        return random.uniform(FAILURE_SLOW_INTERVAL_MIN, FAILURE_SLOW_INTERVAL_MAX)
+
+    if now < burst_end_time:
         return random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
+
+    if last_new_dynamic_time > 0 and now - last_new_dynamic_time >= IDLE_MODE_THRESHOLD:
+        return random.uniform(IDLE_INTERVAL_MIN, IDLE_INTERVAL_MAX)
+
     return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
+
+
+def trigger_burst_mode():
+    global burst_end_time, last_burst_trigger_time, burst_chain_count
+
+    now = time.time()
+
+    if now - last_burst_trigger_time < BURST_COOLDOWN:
+        if now < burst_end_time and burst_chain_count < BURST_MAX_CHAIN:
+            burst_end_time = max(burst_end_time, now + BURST_MODE_DURATION)
+            burst_chain_count += 1
+            logging.info(f"🚀 爆发续期，chain={burst_chain_count}, until={int(burst_end_time)}")
+        return
+
+    burst_end_time = now + BURST_MODE_DURATION
+    last_burst_trigger_time = now
+    burst_chain_count = 1
+    logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
+
+
+def exit_burst_mode(reason=""):
+    global burst_end_time, burst_chain_count
+
+    if time.time() < burst_end_time:
+        logging.info(f"🛑 退出爆发模式 reason={reason}")
+    burst_end_time = 0
+    burst_chain_count = 0
+
 
 def init_logging():
     if os.path.exists(LOG_FILE):
@@ -91,8 +154,9 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (动态增强版 + 评论增强版)")
+    logging.info("B站监控系统启动 (动态增强版 + 评论增强版 + 智能爆发模式)")
     logging.info("=" * 60)
+
 
 def safe_request(url, params, header, retries=5):
     h = header.copy()
@@ -123,11 +187,10 @@ def safe_request(url, params, header, retries=5):
     send_failure_notification("API 请求最终失败", f"{url} 所有重试均失败")
     return {"code": -500}
 
-WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
 def getMixinKey(orig):
     return ''.join([orig[i] for i in mixinKeyEncTab])[:32]
+
 
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
@@ -144,6 +207,7 @@ def encWbi(params, img_key, sub_key):
     filtered["w_rid"] = sign
     return filtered
 
+
 def update_wbi_keys(header):
     try:
         data = safe_request("https://api.bilibili.com/x/web-interface/nav", None, header)
@@ -156,11 +220,13 @@ def update_wbi_keys(header):
     except Exception as e:
         logging.error(f"更新WBI异常: {e}")
 
+
 def wbi_request(url, params, header):
     if not WBI_KEYS["img_key"] or time.time() - WBI_KEYS["last_update"] > 21600:
         update_wbi_keys(header)
     signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
     return safe_request(url, signed, header)
+
 
 def get_following_list(uid, header):
     following = []
@@ -184,6 +250,7 @@ def get_following_list(uid, header):
         time.sleep(random.uniform(0.6, 1.2))
     return following
 
+
 def load_following_cache():
     if os.path.exists(FOLLOWING_CACHE_FILE):
         try:
@@ -193,9 +260,11 @@ def load_following_cache():
             return []
     return []
 
+
 def save_following_cache(uids):
     with open(FOLLOWING_CACHE_FILE, "w", encoding="utf-8") as f:
         json.dump(uids, f)
+
 
 def load_dynamic_state():
     default_state = {
@@ -229,12 +298,14 @@ def load_dynamic_state():
             return default_state
     return default_state
 
+
 def save_dynamic_state(state):
     feed = state.setdefault("feed", {})
     feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
     feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
     with open(DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+
 
 def clean_old_seen(seen_dynamic_ids):
     if len(seen_dynamic_ids) <= MAX_SEEN_DYNAMIC_IDS:
@@ -244,11 +315,13 @@ def clean_old_seen(seen_dynamic_ids):
     seen_dynamic_ids.clear()
     seen_dynamic_ids.update(kept)
 
+
 def clean_old_seen_comments(seen_comments):
     if len(seen_comments) <= MAX_SEEN_COMMENTS:
         return seen_comments
     trimmed = set(list(seen_comments)[-MAX_SEEN_COMMENTS:])
     return trimmed
+
 
 def add_recent_pushed_id(state, dyn_id):
     feed = state.setdefault("feed", {})
@@ -258,10 +331,12 @@ def add_recent_pushed_id(state, dyn_id):
     recent.insert(0, dyn_id)
     feed["recent_pushed_ids"] = recent[:RECENT_PUSHED_IDS_LIMIT]
 
+
 def is_recent_pushed(state, dyn_id):
     feed = state.setdefault("feed", {})
     recent = feed.get("recent_pushed_ids", []) or []
     return dyn_id in recent
+
 
 def update_last_ts_state(feed_state, dyn_id, pub_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
@@ -274,6 +349,7 @@ def update_last_ts_state(feed_state, dyn_id, pub_ts):
         if dyn_id not in last_ts_ids:
             last_ts_ids.append(dyn_id)
             feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_IDS_LIMIT]
+
 
 def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
@@ -289,6 +365,7 @@ def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
         return True
 
     return False
+
 
 def extract_dynamic_text(item):
     try:
@@ -363,6 +440,7 @@ def extract_dynamic_text(item):
     except:
         return ""
 
+
 def format_dynamic_message(item):
     dyn_id = item.get("id_str", "")
     author = item.get("modules", {}).get("module_author", {}) or {}
@@ -389,6 +467,7 @@ def format_dynamic_message(item):
     )
     return name, final_msg
 
+
 def fetch_following_feed(header, offset="", update_baseline=""):
     params = {
         "type": "all",
@@ -403,6 +482,7 @@ def fetch_following_feed(header, offset="", update_baseline=""):
         params["update_baseline"] = update_baseline
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
+
 def fetch_following_feed_retry(header, offset="", update_baseline="", retries=2):
     last = None
     for _ in range(retries + 1):
@@ -413,6 +493,7 @@ def fetch_following_feed_retry(header, offset="", update_baseline="", retries=2)
         time.sleep(random.uniform(0.8, 1.6))
     return last or {"code": -500}
 
+
 def check_feed_update(header, update_baseline):
     params = {
         "type": "all",
@@ -421,12 +502,16 @@ def check_feed_update(header, update_baseline):
     }
     return safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params, header)
 
+
 def init_feed_state(header, target_uids):
+    global last_new_dynamic_time
+
     state = load_dynamic_state()
     seen_dynamic_ids = {}
 
     try:
         max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
+        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids", []) or [])
         offset = ""
         baseline = state.get("feed", {}).get("baseline", "")
 
@@ -452,8 +537,13 @@ def init_feed_state(header, target_uids):
                 author = item.get("modules", {}).get("module_author", {}) or {}
                 author_mid = str(author.get("mid", ""))
                 pub_ts = int(author.get("pub_ts", 0) or 0)
-                if author_mid in target_uids and pub_ts > max_ts:
-                    max_ts = pub_ts
+
+                if author_mid in target_uids:
+                    if pub_ts > max_ts:
+                        max_ts = pub_ts
+                        max_ts_ids = {dyn_id} if dyn_id else set()
+                    elif pub_ts == max_ts and dyn_id:
+                        max_ts_ids.add(dyn_id)
 
             offset = feed.get("offset", "")
             if not offset or not items:
@@ -464,11 +554,12 @@ def init_feed_state(header, target_uids):
         state["feed"]["baseline"] = baseline
         state["feed"]["offset"] = offset
         state["feed"]["last_ts"] = max_ts
-        if "last_ts_ids" not in state["feed"]:
-            state["feed"]["last_ts_ids"] = []
+        state["feed"]["last_ts_ids"] = list(max_ts_ids)[:LAST_TS_IDS_LIMIT]
         if "recent_pushed_ids" not in state["feed"]:
             state["feed"]["recent_pushed_ids"] = []
         save_dynamic_state(state)
+
+        last_new_dynamic_time = time.time()
 
         logging.info(f"关注流初始化完成 baseline={baseline} offset={offset} last_ts={max_ts}")
     except Exception as e:
@@ -476,8 +567,10 @@ def init_feed_state(header, target_uids):
 
     return seen_dynamic_ids, state
 
+
 def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
-    global burst_end_time
+    global last_new_dynamic_time, consecutive_failures
+
     has_new = False
     feed_state = state.setdefault("feed", {
         "last_ts": 0,
@@ -536,12 +629,16 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
         logging.info(f"✅ 新动态 [{name}] {dyn_id}")
 
     if has_new:
-        burst_end_time = time.time() + BURST_MODE_DURATION
-        logging.info(f"🚀 爆发模式启动 {BURST_MODE_DURATION}s")
+        last_new_dynamic_time = time.time()
+        consecutive_failures = 0
+        trigger_burst_mode()
 
     return has_new
 
+
 def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
+    global consecutive_failures
+
     feed_state = state.setdefault("feed", {
         "last_ts": 0,
         "last_ts_ids": [],
@@ -556,10 +653,15 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     direct_fallback = False
 
     if update_data.get("code") != 0:
-        logging.warning(f"update 接口失败 code={update_data.get('code')}，退化到首页兜底")
+        consecutive_failures += 1
+        logging.warning(f"update 接口失败 code={update_data.get('code')}，连续失败={consecutive_failures}，退化到首页兜底")
         direct_fallback = True
+        if consecutive_failures >= FAILURE_EXIT_BURST:
+            exit_burst_mode("update_failed")
     else:
         update_num = update_data.get("data", {}).get("update_num", 0)
+        consecutive_failures = 0
+
         if update_num <= 0:
             return False
         logging.info(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
@@ -570,13 +672,20 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     first_page_baseline = ""
     candidate_baseline = baseline
     completed = True
+    any_success_page = False
 
     while page_count < FEED_FETCH_MAX_PAGES:
         data = fetch_following_feed_retry(header, offset=offset)
         if data.get("code") != 0:
+            consecutive_failures += 1
             completed = False
-            logging.warning(f"关注流拉取失败 page={page_count + 1} code={data.get('code')}")
+            logging.warning(f"关注流拉取失败 page={page_count + 1} code={data.get('code')} 连续失败={consecutive_failures}")
+            if consecutive_failures >= FAILURE_EXIT_BURST:
+                exit_burst_mode("feed_page_failed")
             break
+
+        consecutive_failures = 0
+        any_success_page = True
 
         feed = data.get("data", {}) or {}
         items = feed.get("items") or []
@@ -613,7 +722,7 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         time.sleep(random.uniform(0.4, 0.8))
 
-    if completed:
+    if completed and any_success_page:
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
         feed_state["offset"] = offset
@@ -621,6 +730,7 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         logging.warning("本轮关注流未完整成功，baseline 不前移")
 
     return has_new
+
 
 def scan_comments_pages(oid, header, last_read_time, seen, max_pages=1, startup_mode=False):
     new_list = []
@@ -684,6 +794,7 @@ def scan_comments_pages(oid, header, last_read_time, seen, max_pages=1, startup_
 
     return new_list, max_ctime
 
+
 def startup_backfill_comments(oid, title, header, seen_comments):
     if not oid:
         return int(time.time())
@@ -710,6 +821,7 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         logging.error(f"启动补扫评论异常: {e}")
         return int(time.time())
 
+
 def get_latest_video(header):
     data = safe_request(
         "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
@@ -730,6 +842,7 @@ def get_latest_video(header):
                 pass
     return None
 
+
 def get_video_info(bv, header):
     data = safe_request(f"https://api.bilibili.com/x/web-interface/view?bvid={bv}", None, header)
     if data.get("code") == -101 and refresh_cookie():
@@ -738,6 +851,7 @@ def get_video_info(bv, header):
         d = data["data"]
         return str(d["aid"]), d["title"]
     return None, None
+
 
 def sync_latest_video(header):
     bv = get_latest_video(header)
@@ -753,6 +867,7 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
+
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
@@ -767,6 +882,7 @@ def get_header():
         "Referer": "https://www.bilibili.com/"
     }
 
+
 def refresh_cookie():
     logging.warning("Cookie失效，尝试重新登录...")
     try:
@@ -779,6 +895,7 @@ def refresh_cookie():
         send_failure_notification("Cookie 刷新失败", msg)
         return False
 
+
 def send_failure_notification(title, message):
     key = f"{title}:{message[:100]}"
     if time.time() - _last_notify_time.get(key, 0) >= 600:
@@ -788,8 +905,9 @@ def send_failure_notification(title, message):
         except:
             pass
 
+
 def start_monitoring(header):
-    global last_state_save, last_seen_clean
+    global last_state_save, last_seen_clean, last_new_dynamic_time
 
     last_v_check = 0
     last_hb = 0
@@ -816,9 +934,12 @@ def start_monitoring(header):
     logging.info(f"监控 {len(target_uids)} 个 UID（关注流模式）")
 
     seen_dynamic_ids, state = init_feed_state(header, target_uids)
+    if last_new_dynamic_time == 0:
+        last_new_dynamic_time = time.time()
 
     threading.Thread(target=push_worker, daemon=True).start()
     logging.info("✅ 动态增强版启动（同秒防漏 + baseline延迟提交 + update失败兜底 + recent pushed持久化）")
+    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
     logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
 
     while True:
@@ -921,6 +1042,7 @@ def start_monitoring(header):
         except Exception:
             logging.error(traceback.format_exc())
             time.sleep(8)
+
 
 if __name__ == "__main__":
     init_logging()
