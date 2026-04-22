@@ -85,16 +85,14 @@ RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
 
 # ===== 动态类型过滤 =====
-# 允许推送的动态主类型（空字符串表示普通文字动态也允许）
 ALLOWED_DYNAMIC_TYPES = {
     "",                     # 纯文字/无 major 类型
     "MAJOR_TYPE_OPUS",      # 图文
     "MAJOR_TYPE_ARCHIVE",   # 视频
     "MAJOR_TYPE_ARTICLE",   # 专栏
-    "MAJOR_TYPE_DRAW"       # 图片动态
+    "MAJOR_TYPE_DRAW"       # 图片动态（这里只提取文字，不显示图）
 }
 
-# 允许的顶层 type
 ALLOWED_TOP_LEVEL_TYPES = {
     "DYNAMIC_TYPE_WORD",
     "DYNAMIC_TYPE_DRAW",
@@ -103,7 +101,6 @@ ALLOWED_TOP_LEVEL_TYPES = {
     "DYNAMIC_TYPE_FORWARD"
 }
 
-# 是否允许转发动态
 ALLOW_FORWARD_DYNAMIC = True
 # =============================================
 
@@ -136,13 +133,32 @@ def atomic_write_json(path, data):
     os.replace(tmp_path, path)
 
 
+def normalize_text(text):
+    if not text:
+        return ""
+    text = str(text).replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines).strip()
+
+
+def cut_text(text, max_len=800):
+    text = normalize_text(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3].rstrip() + "..."
+
+
 def push_worker():
     while True:
         try:
             item = push_queue.get(timeout=1)
             if not item:
                 continue
-            notifier.send_webhook_notification("💡 特别关注UP主发布新内容", [item])
+
+            ok = notifier.send_webhook_notification("特别关注UP主发布新内容", [item])
+            if not ok:
+                logging.warning(f"动态推送发送失败: {item.get('user', '未知UP')}")
         except queue.Empty:
             continue
         except Exception as e:
@@ -545,6 +561,7 @@ def extract_dynamic_text(item):
                     "RICH_TEXT_NODE_TYPE_LOTTERY"
                 )
             ).strip()
+            text = normalize_text(text)
             if text:
                 return text
 
@@ -553,49 +570,68 @@ def extract_dynamic_text(item):
 
         if t == "MAJOR_TYPE_ARCHIVE":
             a = major.get("archive") or {}
-            return f"【视频】{a.get('title', '')}\n{a.get('desc', '')}".strip()
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【视频】{title}\n{desc_text}"
+            return f"【视频】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_ARTICLE":
             a = major.get("article", {}) or {}
-            return f"【专栏】{a.get('title', '')}\n{a.get('desc', '')}".strip()
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【专栏】{title}\n{desc_text}"
+            return f"【专栏】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
             nodes = summary.get("rich_text_nodes") or []
             text = "".join(n.get("text", "") for n in nodes if isinstance(n, dict)).strip()
-            title = opus.get("title") or ""
+            text = normalize_text(text)
+            title = normalize_text(opus.get("title") or "")
             if title and text:
-                return f"【图文】{title}\n{text}".strip()
+                return f"【图文】{title}\n{text}"
             return text or f"【图文】{title}".strip()
 
         if t == "MAJOR_TYPE_DRAW":
-            desc_text = desc.get("text", "").strip()
-            if desc_text:
-                return desc_text
-            return "【图片动态】"
+            desc_text = normalize_text(desc.get("text", ""))
+            return desc_text or "【图片动态】"
 
         if t == "MAJOR_TYPE_COMMON":
             common = major.get("common", {}) or {}
-            return f"【卡片】{common.get('title', '')}\n{common.get('desc', '')}".strip()
+            title = normalize_text(common.get("title", ""))
+            desc_text = normalize_text(common.get("desc", ""))
+            if title and desc_text:
+                return f"【卡片】{title}\n{desc_text}"
+            return f"【卡片】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_LIVE":
             live = major.get("live", {}) or {}
-            return f"【直播】{live.get('title', '')}\n{live.get('desc_second', '')}".strip()
+            title = normalize_text(live.get("title", ""))
+            desc_text = normalize_text(live.get("desc_second", ""))
+            if title and desc_text:
+                return f"【直播】{title}\n{desc_text}"
+            return f"【直播】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_PGC":
             pgc = major.get("pgc", {}) or {}
-            return f"【PGC】{pgc.get('title', '')}".strip()
+            return normalize_text(f"【PGC】{pgc.get('title', '')}")
 
         if t == "MAJOR_TYPE_COURSES":
             c = major.get("courses", {}) or {}
-            return f"【课程】{c.get('title', '')}\n{c.get('desc', '')}".strip()
+            title = normalize_text(c.get("title", ""))
+            desc_text = normalize_text(c.get("desc", ""))
+            if title and desc_text:
+                return f"【课程】{title}\n{desc_text}"
+            return f"【课程】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_MUSIC":
             m = major.get("music", {}) or {}
-            return f"【音频】{m.get('title', '')}".strip()
+            return normalize_text(f"【音频】{m.get('title', '')}")
 
-        return desc.get("text", "").strip()
+        return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
 
@@ -604,27 +640,39 @@ def format_dynamic_message(item):
     dyn_id = item.get("id_str", "")
     author = item.get("modules", {}).get("module_author", {}) or {}
     name = author.get("name", "未知UP")
-    pub_ts = author.get("pub_ts", 0)
+    pub_ts = int(author.get("pub_ts", 0) or 0)
 
-    text = extract_dynamic_text(item)
+    text = cut_text(extract_dynamic_text(item), 900)
+    dynamic_type = item.get("type", "")
 
-    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+    if dynamic_type == "DYNAMIC_TYPE_FORWARD":
         orig = item.get("orig")
         if orig and isinstance(orig, dict):
-            orig_text = extract_dynamic_text(orig)
+            orig_text = cut_text(extract_dynamic_text(orig), 300)
             if orig_text:
-                text = f"{text}\n【转发原文】{orig_text}" if text else f"【转发原文】{orig_text}"
+                if text:
+                    text = f"{text}\n\n【转发原文】\n{orig_text}"
+                else:
+                    text = f"【转发原文】\n{orig_text}"
             orig_id = orig.get("id_str")
             if orig_id:
-                text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
+                text = f"{text}\n\n原动态： https://t.bilibili.com/{orig_id}"
 
-    time_str = datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S") if pub_ts > 0 else "未知时间"
-    final_msg = (
-        f"{text}\n\n📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-        if text else
-        f"📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
+    if not text:
+        text = "（该动态无可提取正文）"
+
+    time_str = (
+        datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S")
+        if pub_ts > 0 else "未知时间"
     )
-    return name, final_msg
+
+    return {
+        "user": name,
+        "message": text,
+        "time": time_str,
+        "link": f"https://t.bilibili.com/{dyn_id}",
+        "kind": "dynamic"
+    }
 
 
 def safe_enqueue_push(item):
@@ -801,14 +849,14 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             pub_ts = int(author.get("pub_ts", 0) or 0)
 
-            name, final_msg = format_dynamic_message(item)
-            ok = safe_enqueue_push({"user": name, "message": final_msg})
+            push_data = format_dynamic_message(item)
+            ok = safe_enqueue_push(push_data)
             if ok:
                 pushed_ids.add(dyn_id)
                 add_recent_pushed_id(state, dyn_id)
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 has_new = True
-                logging.info(f"✅ 新动态 [{name}] {dyn_id}")
+                logging.info(f"✅ 新动态 [{push_data.get('user', '未知UP')}] {dyn_id}")
             else:
                 logging.warning(f"动态入队失败，放弃推送 dyn_id={dyn_id}")
         except Exception as e:
@@ -1153,7 +1201,7 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（同秒防漏 + baseline延迟提交 + update失败兜底 + recent pushed持久化）")
+    logging.info("✅ 动态增强版启动（结构化动态推送 + 同秒防漏 + baseline延迟提交 + update失败兜底 + recent pushed持久化）")
     logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
     logging.info("✅ 连续无更新自适应降速已启用")
     logging.info("✅ 评论去重结构优化已启用（set + deque）")
