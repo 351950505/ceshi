@@ -25,9 +25,15 @@ SOURCE_UID = 3706948578969654
 
 FALLBACK_DYNAMIC_UIDS = ["3546905852250875", "3546961271589219", "3546610447419885", "285340365", "3706948578969654"]
 
-COMMENT_SCAN_INTERVAL = 5
-COMMENT_MAX_PAGES = 3
-COMMENT_SAFE_WINDOW = 60
+# ===== 评论监控配置（增强版：接近零漏） =====
+COMMENT_SCAN_INTERVAL = 5              # 常规扫描间隔：5秒
+COMMENT_NORMAL_PAGES = 1               # 常规扫描只扫1页
+COMMENT_RESCAN_INTERVAL = 60           # 每60秒补扫一次
+COMMENT_RESCAN_PAGES = 2               # 补扫前2页
+COMMENT_STARTUP_LOOKBACK = 300         # 启动时补扫最近5分钟
+COMMENT_SAFE_WINDOW = 60               # 安全窗口：避免边界漏
+COMMENT_MAX_RETRY_PAGES = 3            # 单次最多允许扫描页数上限保护
+MAX_SEEN_COMMENTS = 5000               # 评论去重缓存上限
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
@@ -78,7 +84,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流 feed/all 版 - 防漏动态)")
+    logging.info("B站监控系统启动 (关注流 feed/all 版 - 防漏动态 + 评论增强补扫版)")
     logging.info("=" * 60)
 
 def safe_request(url, params, header, retries=5):
@@ -103,7 +109,8 @@ def safe_request(url, params, header, retries=5):
                 time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
                 continue
             return data
-        except Exception:
+        except Exception as e:
+            logging.warning(f"请求异常: {url} params={params} err={e}")
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
     logging.error("请求最终失败")
     send_failure_notification("API 请求最终失败", "所有重试均失败")
@@ -222,6 +229,12 @@ def clean_old_seen(seen_dynamic_ids):
     kept = dict(items[:MAX_SEEN_DYNAMIC_IDS])
     seen_dynamic_ids.clear()
     seen_dynamic_ids.update(kept)
+
+def clean_old_seen_comments(seen_comments):
+    if len(seen_comments) <= MAX_SEEN_COMMENTS:
+        return seen_comments
+    trimmed = set(list(seen_comments)[-MAX_SEEN_COMMENTS:])
+    return trimmed
 
 def extract_dynamic_text(item):
     try:
@@ -504,43 +517,106 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
     return has_new
 
-def scan_new_comments(oid, header, last_read_time, seen):
+def scan_comments_pages(oid, header, last_read_time, seen, max_pages=1, startup_mode=False):
+    """
+    评论扫描增强版：
+    - 常规模式：扫1页
+    - 补扫模式：扫前2页
+    - 启动模式：只处理最近 COMMENT_STARTUP_LOOKBACK 秒内的评论
+    - 使用 seen(rpid) 去重
+    """
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
+    now_ts = int(time.time())
     url = "https://api.bilibili.com/x/v2/reply"
+
+    max_pages = max(1, min(max_pages, COMMENT_MAX_RETRY_PAGES))
     pn = 1
     fetched = 0
-    while fetched < COMMENT_MAX_PAGES:
+
+    while fetched < max_pages:
         params = {"type": 1, "oid": oid, "sort": 0, "nohot": 1, "ps": 20, "pn": pn}
         data = wbi_request(url, params, header)
         if data.get("code") != 0:
+            logging.warning(f"评论扫描失败 code={data.get('code')} oid={oid} pn={pn}")
             break
+
         replies = data.get("data", {}).get("replies", [])
         if not replies:
             break
+
         all_old = True
+
         for r in replies:
             ctime = r.get("ctime", 0)
             if ctime > max_ctime:
                 max_ctime = ctime
-            if ctime > safe_time:
-                all_old = False
-                rpid = str(r.get("rpid", ""))
-                if rpid and rpid not in seen:
-                    seen.add(rpid)
-                    comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
-                    new_list.append({
-                        "user": f"[{comment_time}] {r.get('member', {}).get('uname', '')}",
-                        "message": r.get("content", {}).get("message", ""),
-                        "ctime": ctime
-                    })
-        if all_old or len(replies) < 20:
-            break
+
+            if startup_mode:
+                if now_ts - ctime > COMMENT_STARTUP_LOOKBACK:
+                    continue
+            else:
+                if ctime <= safe_time:
+                    continue
+
+            all_old = False
+
+            rpid = str(r.get("rpid", ""))
+            if rpid and rpid not in seen:
+                seen.add(rpid)
+                comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
+                new_list.append({
+                    "user": f"[{comment_time}] {r.get('member', {}).get('uname', '')}",
+                    "message": r.get("content", {}).get("message", ""),
+                    "ctime": ctime,
+                    "rpid": rpid
+                })
+
+        if startup_mode:
+            if len(replies) < 20:
+                break
+        else:
+            if all_old or len(replies) < 20:
+                break
+
         pn += 1
         fetched += 1
         time.sleep(random.uniform(0.4, 0.8))
+
     return new_list, max_ctime
+
+def startup_backfill_comments(oid, title, header, seen_comments):
+    """
+    启动补扫：
+    - 扫前2页
+    - 只处理最近5分钟评论
+    - 去重后推送
+    """
+    if not oid:
+        return int(time.time())
+
+    logging.info("🧩 启动评论补扫开始")
+    try:
+        new_c, new_t = scan_comments_pages(
+            oid=oid,
+            header=header,
+            last_read_time=int(time.time()) - COMMENT_STARTUP_LOOKBACK,
+            seen=seen_comments,
+            max_pages=COMMENT_RESCAN_PAGES,
+            startup_mode=True
+        )
+        if new_c:
+            new_c.sort(key=lambda x: x["ctime"])
+            payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+            notifier.send_webhook_notification(title, payload)
+            logging.info(f"🧩 启动补扫发送 {len(new_c)} 条评论")
+        else:
+            logging.info("🧩 启动补扫未发现新评论")
+        return new_t
+    except Exception as e:
+        logging.error(f"启动补扫评论异常: {e}")
+        return int(time.time())
 
 def get_latest_video(header):
     data = safe_request(
@@ -626,12 +702,18 @@ def start_monitoring(header):
     last_v_check = 0
     last_hb = 0
     last_comment_check = 0
+    last_comment_rescan = 0
     last_following_refresh = 0
     last_d_check = 0
 
     oid, title = sync_latest_video(header)
-    last_read_time = int(time.time())
+
     seen_comments = set()
+    last_read_time = int(time.time())
+
+    # 启动补扫评论：最近5分钟，前2页
+    if oid:
+        last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
 
     following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
     following_list = [str(uid) for uid in following_list]
@@ -646,6 +728,7 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
     logging.info("✅ 关注流版启动（feed/all/update + feed/all + 补抓防漏）")
+    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
 
     while True:
         try:
@@ -688,16 +771,43 @@ def start_monitoring(header):
 
                 last_following_refresh = now
 
-            # 评论扫描保持原逻辑
+            # 评论常规扫描：每5秒扫1页
             if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
-                new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
+                new_c, new_t = scan_comments_pages(
+                    oid=oid,
+                    header=header,
+                    last_read_time=last_read_time,
+                    seen=seen_comments,
+                    max_pages=COMMENT_NORMAL_PAGES,
+                    startup_mode=False
+                )
                 last_comment_check = now
                 if new_t > last_read_time:
                     last_read_time = new_t
                 if new_c:
                     new_c.sort(key=lambda x: x["ctime"])
-                    notifier.send_webhook_notification(title, new_c)
-                    logging.info(f"💬 发送 {len(new_c)} 条评论")
+                    payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+                    notifier.send_webhook_notification(title, payload)
+                    logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
+
+            # 评论定时补扫：每60秒扫前2页
+            if oid and now - last_comment_rescan >= COMMENT_RESCAN_INTERVAL:
+                new_c, new_t = scan_comments_pages(
+                    oid=oid,
+                    header=header,
+                    last_read_time=last_read_time,
+                    seen=seen_comments,
+                    max_pages=COMMENT_RESCAN_PAGES,
+                    startup_mode=False
+                )
+                last_comment_rescan = now
+                if new_t > last_read_time:
+                    last_read_time = new_t
+                if new_c:
+                    new_c.sort(key=lambda x: x["ctime"])
+                    payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+                    notifier.send_webhook_notification(title, payload)
+                    logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info("💓 心跳正常")
@@ -707,11 +817,17 @@ def start_monitoring(header):
                 res = sync_latest_video(header)
                 if res:
                     oid, title = res
+                    seen_comments = set()
+                    last_read_time = int(time.time())
+                    if oid:
+                        last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
                 last_v_check = now
 
             if now - last_seen_clean > 3600:
                 clean_old_seen(seen_dynamic_ids)
+                seen_comments = clean_old_seen_comments(seen_comments)
                 last_seen_clean = now
+                logging.info("🧹 已清理历史动态/评论去重缓存")
 
             time.sleep(0.25)
 
