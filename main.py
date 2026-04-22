@@ -85,16 +85,14 @@ RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
 
 # ===== 动态类型过滤 =====
-# 允许推送的动态主类型（空字符串表示普通文字动态也允许）
 ALLOWED_DYNAMIC_TYPES = {
-    "",                     # 纯文字/无 major 类型
-    "MAJOR_TYPE_OPUS",      # 图文
-    "MAJOR_TYPE_ARCHIVE",   # 视频
-    "MAJOR_TYPE_ARTICLE",   # 专栏
-    "MAJOR_TYPE_DRAW"       # 图片动态
+    "",
+    "MAJOR_TYPE_OPUS",
+    "MAJOR_TYPE_ARCHIVE",
+    "MAJOR_TYPE_ARTICLE",
+    "MAJOR_TYPE_DRAW"
 }
 
-# 允许的顶层 type
 ALLOWED_TOP_LEVEL_TYPES = {
     "DYNAMIC_TYPE_WORD",
     "DYNAMIC_TYPE_DRAW",
@@ -103,7 +101,6 @@ ALLOWED_TOP_LEVEL_TYPES = {
     "DYNAMIC_TYPE_FORWARD"
 }
 
-# 是否允许转发动态
 ALLOW_FORWARD_DYNAMIC = True
 # =============================================
 
@@ -122,10 +119,10 @@ _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
-    46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,
-    27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,
-    37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,
-    22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
 ]
 
 
@@ -136,68 +133,20 @@ def atomic_write_json(path, data):
     os.replace(tmp_path, path)
 
 
-def push_worker():
-    while True:
-        try:
-            item = push_queue.get(timeout=1)
-            if not item:
-                continue
-            notifier.send_webhook_notification("💡 特别关注UP主发布新内容", [item])
-        except queue.Empty:
-            continue
-        except Exception as e:
-            logging.error(f"推送失败: {repr(e)}")
-            logging.error(traceback.format_exc())
+def normalize_text(text):
+    if not text:
+        return ""
+    text = str(text).replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    lines = [line for line in lines if line]
+    return "\n".join(lines).strip()
 
 
-def get_scan_interval():
-    global burst_end_time, consecutive_failures, last_new_dynamic_time, consecutive_no_update_rounds
-
-    now = time.time()
-
-    if consecutive_failures >= FAILURE_SLOWDOWN_THRESHOLD:
-        return random.uniform(FAILURE_SLOW_INTERVAL_MIN, FAILURE_SLOW_INTERVAL_MAX)
-
-    if now < burst_end_time:
-        return random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
-
-    if consecutive_no_update_rounds >= NO_UPDATE_SLOWDOWN_THRESHOLD_2:
-        return random.uniform(NO_UPDATE_INTERVAL_2_MIN, NO_UPDATE_INTERVAL_2_MAX)
-
-    if consecutive_no_update_rounds >= NO_UPDATE_SLOWDOWN_THRESHOLD_1:
-        return random.uniform(NO_UPDATE_INTERVAL_1_MIN, NO_UPDATE_INTERVAL_1_MAX)
-
-    if last_new_dynamic_time > 0 and now - last_new_dynamic_time >= IDLE_MODE_THRESHOLD:
-        return random.uniform(IDLE_INTERVAL_MIN, IDLE_INTERVAL_MAX)
-
-    return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
-
-
-def trigger_burst_mode():
-    global burst_end_time, last_burst_trigger_time, burst_chain_count
-
-    now = time.time()
-
-    if now - last_burst_trigger_time < BURST_COOLDOWN:
-        if now < burst_end_time and burst_chain_count < BURST_MAX_CHAIN:
-            burst_end_time = max(burst_end_time, now + BURST_MODE_DURATION)
-            burst_chain_count += 1
-            logging.info(f"🚀 爆发续期，chain={burst_chain_count}, until={int(burst_end_time)}")
-        return
-
-    burst_end_time = now + BURST_MODE_DURATION
-    last_burst_trigger_time = now
-    burst_chain_count = 1
-    logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
-
-
-def exit_burst_mode(reason=""):
-    global burst_end_time, burst_chain_count
-
-    if time.time() < burst_end_time:
-        logging.info(f"🛑 退出爆发模式 reason={reason}")
-    burst_end_time = 0
-    burst_chain_count = 0
+def cut_text(text, max_len=800):
+    text = normalize_text(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3].rstrip() + "..."
 
 
 def init_logging():
@@ -208,16 +157,36 @@ def init_logging():
     except Exception:
         pass
 
-    logging.basicConfig(
-        filename=LOG_FILE,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        encoding="utf-8",
-        filemode="w"
-    )
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+
+    file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (最终生产版)")
+    logging.info("B站监控系统启动（增强排障版）")
     logging.info("=" * 60)
+
+
+def send_failure_notification(title, message):
+    key = f"{title}:{message[:100]}"
+    if time.time() - _last_notify_time.get(key, 0) >= 600:
+        _last_notify_time[key] = time.time()
+        try:
+            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
+        except Exception:
+            pass
 
 
 def safe_request(url, params, header, retries=5):
@@ -226,8 +195,13 @@ def safe_request(url, params, header, retries=5):
     base_delay = 3
 
     for i in range(retries):
+        start_ts = time.time()
         try:
+            logging.info(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = requests.get(url, headers=h, params=params, timeout=12)
+            cost = time.time() - start_ts
+            logging.info(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
+
             try:
                 data = r.json()
             except Exception as je:
@@ -235,6 +209,7 @@ def safe_request(url, params, header, retries=5):
                 data = {"code": -500, "message": f"invalid json http={r.status_code}"}
 
             code = data.get("code")
+            logging.info(f"[请求结果] url={url} code={code}")
 
             if code == -101:
                 logging.error("Cookie失效")
@@ -248,16 +223,20 @@ def safe_request(url, params, header, retries=5):
                 continue
 
             if code != 0 and i < retries - 1:
-                time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
+                wait = base_delay * (2 ** i) + random.uniform(0.8, 2.5)
+                logging.warning(f"[请求重试] url={url} code={code} wait={wait:.1f}s")
+                time.sleep(wait)
                 continue
 
             return data
 
         except requests.RequestException as e:
-            logging.warning(f"请求异常: {url} params={params} err={repr(e)}")
+            cost = time.time() - start_ts
+            logging.warning(f"请求异常: url={url} params={params} cost={cost:.2f}s err={repr(e)}")
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
         except Exception as e:
-            logging.warning(f"未知请求异常: {url} params={params} err={repr(e)}")
+            cost = time.time() - start_ts
+            logging.warning(f"未知请求异常: url={url} params={params} cost={cost:.2f}s err={repr(e)}")
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
 
     logging.error(f"请求最终失败: {url}")
@@ -317,33 +296,53 @@ def wbi_request(url, params, header):
         return safe_request(url, params, header)
 
 
-def get_following_list(uid, header):
-    following = []
-    pn = 1
-    ps = 50
+def get_scan_interval():
+    global burst_end_time, consecutive_failures, last_new_dynamic_time, consecutive_no_update_rounds
 
-    while True:
-        params = {"vmid": uid, "pn": pn, "ps": ps, "order": "desc", "order_type": "attention"}
-        data = safe_request("https://api.bilibili.com/x/relation/followings", params, header)
-        if data.get("code") != 0:
-            break
+    now = time.time()
 
-        items = data.get("data", {}).get("list", [])
-        if not items:
-            break
+    if consecutive_failures >= FAILURE_SLOWDOWN_THRESHOLD:
+        return random.uniform(FAILURE_SLOW_INTERVAL_MIN, FAILURE_SLOW_INTERVAL_MAX)
 
-        for item in items:
-            mid = item.get("mid")
-            if mid:
-                following.append(str(mid))
+    if now < burst_end_time:
+        return random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
 
-        if len(items) < ps:
-            break
+    if consecutive_no_update_rounds >= NO_UPDATE_SLOWDOWN_THRESHOLD_2:
+        return random.uniform(NO_UPDATE_INTERVAL_2_MIN, NO_UPDATE_INTERVAL_2_MAX)
 
-        pn += 1
-        time.sleep(random.uniform(0.6, 1.2))
+    if consecutive_no_update_rounds >= NO_UPDATE_SLOWDOWN_THRESHOLD_1:
+        return random.uniform(NO_UPDATE_INTERVAL_1_MIN, NO_UPDATE_INTERVAL_1_MAX)
 
-    return following
+    if last_new_dynamic_time > 0 and now - last_new_dynamic_time >= IDLE_MODE_THRESHOLD:
+        return random.uniform(IDLE_INTERVAL_MIN, IDLE_INTERVAL_MAX)
+
+    return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
+
+
+def trigger_burst_mode():
+    global burst_end_time, last_burst_trigger_time, burst_chain_count
+
+    now = time.time()
+
+    if now - last_burst_trigger_time < BURST_COOLDOWN:
+        if now < burst_end_time and burst_chain_count < BURST_MAX_CHAIN:
+            burst_end_time = max(burst_end_time, now + BURST_MODE_DURATION)
+            burst_chain_count += 1
+            logging.info(f"🚀 爆发续期，chain={burst_chain_count}, until={int(burst_end_time)}")
+        return
+
+    burst_end_time = now + BURST_MODE_DURATION
+    last_burst_trigger_time = now
+    burst_chain_count = 1
+    logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
+
+
+def exit_burst_mode(reason=""):
+    global burst_end_time, burst_chain_count
+    if time.time() < burst_end_time:
+        logging.info(f"🛑 退出爆发模式 reason={reason}")
+    burst_end_time = 0
+    burst_chain_count = 0
 
 
 def load_following_cache():
@@ -422,10 +421,7 @@ def clean_old_seen(seen_dynamic_ids):
 
 
 def init_seen_comments():
-    return {
-        "set": set(),
-        "queue": deque()
-    }
+    return {"set": set(), "queue": deque()}
 
 
 def add_seen_comment(seen_comments, rpid):
@@ -443,10 +439,6 @@ def add_seen_comment(seen_comments, rpid):
         s.discard(old)
 
     return True
-
-
-def has_seen_comment(seen_comments, rpid):
-    return rpid in seen_comments["set"]
 
 
 def prune_seen_comments(seen_comments):
@@ -545,6 +537,7 @@ def extract_dynamic_text(item):
                     "RICH_TEXT_NODE_TYPE_LOTTERY"
                 )
             ).strip()
+            text = normalize_text(text)
             if text:
                 return text
 
@@ -553,49 +546,68 @@ def extract_dynamic_text(item):
 
         if t == "MAJOR_TYPE_ARCHIVE":
             a = major.get("archive") or {}
-            return f"【视频】{a.get('title', '')}\n{a.get('desc', '')}".strip()
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【视频】{title}\n{desc_text}"
+            return f"【视频】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_ARTICLE":
             a = major.get("article", {}) or {}
-            return f"【专栏】{a.get('title', '')}\n{a.get('desc', '')}".strip()
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【专栏】{title}\n{desc_text}"
+            return f"【专栏】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
             nodes = summary.get("rich_text_nodes") or []
             text = "".join(n.get("text", "") for n in nodes if isinstance(n, dict)).strip()
-            title = opus.get("title") or ""
+            text = normalize_text(text)
+            title = normalize_text(opus.get("title") or "")
             if title and text:
-                return f"【图文】{title}\n{text}".strip()
+                return f"【图文】{title}\n{text}"
             return text or f"【图文】{title}".strip()
 
         if t == "MAJOR_TYPE_DRAW":
-            desc_text = desc.get("text", "").strip()
-            if desc_text:
-                return desc_text
-            return "【图片动态】"
+            desc_text = normalize_text(desc.get("text", ""))
+            return desc_text or "【图片动态】"
 
         if t == "MAJOR_TYPE_COMMON":
             common = major.get("common", {}) or {}
-            return f"【卡片】{common.get('title', '')}\n{common.get('desc', '')}".strip()
+            title = normalize_text(common.get("title", ""))
+            desc_text = normalize_text(common.get("desc", ""))
+            if title and desc_text:
+                return f"【卡片】{title}\n{desc_text}"
+            return f"【卡片】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_LIVE":
             live = major.get("live", {}) or {}
-            return f"【直播】{live.get('title', '')}\n{live.get('desc_second', '')}".strip()
+            title = normalize_text(live.get("title", ""))
+            desc_text = normalize_text(live.get("desc_second", ""))
+            if title and desc_text:
+                return f"【直播】{title}\n{desc_text}"
+            return f"【直播】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_PGC":
             pgc = major.get("pgc", {}) or {}
-            return f"【PGC】{pgc.get('title', '')}".strip()
+            return normalize_text(f"【PGC】{pgc.get('title', '')}")
 
         if t == "MAJOR_TYPE_COURSES":
             c = major.get("courses", {}) or {}
-            return f"【课程】{c.get('title', '')}\n{c.get('desc', '')}".strip()
+            title = normalize_text(c.get("title", ""))
+            desc_text = normalize_text(c.get("desc", ""))
+            if title and desc_text:
+                return f"【课程】{title}\n{desc_text}"
+            return f"【课程】{title or desc_text}".strip()
 
         if t == "MAJOR_TYPE_MUSIC":
             m = major.get("music", {}) or {}
-            return f"【音频】{m.get('title', '')}".strip()
+            return normalize_text(f"【音频】{m.get('title', '')}")
 
-        return desc.get("text", "").strip()
+        return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
 
@@ -604,27 +616,36 @@ def format_dynamic_message(item):
     dyn_id = item.get("id_str", "")
     author = item.get("modules", {}).get("module_author", {}) or {}
     name = author.get("name", "未知UP")
-    pub_ts = author.get("pub_ts", 0)
+    pub_ts = int(author.get("pub_ts", 0) or 0)
 
-    text = extract_dynamic_text(item)
+    text = cut_text(extract_dynamic_text(item), 900)
+    dynamic_type = item.get("type", "")
 
-    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+    if dynamic_type == "DYNAMIC_TYPE_FORWARD":
         orig = item.get("orig")
         if orig and isinstance(orig, dict):
-            orig_text = extract_dynamic_text(orig)
+            orig_text = cut_text(extract_dynamic_text(orig), 300)
             if orig_text:
-                text = f"{text}\n【转发原文】{orig_text}" if text else f"【转发原文】{orig_text}"
+                if text:
+                    text = f"{text}\n\n【转发原文】\n{orig_text}"
+                else:
+                    text = f"【转发原文】\n{orig_text}"
             orig_id = orig.get("id_str")
             if orig_id:
-                text = f"{text}\n【原动态链接】https://t.bilibili.com/{orig_id}"
+                text = f"{text}\n\n原动态： https://t.bilibili.com/{orig_id}"
+
+    if not text:
+        text = "（该动态无可提取正文）"
 
     time_str = datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S") if pub_ts > 0 else "未知时间"
-    final_msg = (
-        f"{text}\n\n📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-        if text else
-        f"📅 发布于: {time_str}\n🔗 直达链接: https://t.bilibili.com/{dyn_id}"
-    )
-    return name, final_msg
+
+    return {
+        "user": name,
+        "message": text,
+        "time": time_str,
+        "link": f"https://t.bilibili.com/{dyn_id}",
+        "kind": "dynamic"
+    }
 
 
 def safe_enqueue_push(item):
@@ -637,6 +658,42 @@ def safe_enqueue_push(item):
     except Exception as e:
         logging.error(f"推送入队失败: {repr(e)}")
         return False
+
+
+def push_worker():
+    while True:
+        try:
+            item = push_queue.get(timeout=1)
+            if not item:
+                continue
+
+            logging.info(
+                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
+                f"time={item.get('time', '')} link={item.get('link', '')}"
+            )
+
+            ok = notifier.send_webhook_notification(
+                "特别关注UP主发布新内容",
+                [item],
+                notify_type="dynamic"
+            )
+
+            if ok:
+                logging.info(
+                    f"[推送队列] 发送成功 user={item.get('user', '未知UP')} "
+                    f"link={item.get('link', '')}"
+                )
+            else:
+                logging.warning(
+                    f"[推送队列] 发送失败 user={item.get('user', '未知UP')} "
+                    f"link={item.get('link', '')}"
+                )
+
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logging.error(f"推送失败: {repr(e)}")
+            logging.error(traceback.format_exc())
 
 
 def fetch_following_feed(header, offset="", update_baseline=""):
@@ -672,6 +729,35 @@ def check_feed_update(header, update_baseline):
         "web_location": "333.1365"
     }
     return safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params, header)
+
+
+def get_following_list(uid, header):
+    following = []
+    pn = 1
+    ps = 50
+
+    while True:
+        params = {"vmid": uid, "pn": pn, "ps": ps, "order": "desc", "order_type": "attention"}
+        data = safe_request("https://api.bilibili.com/x/relation/followings", params, header)
+        if data.get("code") != 0:
+            break
+
+        items = data.get("data", {}).get("list", [])
+        if not items:
+            break
+
+        for item in items:
+            mid = item.get("mid")
+            if mid:
+                following.append(str(mid))
+
+        if len(items) < ps:
+            break
+
+        pn += 1
+        time.sleep(random.uniform(0.6, 1.2))
+
+    return following
 
 
 def init_feed_state(header, target_uids):
@@ -770,21 +856,29 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             author_mid = str(author.get("mid", ""))
             pub_ts = int(author.get("pub_ts", 0) or 0)
+            top_type = item.get("type", "")
+
+            logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
 
             if author_mid not in target_uids:
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
 
             if not is_allowed_dynamic(item):
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=类型不允许")
                 continue
 
             if is_recent_pushed(state, dyn_id):
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=recent_pushed")
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 continue
 
             if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
+                logging.info(f"[动态命中] dyn_id={dyn_id} 进入候选")
                 new_items.add(dyn_id)
                 candidate_items[dyn_id] = item
-
+            else:
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不是新动态候选")
         except Exception as e:
             logging.warning(f"处理单条动态异常: {repr(e)}")
 
@@ -801,14 +895,17 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             pub_ts = int(author.get("pub_ts", 0) or 0)
 
-            name, final_msg = format_dynamic_message(item)
-            ok = safe_enqueue_push({"user": name, "message": final_msg})
+            push_data = format_dynamic_message(item)
+            ok = safe_enqueue_push(push_data)
             if ok:
                 pushed_ids.add(dyn_id)
                 add_recent_pushed_id(state, dyn_id)
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 has_new = True
-                logging.info(f"✅ 新动态 [{name}] {dyn_id}")
+                logging.info(
+                    f"✅ 新动态 user={push_data.get('user', '未知UP')} dyn_id={dyn_id} "
+                    f"pub_time={push_data.get('time', '')} link={push_data.get('link', '')}"
+                )
             else:
                 logging.warning(f"动态入队失败，放弃推送 dyn_id={dyn_id}")
         except Exception as e:
@@ -838,13 +935,15 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     baseline = feed_state.get("baseline", "")
     old_baseline = baseline
 
+    logging.info(f"[动态扫描] 开始检查 update, baseline={baseline or 'EMPTY'}")
+
     update_data = check_feed_update(header, baseline)
     direct_fallback = False
 
     if update_data.get("code") != 0:
         consecutive_failures += 1
         logging.warning(
-            f"update 接口失败 code={update_data.get('code')}，连续失败={consecutive_failures}，退化到首页兜底"
+            f"[动态扫描] update 接口失败 code={update_data.get('code')}，连续失败={consecutive_failures}，退化到首页兜底"
         )
         direct_fallback = True
         if consecutive_failures >= FAILURE_EXIT_BURST:
@@ -853,8 +952,11 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         update_num = update_data.get("data", {}).get("update_num", 0)
         consecutive_failures = 0
 
+        logging.info(f"[动态扫描] update 接口成功，update_num={update_num}")
+
         if update_num <= 0:
             consecutive_no_update_rounds += 1
+            logging.info(f"[动态扫描] 无更新，no_update_rounds={consecutive_no_update_rounds}")
             return False
 
         consecutive_no_update_rounds = 0
@@ -868,12 +970,14 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     any_success_page = False
 
     while page_count < FEED_FETCH_MAX_PAGES:
+        logging.info(f"[动态扫描] 拉取第 {page_count + 1} 页，offset={offset or 'EMPTY'}")
         data = fetch_following_feed_retry(header, offset=offset)
+
         if data.get("code") != 0:
             consecutive_failures += 1
             completed = False
             logging.warning(
-                f"关注流拉取失败 page={page_count + 1} code={data.get('code')} 连续失败={consecutive_failures}"
+                f"[动态扫描] 关注流拉取失败 page={page_count + 1} code={data.get('code')} 连续失败={consecutive_failures}"
             )
             if consecutive_failures >= FAILURE_EXIT_BURST:
                 exit_burst_mode("feed_page_failed")
@@ -884,15 +988,21 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         feed = data.get("data", {}) or {}
         items = feed.get("items") or []
+        logging.info(f"[动态扫描] 第 {page_count + 1} 页返回 items={len(items)}")
+
         if not items:
+            logging.info(f"[动态扫描] 第 {page_count + 1} 页无 items，结束")
             break
 
         if page_count == 0:
             first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
             if first_page_baseline:
                 candidate_baseline = first_page_baseline
+            logging.info(f"[动态扫描] 候选 baseline={candidate_baseline or 'EMPTY'}")
 
         page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
+        logging.info(f"[动态扫描] 第 {page_count + 1} 页处理完成，page_has_new={page_has_new}")
+
         if page_has_new:
             has_new = True
 
@@ -903,27 +1013,50 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
                     continue
                 if item.get("id_str") == old_baseline:
                     reached_old = True
+                    logging.info(f"[动态扫描] 命中旧 baseline={old_baseline}，停止翻页")
                     break
 
         offset = feed.get("offset", "")
         page_count += 1
 
         if direct_fallback:
+            logging.info("[动态扫描] 当前为 fallback 模式，只拉首页后结束")
             break
         if reached_old:
             break
         if not offset:
+            logging.info("[动态扫描] offset 为空，停止翻页")
             break
 
         time.sleep(random.uniform(0.4, 0.8))
+
+    if not has_new and not direct_fallback:
+        try:
+            logging.info("[动态扫描] 本轮检测到 update 但未命中新动态，1秒后补拉首页确认")
+            time.sleep(1.0)
+            retry_data = fetch_following_feed_retry(header, offset="")
+            if retry_data.get("code") == 0:
+                retry_items = (retry_data.get("data", {}) or {}).get("items") or []
+                logging.info(f"[动态扫描] 二次确认首页返回 items={len(retry_items)}")
+                if retry_items:
+                    retry_has_new = process_feed_items(
+                        retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
+                    )
+                    if retry_has_new:
+                        has_new = True
+                        logging.info("[动态扫描] 二次确认补拉命中新动态")
+        except Exception as e:
+            logging.warning(f"[动态扫描] 二次确认补拉异常: {repr(e)}")
 
     if completed and any_success_page:
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
         feed_state["offset"] = offset
+        logging.info(f"[动态扫描] baseline 已更新为 {feed_state['baseline']}, offset={offset or 'EMPTY'}")
     else:
-        logging.warning("本轮关注流未完整成功，baseline 不前移")
+        logging.warning("[动态扫描] 本轮关注流未完整成功，baseline 不前移")
 
+    logging.info(f"[动态扫描] 本轮结束 has_new={has_new}")
     return has_new
 
 
@@ -1110,16 +1243,6 @@ def refresh_cookie():
         return False
 
 
-def send_failure_notification(title, message):
-    key = f"{title}:{message[:100]}"
-    if time.time() - _last_notify_time.get(key, 0) >= 600:
-        _last_notify_time[key] = time.time()
-        try:
-            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
-        except Exception:
-            pass
-
-
 def start_monitoring(header):
     global last_state_save, last_seen_clean, last_new_dynamic_time
 
@@ -1153,7 +1276,7 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（同秒防漏 + baseline延迟提交 + update失败兜底 + recent pushed持久化）")
+    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
     logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
     logging.info("✅ 连续无更新自适应降速已启用")
     logging.info("✅ 评论去重结构优化已启用（set + deque）")
