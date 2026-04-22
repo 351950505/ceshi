@@ -25,30 +25,35 @@ SOURCE_UID = 3706948578969654
 
 FALLBACK_DYNAMIC_UIDS = ["3546905852250875", "3546961271589219", "3546610447419885", "285340365", "3706948578969654"]
 
-# ===== 评论监控配置（增强版：接近零漏） =====
-COMMENT_SCAN_INTERVAL = 5              # 常规扫描间隔：5秒
-COMMENT_NORMAL_PAGES = 1               # 常规扫描只扫1页
-COMMENT_RESCAN_INTERVAL = 60           # 每60秒补扫一次
-COMMENT_RESCAN_PAGES = 2               # 补扫前2页
-COMMENT_STARTUP_LOOKBACK = 300         # 启动时补扫最近5分钟
-COMMENT_SAFE_WINDOW = 60               # 安全窗口：避免边界漏
-COMMENT_MAX_RETRY_PAGES = 3            # 单次最多允许扫描页数上限保护
-MAX_SEEN_COMMENTS = 5000               # 评论去重缓存上限
+# ===== 评论监控配置（保留增强版） =====
+COMMENT_SCAN_INTERVAL = 5
+COMMENT_NORMAL_PAGES = 1
+COMMENT_RESCAN_INTERVAL = 60
+COMMENT_RESCAN_PAGES = 2
+COMMENT_STARTUP_LOOKBACK = 300
+COMMENT_SAFE_WINDOW = 60
+COMMENT_MAX_RETRY_PAGES = 3
+MAX_SEEN_COMMENTS = 5000
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
-# 最稳24小时参数（已调松防漏+防风控）
+# 动态参数
 INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
 STATE_SAVE_INTERVAL = 30
 BURST_MODE_DURATION = 18
-BURST_INTERVAL = 1.6
-NORMAL_INTERVAL = 2.0
+BURST_INTERVAL_MIN = 1.4
+BURST_INTERVAL_MAX = 1.9
+NORMAL_INTERVAL_MIN = 1.8
+NORMAL_INTERVAL_MAX = 2.4
 
 MAX_SEEN_DYNAMIC_IDS = 3000
-DYNAMIC_NEW_WINDOW = 300          # 仅推送最近5分钟内的动态
-FEED_FETCH_MAX_PAGES = 3          # 检测到更新后最多补抓页数
+DYNAMIC_NEW_WINDOW = 300
+FEED_FETCH_MAX_PAGES = 3
+FEED_INIT_PAGES = 2
+RECENT_PUSHED_IDS_LIMIT = 1000
+LAST_TS_IDS_LIMIT = 100
 # =============================================
 
 push_queue = queue.Queue()
@@ -70,7 +75,9 @@ def push_worker():
 
 def get_scan_interval():
     global burst_end_time
-    return BURST_INTERVAL if time.time() < burst_end_time else NORMAL_INTERVAL
+    if time.time() < burst_end_time:
+        return random.uniform(BURST_INTERVAL_MIN, BURST_INTERVAL_MAX)
+    return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
 
 def init_logging():
     if os.path.exists(LOG_FILE):
@@ -84,7 +91,7 @@ def init_logging():
         filemode="w"
     )
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流 feed/all 版 - 防漏动态 + 评论增强补扫版)")
+    logging.info("B站监控系统启动 (动态增强版 + 评论增强版)")
     logging.info("=" * 60)
 
 def safe_request(url, params, header, retries=5):
@@ -113,7 +120,7 @@ def safe_request(url, params, header, retries=5):
             logging.warning(f"请求异常: {url} params={params} err={e}")
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
     logging.error("请求最终失败")
-    send_failure_notification("API 请求最终失败", "所有重试均失败")
+    send_failure_notification("API 请求最终失败", f"{url} 所有重试均失败")
     return {"code": -500}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
@@ -194,8 +201,10 @@ def load_dynamic_state():
     default_state = {
         "feed": {
             "last_ts": 0,
+            "last_ts_ids": [],
             "baseline": "",
-            "offset": ""
+            "offset": "",
+            "recent_pushed_ids": []
         }
     }
     if os.path.exists(DYNAMIC_STATE_FILE):
@@ -209,9 +218,11 @@ def load_dynamic_state():
                 feed = {}
             return {
                 "feed": {
-                    "last_ts": feed.get("last_ts", 0),
+                    "last_ts": int(feed.get("last_ts", 0) or 0),
+                    "last_ts_ids": list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT],
                     "baseline": feed.get("baseline", ""),
-                    "offset": feed.get("offset", "")
+                    "offset": feed.get("offset", ""),
+                    "recent_pushed_ids": list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
                 }
             }
         except:
@@ -219,6 +230,9 @@ def load_dynamic_state():
     return default_state
 
 def save_dynamic_state(state):
+    feed = state.setdefault("feed", {})
+    feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
+    feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
     with open(DYNAMIC_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
@@ -235,6 +249,46 @@ def clean_old_seen_comments(seen_comments):
         return seen_comments
     trimmed = set(list(seen_comments)[-MAX_SEEN_COMMENTS:])
     return trimmed
+
+def add_recent_pushed_id(state, dyn_id):
+    feed = state.setdefault("feed", {})
+    recent = list(feed.get("recent_pushed_ids", []) or [])
+    if dyn_id in recent:
+        recent.remove(dyn_id)
+    recent.insert(0, dyn_id)
+    feed["recent_pushed_ids"] = recent[:RECENT_PUSHED_IDS_LIMIT]
+
+def is_recent_pushed(state, dyn_id):
+    feed = state.setdefault("feed", {})
+    recent = feed.get("recent_pushed_ids", []) or []
+    return dyn_id in recent
+
+def update_last_ts_state(feed_state, dyn_id, pub_ts):
+    last_ts = int(feed_state.get("last_ts", 0) or 0)
+    last_ts_ids = list(feed_state.get("last_ts_ids", []) or [])
+
+    if pub_ts > last_ts:
+        feed_state["last_ts"] = pub_ts
+        feed_state["last_ts_ids"] = [dyn_id]
+    elif pub_ts == last_ts:
+        if dyn_id not in last_ts_ids:
+            last_ts_ids.append(dyn_id)
+            feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_IDS_LIMIT]
+
+def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
+    last_ts = int(feed_state.get("last_ts", 0) or 0)
+    last_ts_ids = set(feed_state.get("last_ts_ids", []) or [])
+
+    if now_ts - pub_ts > DYNAMIC_NEW_WINDOW:
+        return False
+
+    if pub_ts > last_ts:
+        return True
+
+    if pub_ts == last_ts and dyn_id not in last_ts_ids:
+        return True
+
+    return False
 
 def extract_dynamic_text(item):
     try:
@@ -349,6 +403,16 @@ def fetch_following_feed(header, offset="", update_baseline=""):
         params["update_baseline"] = update_baseline
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
 
+def fetch_following_feed_retry(header, offset="", update_baseline="", retries=2):
+    last = None
+    for _ in range(retries + 1):
+        data = fetch_following_feed(header, offset=offset, update_baseline=update_baseline)
+        last = data
+        if data.get("code") == 0:
+            return data
+        time.sleep(random.uniform(0.8, 1.6))
+    return last or {"code": -500}
+
 def check_feed_update(header, update_baseline):
     params = {
         "type": "all",
@@ -362,14 +426,21 @@ def init_feed_state(header, target_uids):
     seen_dynamic_ids = {}
 
     try:
-        data = fetch_following_feed(header, offset="")
-        if data.get("code") == 0:
+        max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
+        offset = ""
+        baseline = state.get("feed", {}).get("baseline", "")
+
+        for page_idx in range(FEED_INIT_PAGES):
+            data = fetch_following_feed_retry(header, offset=offset)
+            if data.get("code") != 0:
+                logging.warning(f"关注流初始化第 {page_idx + 1} 页失败 code={data.get('code')}")
+                break
+
             feed = data.get("data", {}) or {}
             items = feed.get("items") or []
 
-            baseline = feed.get("update_baseline", "")
-            offset = feed.get("offset", "")
-            max_ts = 0
+            if page_idx == 0:
+                baseline = feed.get("update_baseline", "") or baseline
 
             for item in items:
                 if not isinstance(item, dict):
@@ -380,18 +451,26 @@ def init_feed_state(header, target_uids):
 
                 author = item.get("modules", {}).get("module_author", {}) or {}
                 author_mid = str(author.get("mid", ""))
-                pub_ts = author.get("pub_ts", 0)
+                pub_ts = int(author.get("pub_ts", 0) or 0)
                 if author_mid in target_uids and pub_ts > max_ts:
                     max_ts = pub_ts
 
-            state["feed"]["baseline"] = baseline
-            state["feed"]["offset"] = offset
-            state["feed"]["last_ts"] = max_ts
-            save_dynamic_state(state)
+            offset = feed.get("offset", "")
+            if not offset or not items:
+                break
 
-            logging.info(f"关注流初始化完成 baseline={baseline} offset={offset} last_ts={max_ts}")
-        else:
-            logging.warning(f"关注流初始化失败，code={data.get('code')}")
+            time.sleep(random.uniform(0.4, 0.8))
+
+        state["feed"]["baseline"] = baseline
+        state["feed"]["offset"] = offset
+        state["feed"]["last_ts"] = max_ts
+        if "last_ts_ids" not in state["feed"]:
+            state["feed"]["last_ts_ids"] = []
+        if "recent_pushed_ids" not in state["feed"]:
+            state["feed"]["recent_pushed_ids"] = []
+        save_dynamic_state(state)
+
+        logging.info(f"关注流初始化完成 baseline={baseline} offset={offset} last_ts={max_ts}")
     except Exception as e:
         logging.error(f"关注流初始化异常: {e}")
 
@@ -400,11 +479,16 @@ def init_feed_state(header, target_uids):
 def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
     global burst_end_time
     has_new = False
-    feed_state = state.setdefault("feed", {"last_ts": 0, "baseline": "", "offset": ""})
-    last_ts = feed_state.get("last_ts", 0)
-    max_ts = last_ts
+    feed_state = state.setdefault("feed", {
+        "last_ts": 0,
+        "last_ts_ids": [],
+        "baseline": "",
+        "offset": "",
+        "recent_pushed_ids": []
+    })
 
-    new_items = []
+    candidate_items = {}
+    new_items = set()
 
     for item in items:
         if not isinstance(item, dict):
@@ -418,35 +502,36 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
 
         author = item.get("modules", {}).get("module_author", {}) or {}
         author_mid = str(author.get("mid", ""))
-        pub_ts = author.get("pub_ts", 0)
+        pub_ts = int(author.get("pub_ts", 0) or 0)
 
         if author_mid not in target_uids:
             continue
 
-        if pub_ts > max_ts:
-            max_ts = pub_ts
-
-        if dyn_id in new_items:
+        if is_recent_pushed(state, dyn_id):
+            update_last_ts_state(feed_state, dyn_id, pub_ts)
             continue
 
-        if pub_ts > last_ts and (now_ts - pub_ts <= DYNAMIC_NEW_WINDOW):
-            new_items.append(dyn_id)
-
-    if max_ts > last_ts:
-        feed_state["last_ts"] = max_ts
+        if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
+            new_items.add(dyn_id)
+            candidate_items[dyn_id] = item
 
     pushed_ids = set()
-    for item in items:
-        if not isinstance(item, dict):
+    for dyn_id in new_items:
+        if dyn_id in pushed_ids:
             continue
 
-        dyn_id = item.get("id_str")
-        if not dyn_id or dyn_id not in new_items or dyn_id in pushed_ids:
+        item = candidate_items.get(dyn_id)
+        if not item:
             continue
+
+        author = item.get("modules", {}).get("module_author", {}) or {}
+        pub_ts = int(author.get("pub_ts", 0) or 0)
 
         name, final_msg = format_dynamic_message(item)
         push_queue.put({"user": name, "message": final_msg})
         pushed_ids.add(dyn_id)
+        add_recent_pushed_id(state, dyn_id)
+        update_last_ts_state(feed_state, dyn_id, pub_ts)
         has_new = True
         logging.info(f"✅ 新动态 [{name}] {dyn_id}")
 
@@ -457,28 +542,40 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
     return has_new
 
 def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
-    feed_state = state.setdefault("feed", {"last_ts": 0, "baseline": "", "offset": ""})
+    feed_state = state.setdefault("feed", {
+        "last_ts": 0,
+        "last_ts_ids": [],
+        "baseline": "",
+        "offset": "",
+        "recent_pushed_ids": []
+    })
     baseline = feed_state.get("baseline", "")
     old_baseline = baseline
 
     update_data = check_feed_update(header, baseline)
+    direct_fallback = False
+
     if update_data.get("code") != 0:
-        return False
-
-    update_num = update_data.get("data", {}).get("update_num", 0)
-    if update_num <= 0:
-        return False
-
-    logging.info(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
+        logging.warning(f"update 接口失败 code={update_data.get('code')}，退化到首页兜底")
+        direct_fallback = True
+    else:
+        update_num = update_data.get("data", {}).get("update_num", 0)
+        if update_num <= 0:
+            return False
+        logging.info(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
 
     has_new = False
     offset = ""
     page_count = 0
     first_page_baseline = ""
+    candidate_baseline = baseline
+    completed = True
 
     while page_count < FEED_FETCH_MAX_PAGES:
-        data = fetch_following_feed(header, offset=offset)
+        data = fetch_following_feed_retry(header, offset=offset)
         if data.get("code") != 0:
+            completed = False
+            logging.warning(f"关注流拉取失败 page={page_count + 1} code={data.get('code')}")
             break
 
         feed = data.get("data", {}) or {}
@@ -489,25 +586,26 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         if page_count == 0:
             first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
             if first_page_baseline:
-                feed_state["baseline"] = first_page_baseline
+                candidate_baseline = first_page_baseline
 
         page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
         if page_has_new:
             has_new = True
 
         reached_old = False
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("id_str") == old_baseline:
-                reached_old = True
-                break
+        if old_baseline:
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id_str") == old_baseline:
+                    reached_old = True
+                    break
 
         offset = feed.get("offset", "")
-        feed_state["offset"] = offset
-
         page_count += 1
 
+        if direct_fallback:
+            break
         if reached_old:
             break
         if not offset:
@@ -515,16 +613,16 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         time.sleep(random.uniform(0.4, 0.8))
 
+    if completed:
+        if candidate_baseline:
+            feed_state["baseline"] = candidate_baseline
+        feed_state["offset"] = offset
+    else:
+        logging.warning("本轮关注流未完整成功，baseline 不前移")
+
     return has_new
 
 def scan_comments_pages(oid, header, last_read_time, seen, max_pages=1, startup_mode=False):
-    """
-    评论扫描增强版：
-    - 常规模式：扫1页
-    - 补扫模式：扫前2页
-    - 启动模式：只处理最近 COMMENT_STARTUP_LOOKBACK 秒内的评论
-    - 使用 seen(rpid) 去重
-    """
     new_list = []
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
@@ -587,12 +685,6 @@ def scan_comments_pages(oid, header, last_read_time, seen, max_pages=1, startup_
     return new_list, max_ctime
 
 def startup_backfill_comments(oid, title, header, seen_comments):
-    """
-    启动补扫：
-    - 扫前2页
-    - 只处理最近5分钟评论
-    - 去重后推送
-    """
     if not oid:
         return int(time.time())
 
@@ -711,7 +803,6 @@ def start_monitoring(header):
     seen_comments = set()
     last_read_time = int(time.time())
 
-    # 启动补扫评论：最近5分钟，前2页
     if oid:
         last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
 
@@ -727,17 +818,16 @@ def start_monitoring(header):
     seen_dynamic_ids, state = init_feed_state(header, target_uids)
 
     threading.Thread(target=push_worker, daemon=True).start()
-    logging.info("✅ 关注流版启动（feed/all/update + feed/all + 补抓防漏）")
+    logging.info("✅ 动态增强版启动（同秒防漏 + baseline延迟提交 + update失败兜底 + recent pushed持久化）")
     logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
 
     while True:
         try:
             now = time.time()
 
-            # 动态扫描：先update，再feed/all
             if now - last_d_check >= get_scan_interval():
                 try:
-                    state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, now)
+                    state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, int(now))
                     if state_updated or now - last_state_save > STATE_SAVE_INTERVAL:
                         save_dynamic_state(state)
                         last_state_save = now
@@ -745,7 +835,6 @@ def start_monitoring(header):
                     logging.error(f"关注流扫描异常: {e}")
                 last_d_check = now
 
-            # 刷新关注列表
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 new_list = get_following_list(SOURCE_UID, header)
                 if new_list:
@@ -771,7 +860,6 @@ def start_monitoring(header):
 
                 last_following_refresh = now
 
-            # 评论常规扫描：每5秒扫1页
             if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
                 new_c, new_t = scan_comments_pages(
                     oid=oid,
@@ -790,7 +878,6 @@ def start_monitoring(header):
                     notifier.send_webhook_notification(title, payload)
                     logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
 
-            # 评论定时补扫：每60秒扫前2页
             if oid and now - last_comment_rescan >= COMMENT_RESCAN_INTERVAL:
                 new_c, new_t = scan_comments_pages(
                     oid=oid,
