@@ -34,12 +34,12 @@ LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
-# 最稳参数
+# 最稳 + 漏动态修复参数
 INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.0, 6.0
 STATE_SAVE_INTERVAL = 30
-BURST_MODE_DURATION = 18      # 爆发模式持续时间
-BURST_INTERVAL = 1.5          # 爆发模式扫描间隔（最稳）
-NORMAL_INTERVAL = 1.8         # 普通模式扫描间隔
+BURST_MODE_DURATION = 18
+BURST_INTERVAL = 1.3          # 爆发模式（修复漏动态）
+NORMAL_INTERVAL = 1.6         # 普通模式
 MAX_SEEN_PER_UID = 800
 # =============================================
 
@@ -70,7 +70,7 @@ def init_logging():
                         format="%(asctime)s [%(levelname)s] %(message)s",
                         encoding="utf-8", filemode="w")
     logging.info("="*60)
-    logging.info("B站监控系统启动 (最稳方案 + 工作时间限制)")
+    logging.info("B站监控系统启动 (24小时运行 + 漏动态修复版)")
     logging.info("="*60)
 
 def safe_request(url, params, header, retries=5):
@@ -365,18 +365,6 @@ def sync_latest_video(header):
         return oid, title
     return None, None
 
-def is_work_time(now=None):
-    if now is None: now = datetime.datetime.now()
-    if now.weekday() >= 5: return False
-    return datetime.time(8, 30) <= now.time() <= datetime.time(17, 0)
-
-def get_sleep_until_work_time(now=None):
-    if now is None: now = datetime.datetime.now()
-    target = datetime.datetime(now.year, now.month, now.day, 8, 30)
-    if now > target: target += datetime.timedelta(days=1)
-    while target.weekday() >= 5: target += datetime.timedelta(days=1)
-    return max(1, (target - now).total_seconds())
-
 def get_header():
     try:
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
@@ -420,22 +408,16 @@ def start_monitoring(header):
     seen_dynamics = init_dynamic_states_for_uids(following_list, header)
     state = load_dynamic_state()
     threading.Thread(target=push_worker, daemon=True).start()
-    logging.info("✅ 扫描与推送线程已彻底分离（最稳方案）")
-    batch_index = 0
+    logging.info("✅ 扫描与推送线程已彻底分离（24小时 + 漏动态修复）")
     while True:
         try:
             now_dt = datetime.datetime.now()
-            if not is_work_time(now_dt):
-                time.sleep(get_sleep_until_work_time(now_dt))
-                header = get_header()
-                update_wbi_keys(header)
-                continue
+            # 24小时运行（已取消工作时间限制）
             now = time.time()
+            # 动态扫描（修复漏动态：每轮扫描所有UID）
             if now - last_d_check >= get_scan_interval():
-                batch_size = 28 if 928 <= (now_dt.hour*100 + now_dt.minute) <= 1000 else 20
-                batch = following_list[batch_index*batch_size:(batch_index+1)*batch_size]
                 state_updated = False
-                for uid in batch:
+                for uid in following_list:
                     try:
                         if check_new_dynamics_for_uid(uid, header, seen_dynamics, state, now):
                             state_updated = True
@@ -444,9 +426,30 @@ def start_monitoring(header):
                 if state_updated and now - last_state_save > STATE_SAVE_INTERVAL:
                     save_dynamic_state(state)
                     last_state_save = now
-                batch_index = (batch_index + 1) % max(1, len(following_list)//batch_size + 1)
                 last_d_check = now
+            # 刷新关注列表（新UID立即初始化）
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
+                new_list = get_following_list(SOURCE_UID, header)
+                if new_list:
+                    new_list = [str(uid) for uid in new_list]
+                    if str(SOURCE_UID) not in new_list:
+                        new_list.append(str(SOURCE_UID))
+                    old_set = set(following_list)
+                    new_set = set(new_list)
+                    added = new_set - old_set
+                    removed = old_set - new_set
+                    if added or removed:
+                        for uid in added:
+                            uid_str = str(uid)
+                            seen_dynamics[uid_str] = set()
+                            state[uid_str] = {"last_ts": 0, "baseline": "", "offset": ""}
+                            logging.info(f"新UID {uid_str} 已加入扫描")
+                        for uid in removed:
+                            seen_dynamics.pop(uid, None)
+                            state.pop(uid, None)
+                        following_list = new_list
+                        save_following_cache(following_list)
+                        save_dynamic_state(state)
                 last_following_refresh = now
             if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
                 new_c, new_t = scan_new_comments(oid, header, last_read_time, seen_comments)
