@@ -190,7 +190,8 @@ def init_logging():
                 "评论增强版启动",
                 "进入智能爆发模式",
                 "爆发续期",
-                "退出爆发模式"
+                "退出爆发模式",
+                "心跳正常"
             ]
             return any(k in msg for k in keywords)
 
@@ -233,7 +234,7 @@ def init_logging():
         lib_logger.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（完整精简版）")
+    logging.info("B站监控系统启动（最终精简版）")
     logging.info("=" * 60)
 
 
@@ -833,16 +834,15 @@ def init_feed_state(header, target_uids):
                 if not isinstance(item, dict):
                     continue
 
-                    dyn_id = item.get("id_str")
-                    if dyn_id:
-                        seen_dynamic_ids[dyn_id] = time.time()
+                dyn_id = item.get("id_str")
+                if dyn_id:
+                    seen_dynamic_ids[dyn_id] = time.time()
 
                 author = item.get("modules", {}).get("module_author", {}) or {}
                 author_mid = str(author.get("mid", ""))
                 pub_ts = int(author.get("pub_ts", 0) or 0)
 
                 if author_mid in target_uids:
-                    dyn_id = item.get("id_str")
                     if pub_ts > max_ts:
                         max_ts = pub_ts
                         max_ts_ids = {dyn_id} if dyn_id else set()
