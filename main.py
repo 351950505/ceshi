@@ -196,8 +196,15 @@ def init_logging():
             return any(k in msg for k in keywords)
 
     root_logger = logging.getLogger()
-    root_logger.handlers.clear()
     root_logger.setLevel(logging.INFO)
+
+    # 关键：彻底移除旧 handler，避免重复打印
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -218,6 +225,10 @@ def init_logging():
     root_logger.addHandler(error_file_handler)
     root_logger.addHandler(stream_handler)
 
+    # 防止 logging 自己再去重复传播
+    root_logger.propagate = False
+
+    # 压第三方日志
     for name in [
         "urllib3",
         "urllib3.connectionpool",
@@ -231,12 +242,19 @@ def init_logging():
     ]:
         lib_logger = logging.getLogger(name)
         lib_logger.setLevel(logging.WARNING)
+
+        for h in lib_logger.handlers[:]:
+            lib_logger.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+
         lib_logger.propagate = False
 
     logging.info("=" * 60)
     logging.info("B站监控系统启动（最终精简版）")
     logging.info("=" * 60)
-
 
 def send_failure_notification(title, message):
     key = f"{title}:{message[:100]}"
