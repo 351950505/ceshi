@@ -17,6 +17,7 @@ _session.headers.update({
 
 _cached_webhook = None
 
+
 if not logging.getLogger().handlers:
     logging.basicConfig(
         level=logging.INFO,
@@ -148,7 +149,7 @@ def post_dingtalk(payload, retries=2):
 
         except requests.RequestException as e:
             logging.error(
-                f"钉钉 webhook 请求异常 ({attempt+1}/{retries+1}): type={msgtype}, title={msgtitle}, error={e}"
+                f"钉钉 webhook 请求异常 ({attempt + 1}/{retries + 1}): type={msgtype}, title={msgtitle}, error={e}"
             )
             if attempt < retries:
                 time.sleep(1 + attempt + random.random())
@@ -157,7 +158,7 @@ def post_dingtalk(payload, retries=2):
 
         except Exception as e:
             logging.error(
-                f"钉钉 webhook 未知异常 ({attempt+1}/{retries+1}): type={msgtype}, title={msgtitle}, error={e}"
+                f"钉钉 webhook 未知异常 ({attempt + 1}/{retries + 1}): type={msgtype}, title={msgtitle}, error={e}"
             )
             if attempt < retries:
                 time.sleep(1 + attempt + random.random())
@@ -167,7 +168,7 @@ def post_dingtalk(payload, retries=2):
     return False
 
 
-def build_dynamic_markdown(title, items):
+def build_dynamic_markdown(items):
     lines = ["## B站动态更新", ""]
 
     for idx, item in enumerate(items, 1):
@@ -194,13 +195,8 @@ def build_dynamic_markdown(title, items):
     return truncate_text("\n".join(lines).strip(), MAX_MARKDOWN_LENGTH)
 
 
-def build_comment_markdown(video_title, comments):
-    lines = [
-        "## B站新评论",
-        "",
-        f"### {clean_text(video_title) or '未知视频'}",
-        ""
-    ]
+def build_comment_markdown(comments):
+    lines = ["## B站新评论", ""]
 
     for idx, c in enumerate(comments, 1):
         user = clean_text(c.get("user", "未知用户")) or "未知用户"
@@ -218,16 +214,36 @@ def build_comment_markdown(video_title, comments):
     return truncate_text("\n".join(lines).strip(), MAX_MARKDOWN_LENGTH)
 
 
-def send_webhook_notification(title, items, retries=2, notify_type="comment"):
+def detect_notify_type(items, notify_type):
+    if notify_type in ("dynamic", "comment"):
+        return notify_type
+
+    if not items:
+        return "comment"
+
+    first = items[0] if isinstance(items[0], dict) else {}
+
+    if first.get("kind") == "dynamic":
+        return "dynamic"
+
+    if first.get("link") or first.get("time"):
+        return "dynamic"
+
+    return "comment"
+
+
+def send_webhook_notification(title, items, retries=2, notify_type=None):
     if not isinstance(items, list):
         items = []
 
     if not items:
-        logging.info(f"没有可发送内容，跳过通知: type={notify_type}, title={title[:50]}")
+        logging.info("没有可发送内容，跳过通知")
         return False
 
-    if notify_type == "dynamic":
-        markdown_text = build_dynamic_markdown(title, items)
+    actual_type = detect_notify_type(items, notify_type)
+
+    if actual_type == "dynamic":
+        markdown_text = build_dynamic_markdown(items)
         payload = {
             "msgtype": "markdown",
             "markdown": {
@@ -237,7 +253,7 @@ def send_webhook_notification(title, items, retries=2, notify_type="comment"):
         }
         return post_dingtalk(payload, retries=retries)
 
-    markdown_text = build_comment_markdown(title, items)
+    markdown_text = build_comment_markdown(items)
     payload = {
         "msgtype": "markdown",
         "markdown": {
