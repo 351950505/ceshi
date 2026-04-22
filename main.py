@@ -194,34 +194,49 @@ def init_logging():
             ]
             return any(k in msg for k in keywords)
 
-    logger = logging.getLogger()
-    logger.handlers.clear()
-    logger.setLevel(logging.DEBUG)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    # 全量日志文件
+    # 全量日志文件：保留你自己的 DEBUG
     file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
-    # 错误日志文件
+    # 错误日志文件：只保留 WARNING / ERROR
     error_file_handler = logging.FileHandler(ERROR_LOG_FILE, mode="w", encoding="utf-8")
     error_file_handler.setLevel(logging.WARNING)
     error_file_handler.setFormatter(formatter)
 
-    # 控制台只看关键日志
+    # 控制台：只显示关键日志
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
     stream_handler.addFilter(ConsoleKeyFilter())
 
-    logger.addHandler(file_handler)
-    logger.addHandler(error_file_handler)
-    logger.addHandler(stream_handler)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(error_file_handler)
+    root_logger.addHandler(stream_handler)
+
+    # 关键：屏蔽第三方库 DEBUG 噪音，保留 WARNING/ERROR
+    noisy_loggers = [
+        "urllib3",
+        "urllib3.connectionpool",
+        "urllib3.util.retry",
+        "requests",
+        "charset_normalizer",
+        "chardet",
+        "httpx",
+        "httpcore",
+        "asyncio",
+    ]
+    for name in noisy_loggers:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（精简日志版）")
+    logging.info("B站监控系统启动（方案A：保留自身DEBUG，屏蔽第三方DEBUG）")
     logging.info("=" * 60)
 
 
