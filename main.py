@@ -43,7 +43,6 @@ COMMENT_MAX_RETRY_PAGES = 3
 MAX_SEEN_COMMENTS = 5000
 
 LOG_FILE = "bili_monitor.log"
-ERROR_LOG_FILE = "bili_error.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
 
@@ -126,8 +125,6 @@ mixinKeyEncTab = [
     22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
 ]
 
-_LOGGING_INITIALIZED = False
-
 
 def atomic_write_json(path, data):
     tmp_path = f"{path}.tmp"
@@ -152,65 +149,17 @@ def cut_text(text, max_len=800):
     return text[:max_len - 3].rstrip() + "..."
 
 
-def init_logging(force=False):
-    global _LOGGING_INITIALIZED
-
-    if _LOGGING_INITIALIZED and not force:
-        return
-
+def init_logging():
     try:
-        for path in [LOG_FILE, ERROR_LOG_FILE]:
-            if os.path.exists(path):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.truncate()
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "w", encoding="utf-8") as f:
+                f.truncate()
     except Exception:
         pass
 
-    class ConsoleKeyFilter(logging.Filter):
-        def filter(self, record):
-            msg = record.getMessage()
-
-            if record.levelno >= logging.WARNING:
-                return True
-
-            keywords = [
-                "B站监控系统启动",
-                "监控 ",
-                "初始化完成",
-                "WBI密钥已更新",
-                "新动态",
-                "发送成功",
-                "发送失败",
-                "启动补扫",
-                "常规扫描发送",
-                "补扫发送",
-                "已加入过滤名单",
-                "已移出过滤名单",
-                "过滤UID已刷新",
-                "重新登录成功",
-                "已清理历史动态/评论去重缓存",
-                "动态增强版启动",
-                "智能爆发模式启动",
-                "连续无更新自适应降速已启用",
-                "评论去重结构优化已启用",
-                "动态类型过滤已启用",
-                "评论增强版启动",
-                "进入智能爆发模式",
-                "爆发续期",
-                "退出爆发模式",
-                "心跳正常"
-            ]
-            return any(k in msg for k in keywords)
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-
-    for h in root_logger.handlers[:]:
-        root_logger.removeHandler(h)
-        try:
-            h.close()
-        except Exception:
-            pass
+    logger = logging.getLogger()
+    logger.handlers.clear()
+    logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
@@ -218,47 +167,15 @@ def init_logging(force=False):
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
-    error_file_handler = logging.FileHandler(ERROR_LOG_FILE, mode="w", encoding="utf-8")
-    error_file_handler.setLevel(logging.WARNING)
-    error_file_handler.setFormatter(formatter)
-
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
-    stream_handler.addFilter(ConsoleKeyFilter())
 
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(error_file_handler)
-    root_logger.addHandler(stream_handler)
-    root_logger.propagate = False
-
-    for name in [
-        "urllib3",
-        "urllib3.connectionpool",
-        "urllib3.util.retry",
-        "requests",
-        "charset_normalizer",
-        "chardet",
-        "httpx",
-        "httpcore",
-        "asyncio",
-    ]:
-        lib_logger = logging.getLogger(name)
-        lib_logger.setLevel(logging.WARNING)
-
-        for h in lib_logger.handlers[:]:
-            lib_logger.removeHandler(h)
-            try:
-                h.close()
-            except Exception:
-                pass
-
-        lib_logger.propagate = False
-
-    _LOGGING_INITIALIZED = True
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（最终精简版）")
+    logging.info("B站监控系统启动（增强排障版）")
     logging.info("=" * 60)
 
 
@@ -280,7 +197,10 @@ def safe_request(url, params, header, retries=5):
     for i in range(retries):
         start_ts = time.time()
         try:
+            logging.info(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = requests.get(url, headers=h, params=params, timeout=12)
+            cost = time.time() - start_ts
+            logging.info(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
 
             try:
                 data = r.json()
@@ -289,6 +209,7 @@ def safe_request(url, params, header, retries=5):
                 data = {"code": -500, "message": f"invalid json http={r.status_code}"}
 
             code = data.get("code")
+            logging.info(f"[请求结果] url={url} code={code}")
 
             if code == -101:
                 logging.error("Cookie失效")
@@ -746,6 +667,11 @@ def push_worker():
             if not item:
                 continue
 
+            logging.info(
+                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
+                f"time={item.get('time', '')} link={item.get('link', '')}"
+            )
+
             ok = notifier.send_webhook_notification("特别关注UP主发布新内容", [item])
 
             if ok:
@@ -926,20 +852,29 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             author_mid = str(author.get("mid", ""))
             pub_ts = int(author.get("pub_ts", 0) or 0)
+            top_type = item.get("type", "")
+
+            logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
 
             if author_mid not in target_uids:
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
 
             if not is_allowed_dynamic(item):
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=类型不允许")
                 continue
 
             if is_recent_pushed(state, dyn_id):
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=recent_pushed")
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 continue
 
             if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
+                logging.info(f"[动态命中] dyn_id={dyn_id} 进入候选")
                 new_items.add(dyn_id)
                 candidate_items[dyn_id] = item
+            else:
+                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不是新动态候选")
         except Exception as e:
             logging.warning(f"处理单条动态异常: {repr(e)}")
 
@@ -996,6 +931,8 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     baseline = feed_state.get("baseline", "")
     old_baseline = baseline
 
+    logging.info(f"[动态扫描] 开始检查 update, baseline={baseline or 'EMPTY'}")
+
     update_data = check_feed_update(header, baseline)
     direct_fallback = False
 
@@ -1011,11 +948,15 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         update_num = update_data.get("data", {}).get("update_num", 0)
         consecutive_failures = 0
 
+        logging.info(f"[动态扫描] update 接口成功，update_num={update_num}")
+
         if update_num <= 0:
             consecutive_no_update_rounds += 1
+            logging.info(f"[动态扫描] 无更新，no_update_rounds={consecutive_no_update_rounds}")
             return False
 
         consecutive_no_update_rounds = 0
+        logging.info(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
 
     has_new = False
     offset = ""
@@ -1025,6 +966,7 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     any_success_page = False
 
     while page_count < FEED_FETCH_MAX_PAGES:
+        logging.info(f"[动态扫描] 拉取第 {page_count + 1} 页，offset={offset or 'EMPTY'}")
         data = fetch_following_feed_retry(header, offset=offset)
 
         if data.get("code") != 0:
@@ -1042,16 +984,20 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         feed = data.get("data", {}) or {}
         items = feed.get("items") or []
+        logging.info(f"[动态扫描] 第 {page_count + 1} 页返回 items={len(items)}")
 
         if not items:
+            logging.info(f"[动态扫描] 第 {page_count + 1} 页无 items，结束")
             break
 
         if page_count == 0:
             first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
             if first_page_baseline:
                 candidate_baseline = first_page_baseline
+            logging.info(f"[动态扫描] 候选 baseline={candidate_baseline or 'EMPTY'}")
 
         page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
+        logging.info(f"[动态扫描] 第 {page_count + 1} 页处理完成，page_has_new={page_has_new}")
 
         if page_has_new:
             has_new = True
@@ -1063,32 +1009,38 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
                     continue
                 if item.get("id_str") == old_baseline:
                     reached_old = True
+                    logging.info(f"[动态扫描] 命中旧 baseline={old_baseline}，停止翻页")
                     break
 
         offset = feed.get("offset", "")
         page_count += 1
 
         if direct_fallback:
+            logging.info("[动态扫描] 当前为 fallback 模式，只拉首页后结束")
             break
         if reached_old:
             break
         if not offset:
+            logging.info("[动态扫描] offset 为空，停止翻页")
             break
 
         time.sleep(random.uniform(0.4, 0.8))
 
     if not has_new and not direct_fallback:
         try:
+            logging.info("[动态扫描] 本轮检测到 update 但未命中新动态，1秒后补拉首页确认")
             time.sleep(1.0)
             retry_data = fetch_following_feed_retry(header, offset="")
             if retry_data.get("code") == 0:
                 retry_items = (retry_data.get("data", {}) or {}).get("items") or []
+                logging.info(f"[动态扫描] 二次确认首页返回 items={len(retry_items)}")
                 if retry_items:
                     retry_has_new = process_feed_items(
                         retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
                     )
                     if retry_has_new:
                         has_new = True
+                        logging.info("[动态扫描] 二次确认补拉命中新动态")
         except Exception as e:
             logging.warning(f"[动态扫描] 二次确认补拉异常: {repr(e)}")
 
@@ -1096,9 +1048,11 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
         feed_state["offset"] = offset
+        logging.info(f"[动态扫描] baseline 已更新为 {feed_state['baseline']}, offset={offset or 'EMPTY'}")
     else:
         logging.warning("[动态扫描] 本轮关注流未完整成功，baseline 不前移")
 
+    logging.info(f"[动态扫描] 本轮结束 has_new={has_new}")
     return has_new
 
 
@@ -1318,12 +1272,12 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动")
-    logging.info("✅ 智能爆发模式启动")
+    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
+    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
     logging.info("✅ 连续无更新自适应降速已启用")
-    logging.info("✅ 评论去重结构优化已启用")
+    logging.info("✅ 评论去重结构优化已启用（set + deque）")
     logging.info("✅ 动态类型过滤已启用")
-    logging.info("✅ 评论增强版启动")
+    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
 
     while True:
         try:
@@ -1414,7 +1368,11 @@ def start_monitoring(header):
                     logging.error(traceback.format_exc())
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
-                logging.info("💓 心跳正常")
+                logging.info(
+                    f"💓 心跳正常 interval={get_scan_interval():.2f}s "
+                    f"burst={'on' if time.time() < burst_end_time else 'off'} "
+                    f"fail={consecutive_failures} no_update={consecutive_no_update_rounds}"
+                )
                 last_hb = now
 
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
