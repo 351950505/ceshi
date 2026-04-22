@@ -126,6 +126,8 @@ mixinKeyEncTab = [
     22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
 ]
 
+_LOGGING_INITIALIZED = False
+
 
 def atomic_write_json(path, data):
     tmp_path = f"{path}.tmp"
@@ -150,7 +152,12 @@ def cut_text(text, max_len=800):
     return text[:max_len - 3].rstrip() + "..."
 
 
-def init_logging():
+def init_logging(force=False):
+    global _LOGGING_INITIALIZED
+
+    if _LOGGING_INITIALIZED and not force:
+        return
+
     try:
         for path in [LOG_FILE, ERROR_LOG_FILE]:
             if os.path.exists(path):
@@ -198,7 +205,6 @@ def init_logging():
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
 
-    # 关键：彻底移除旧 handler，避免重复打印
     for h in root_logger.handlers[:]:
         root_logger.removeHandler(h)
         try:
@@ -224,11 +230,8 @@ def init_logging():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(error_file_handler)
     root_logger.addHandler(stream_handler)
-
-    # 防止 logging 自己再去重复传播
     root_logger.propagate = False
 
-    # 压第三方日志
     for name in [
         "urllib3",
         "urllib3.connectionpool",
@@ -252,9 +255,12 @@ def init_logging():
 
         lib_logger.propagate = False
 
+    _LOGGING_INITIALIZED = True
+
     logging.info("=" * 60)
     logging.info("B站监控系统启动（最终精简版）")
     logging.info("=" * 60)
+
 
 def send_failure_notification(title, message):
     key = f"{title}:{message[:100]}"
