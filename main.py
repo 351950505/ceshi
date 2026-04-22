@@ -196,21 +196,18 @@ def init_logging():
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
 
     formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    # 全量日志文件：保留你自己的 DEBUG
     file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
-    # 错误日志文件：只保留 WARNING / ERROR
     error_file_handler = logging.FileHandler(ERROR_LOG_FILE, mode="w", encoding="utf-8")
     error_file_handler.setLevel(logging.WARNING)
     error_file_handler.setFormatter(formatter)
 
-    # 控制台：只显示关键日志
     stream_handler = logging.StreamHandler(sys.stdout)
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
@@ -220,8 +217,7 @@ def init_logging():
     root_logger.addHandler(error_file_handler)
     root_logger.addHandler(stream_handler)
 
-    # 关键：屏蔽第三方库 DEBUG 噪音，保留 WARNING/ERROR
-    noisy_loggers = [
+    for name in [
         "urllib3",
         "urllib3.connectionpool",
         "urllib3.util.retry",
@@ -231,12 +227,13 @@ def init_logging():
         "httpx",
         "httpcore",
         "asyncio",
-    ]
-    for name in noisy_loggers:
-        logging.getLogger(name).setLevel(logging.WARNING)
+    ]:
+        lib_logger = logging.getLogger(name)
+        lib_logger.setLevel(logging.WARNING)
+        lib_logger.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（方案A：保留自身DEBUG，屏蔽第三方DEBUG）")
+    logging.info("B站监控系统启动（完整精简版）")
     logging.info("=" * 60)
 
 
@@ -258,10 +255,7 @@ def safe_request(url, params, header, retries=5):
     for i in range(retries):
         start_ts = time.time()
         try:
-            logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = requests.get(url, headers=h, params=params, timeout=12)
-            cost = time.time() - start_ts
-            logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
 
             try:
                 data = r.json()
@@ -270,7 +264,6 @@ def safe_request(url, params, header, retries=5):
                 data = {"code": -500, "message": f"invalid json http={r.status_code}"}
 
             code = data.get("code")
-            logging.debug(f"[请求结果] url={url} code={code}")
 
             if code == -101:
                 logging.error("Cookie失效")
@@ -728,11 +721,6 @@ def push_worker():
             if not item:
                 continue
 
-            logging.debug(
-                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
-                f"time={item.get('time', '')} link={item.get('link', '')}"
-            )
-
             ok = notifier.send_webhook_notification("特别关注UP主发布新内容", [item])
 
             if ok:
@@ -845,15 +833,16 @@ def init_feed_state(header, target_uids):
                 if not isinstance(item, dict):
                     continue
 
-                dyn_id = item.get("id_str")
-                if dyn_id:
-                    seen_dynamic_ids[dyn_id] = time.time()
+                    dyn_id = item.get("id_str")
+                    if dyn_id:
+                        seen_dynamic_ids[dyn_id] = time.time()
 
                 author = item.get("modules", {}).get("module_author", {}) or {}
                 author_mid = str(author.get("mid", ""))
                 pub_ts = int(author.get("pub_ts", 0) or 0)
 
                 if author_mid in target_uids:
+                    dyn_id = item.get("id_str")
                     if pub_ts > max_ts:
                         max_ts = pub_ts
                         max_ts_ids = {dyn_id} if dyn_id else set()
@@ -913,29 +902,20 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             author_mid = str(author.get("mid", ""))
             pub_ts = int(author.get("pub_ts", 0) or 0)
-            top_type = item.get("type", "")
-
-            logging.debug(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
 
             if author_mid not in target_uids:
-                logging.debug(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
 
             if not is_allowed_dynamic(item):
-                logging.debug(f"[动态过滤] dyn_id={dyn_id} 原因=类型不允许")
                 continue
 
             if is_recent_pushed(state, dyn_id):
-                logging.debug(f"[动态过滤] dyn_id={dyn_id} 原因=recent_pushed")
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 continue
 
             if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
-                logging.debug(f"[动态命中] dyn_id={dyn_id} 进入候选")
                 new_items.add(dyn_id)
                 candidate_items[dyn_id] = item
-            else:
-                logging.debug(f"[动态过滤] dyn_id={dyn_id} 原因=不是新动态候选")
         except Exception as e:
             logging.warning(f"处理单条动态异常: {repr(e)}")
 
@@ -992,8 +972,6 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     baseline = feed_state.get("baseline", "")
     old_baseline = baseline
 
-    logging.debug(f"[动态扫描] 开始检查 update, baseline={baseline or 'EMPTY'}")
-
     update_data = check_feed_update(header, baseline)
     direct_fallback = False
 
@@ -1009,15 +987,11 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         update_num = update_data.get("data", {}).get("update_num", 0)
         consecutive_failures = 0
 
-        logging.debug(f"[动态扫描] update 接口成功，update_num={update_num}")
-
         if update_num <= 0:
             consecutive_no_update_rounds += 1
-            logging.debug(f"[动态扫描] 无更新，no_update_rounds={consecutive_no_update_rounds}")
             return False
 
         consecutive_no_update_rounds = 0
-        logging.debug(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
 
     has_new = False
     offset = ""
@@ -1027,7 +1001,6 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     any_success_page = False
 
     while page_count < FEED_FETCH_MAX_PAGES:
-        logging.debug(f"[动态扫描] 拉取第 {page_count + 1} 页，offset={offset or 'EMPTY'}")
         data = fetch_following_feed_retry(header, offset=offset)
 
         if data.get("code") != 0:
@@ -1045,20 +1018,16 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         feed = data.get("data", {}) or {}
         items = feed.get("items") or []
-        logging.debug(f"[动态扫描] 第 {page_count + 1} 页返回 items={len(items)}")
 
         if not items:
-            logging.debug(f"[动态扫描] 第 {page_count + 1} 页无 items，结束")
             break
 
         if page_count == 0:
             first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
             if first_page_baseline:
                 candidate_baseline = first_page_baseline
-            logging.debug(f"[动态扫描] 候选 baseline={candidate_baseline or 'EMPTY'}")
 
         page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
-        logging.debug(f"[动态扫描] 第 {page_count + 1} 页处理完成，page_has_new={page_has_new}")
 
         if page_has_new:
             has_new = True
@@ -1070,38 +1039,32 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
                     continue
                 if item.get("id_str") == old_baseline:
                     reached_old = True
-                    logging.debug(f"[动态扫描] 命中旧 baseline={old_baseline}，停止翻页")
                     break
 
         offset = feed.get("offset", "")
         page_count += 1
 
         if direct_fallback:
-            logging.debug("[动态扫描] 当前为 fallback 模式，只拉首页后结束")
             break
         if reached_old:
             break
         if not offset:
-            logging.debug("[动态扫描] offset 为空，停止翻页")
             break
 
         time.sleep(random.uniform(0.4, 0.8))
 
     if not has_new and not direct_fallback:
         try:
-            logging.debug("[动态扫描] 本轮检测到 update 但未命中新动态，1秒后补拉首页确认")
             time.sleep(1.0)
             retry_data = fetch_following_feed_retry(header, offset="")
             if retry_data.get("code") == 0:
                 retry_items = (retry_data.get("data", {}) or {}).get("items") or []
-                logging.debug(f"[动态扫描] 二次确认首页返回 items={len(retry_items)}")
                 if retry_items:
                     retry_has_new = process_feed_items(
                         retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
                     )
                     if retry_has_new:
                         has_new = True
-                        logging.debug("[动态扫描] 二次确认补拉命中新动态")
         except Exception as e:
             logging.warning(f"[动态扫描] 二次确认补拉异常: {repr(e)}")
 
@@ -1109,11 +1072,9 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
         feed_state["offset"] = offset
-        logging.debug(f"[动态扫描] baseline 已更新为 {feed_state['baseline']}, offset={offset or 'EMPTY'}")
     else:
         logging.warning("[动态扫描] 本轮关注流未完整成功，baseline 不前移")
 
-    logging.debug(f"[动态扫描] 本轮结束 has_new={has_new}")
     return has_new
 
 
@@ -1333,12 +1294,12 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
-    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
+    logging.info("✅ 动态增强版启动")
+    logging.info("✅ 智能爆发模式启动")
     logging.info("✅ 连续无更新自适应降速已启用")
-    logging.info("✅ 评论去重结构优化已启用（set + deque）")
+    logging.info("✅ 评论去重结构优化已启用")
     logging.info("✅ 动态类型过滤已启用")
-    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
+    logging.info("✅ 评论增强版启动")
 
     while True:
         try:
@@ -1429,11 +1390,7 @@ def start_monitoring(header):
                     logging.error(traceback.format_exc())
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
-                logging.debug(
-                    f"💓 心跳正常 interval={get_scan_interval():.2f}s "
-                    f"burst={'on' if time.time() < burst_end_time else 'off'} "
-                    f"fail={consecutive_failures} no_update={consecutive_no_update_rounds}"
-                )
+                logging.info("💓 心跳正常")
                 last_hb = now
 
             if now - last_v_check > VIDEO_CHECK_INTERVAL:
