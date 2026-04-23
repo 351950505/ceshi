@@ -12,6 +12,7 @@ import requests
 import datetime
 import threading
 import queue
+from zoneinfo import ZoneInfo
 from collections import deque
 
 import database as db
@@ -45,6 +46,13 @@ MAX_SEEN_COMMENTS = 5000
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
 FOLLOWING_CACHE_FILE = "following_cache.json"
+
+# ===== 运行时间窗口（中国时间）=====
+RUN_TZ = "Asia/Shanghai"
+RUN_WEEKDAYS = {0, 1, 2, 3, 4}
+RUN_START_HOUR = 9
+RUN_END_HOUR = 16
+OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
 INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
@@ -147,6 +155,20 @@ def cut_text(text, max_len=800):
     if len(text) <= max_len:
         return text
     return text[:max_len - 3].rstrip() + "..."
+
+
+def is_in_monitor_window(now_dt=None):
+    if now_dt is None:
+        now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
+
+    if now_dt.weekday() not in RUN_WEEKDAYS:
+        return False
+
+    current_hm = now_dt.hour * 60 + now_dt.minute
+    start_hm = RUN_START_HOUR * 60
+    end_hm = RUN_END_HOUR * 60
+
+    return start_hm <= current_hm < end_hm
 
 
 def init_logging():
@@ -1282,10 +1304,22 @@ def start_monitoring(header):
     logging.info("✅ 评论去重结构优化已启用（set + deque）")
     logging.info("✅ 动态类型过滤已启用")
     logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
+    logging.info("✅ 仅在中国时间工作日 09:00-16:00 运行监听")
 
     while True:
         try:
             now = time.time()
+
+            china_now = datetime.datetime.now(ZoneInfo(RUN_TZ))
+            if not is_in_monitor_window(china_now):
+                if now - last_hb >= HEARTBEAT_INTERVAL:
+                    logging.info(
+                        f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
+                        f"仅工作日 09:00-16:00 运行"
+                    )
+                    last_hb = now
+                time.sleep(OFF_HOURS_SLEEP)
+                continue
 
             if now - last_d_check >= get_scan_interval():
                 try:
