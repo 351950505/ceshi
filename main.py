@@ -880,7 +880,8 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             pub_ts = int(author.get("pub_ts", 0) or 0)
             top_type = item.get("type", "")
 
-            logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
+            # 已注释掉每条动态的详细日志，消除重复输出
+            # logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
 
             if author_mid not in target_uids:
                 logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
