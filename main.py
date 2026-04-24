@@ -1439,7 +1439,7 @@ def start_monitoring(header):
                     logging.error(f"缓存清理异常: {repr(e)}")
                     logging.error(traceback.format_exc())
 
-            time.sleep(0.25)
+            time.sleep(0.5)
 
         except Exception:
             logging.error("主循环异常")
