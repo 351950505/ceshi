@@ -51,11 +51,12 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_END_HOUR = 16
+RUN_START_MINUTE = 20     # 9:20 开始
+RUN_END_HOUR = 15
+RUN_END_MINUTE = 30       # 15:30 结束
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
-INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
 STATE_SAVE_INTERVAL = 30
 
 BURST_MODE_DURATION = 12
@@ -165,8 +166,8 @@ def is_in_monitor_window(now_dt=None):
         return False
 
     current_hm = now_dt.hour * 60 + now_dt.minute
-    start_hm = RUN_START_HOUR * 60
-    end_hm = RUN_END_HOUR * 60
+    start_hm = RUN_START_HOUR * 60 + RUN_START_MINUTE
+    end_hm = RUN_END_HOUR * 60 + RUN_END_MINUTE
 
     return start_hm <= current_hm < end_hm
 
@@ -880,9 +881,6 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             pub_ts = int(author.get("pub_ts", 0) or 0)
             top_type = item.get("type", "")
 
-            # 已注释掉每条动态的详细日志，消除重复输出
-            # logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
-
             if author_mid not in target_uids:
                 logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
@@ -1275,6 +1273,7 @@ def start_monitoring(header):
     last_comment_rescan = 0
     last_following_refresh = 0
     last_d_check = 0
+    current_interval = get_scan_interval()   # 缓存间隔
 
     oid, title = sync_latest_video(header)
 
@@ -1300,12 +1299,9 @@ def start_monitoring(header):
     threading.Thread(target=push_worker, daemon=True).start()
 
     logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
-    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
-    logging.info("✅ 连续无更新自适应降速已启用")
-    logging.info("✅ 评论去重结构优化已启用（set + deque）")
-    logging.info("✅ 动态类型过滤已启用")
-    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
-    logging.info("✅ 仅在中国时间工作日 09:00-16:00 运行监听")
+    logging.info("✅ 智能爆发模式启动")
+    logging.info("✅ 评论增强版启动")
+    logging.info(f"✅ 监听时间窗口：工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d} - {RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d}")
 
     while True:
         try:
@@ -1316,13 +1312,14 @@ def start_monitoring(header):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
                         f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
-                        f"仅工作日 09:00-16:00 运行"
+                        f"仅工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d} 运行"
                     )
                     last_hb = now
                 time.sleep(OFF_HOURS_SLEEP)
                 continue
 
-            if now - last_d_check >= get_scan_interval():
+            current_interval = get_scan_interval()  # 每轮更新一次
+            if now - last_d_check >= current_interval:
                 try:
                     state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, int(now))
                     if state_updated or now - last_state_save > STATE_SAVE_INTERVAL:
@@ -1408,7 +1405,7 @@ def start_monitoring(header):
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info(
-                    f"💓 心跳正常 interval={get_scan_interval():.2f}s "
+                    f"💓 心跳正常 interval={current_interval:.2f}s "
                     f"burst={'on' if time.time() < burst_end_time else 'off'} "
                     f"fail={consecutive_failures} no_update={consecutive_no_update_rounds}"
                 )
@@ -1439,7 +1436,7 @@ def start_monitoring(header):
                     logging.error(f"缓存清理异常: {repr(e)}")
                     logging.error(traceback.format_exc())
 
-            time.sleep(0.5)
+            time.sleep(0.5)   # 优化：降低 CPU 占用
 
         except Exception:
             logging.error("主循环异常")
