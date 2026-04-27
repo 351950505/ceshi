@@ -25,6 +25,8 @@ HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3706948578969654
 
+FULL_DAY_MODE = True        # ← 只改这里：True=24小时全天运行，False=仅工作日9:20-15:30
+
 FALLBACK_DYNAMIC_UIDS = [
     "3546905852250875",
     "3546961271589219",
@@ -162,6 +164,11 @@ def is_in_monitor_window(now_dt=None):
     if now_dt is None:
         now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
 
+    # 24小时全天模式（只需改上方 FULL_DAY_MODE = True/False）
+    if FULL_DAY_MODE:
+        return True
+
+    # 原工作时间窗口模式
     if now_dt.weekday() not in RUN_WEEKDAYS:
         return False
 
@@ -659,7 +666,7 @@ def format_dynamic_message(item):
         "message": text,
         "time": time_str,
         "link": f"https://t.bilibili.com/{dyn_id}",
-        "cover": cover,      # 用于钉钉图片显示
+        "cover": cover,
         "kind": "dynamic"
     }
 
@@ -911,7 +918,7 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             if ok:
                 pushed_ids.add(dyn_id)
                 add_recent_pushed_id(state, dyn_id)
-                update_last_ts_state(feed_state, dyn_id, push_data.get("time", ""))
+                update_last_ts_state(feed_state, dyn_id, pub_ts)
                 has_new = True
                 logging.info(
                     f"✅ 新动态 user={push_data.get('user', '未知UP')} dyn_id={dyn_id} "
@@ -1299,8 +1306,8 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（带图片推送）")
-    logging.info(f"✅ 监听时间窗口：工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d} - {RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d}")
+    mode_str = "24小时全天模式" if FULL_DAY_MODE else f"工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d}"
+    logging.info(f"✅ 动态增强版启动（带图片推送） - 当前模式: {mode_str}")
 
     while True:
         try:
@@ -1311,7 +1318,7 @@ def start_monitoring(header):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
                         f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
-                        f"仅工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d} 运行"
+                        f"当前模式: {'24小时全天' if FULL_DAY_MODE else '工作时间窗口'}"
                     )
                     last_hb = now
                 time.sleep(OFF_HOURS_SLEEP)
