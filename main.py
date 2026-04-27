@@ -51,9 +51,9 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_START_MINUTE = 20     # 9:20 开始
+RUN_START_MINUTE = 20
 RUN_END_HOUR = 15
-RUN_END_MINUTE = 30       # 15:30 结束
+RUN_END_MINUTE = 30
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
@@ -598,38 +598,6 @@ def extract_dynamic_text(item):
             desc_text = normalize_text(desc.get("text", ""))
             return desc_text or "【图片动态】"
 
-        if t == "MAJOR_TYPE_COMMON":
-            common = major.get("common", {}) or {}
-            title = normalize_text(common.get("title", ""))
-            desc_text = normalize_text(common.get("desc", ""))
-            if title and desc_text:
-                return f"【卡片】{title}\n{desc_text}"
-            return f"【卡片】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_LIVE":
-            live = major.get("live", {}) or {}
-            title = normalize_text(live.get("title", ""))
-            desc_text = normalize_text(live.get("desc_second", ""))
-            if title and desc_text:
-                return f"【直播】{title}\n{desc_text}"
-            return f"【直播】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_PGC":
-            pgc = major.get("pgc", {}) or {}
-            return normalize_text(f"【PGC】{pgc.get('title', '')}")
-
-        if t == "MAJOR_TYPE_COURSES":
-            c = major.get("courses", {}) or {}
-            title = normalize_text(c.get("title", ""))
-            desc_text = normalize_text(c.get("desc", ""))
-            if title and desc_text:
-                return f"【课程】{title}\n{desc_text}"
-            return f"【课程】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_MUSIC":
-            m = major.get("music", {}) or {}
-            return normalize_text(f"【音频】{m.get('title', '')}")
-
         return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
@@ -643,6 +611,30 @@ def format_dynamic_message(item):
 
     text = cut_text(extract_dynamic_text(item), 900)
     dynamic_type = item.get("type", "")
+
+    # 提取动态封面图
+    cover = ""
+    try:
+        modules = item.get("modules", {}) or {}
+        dyn_module = modules.get("module_dynamic", {}) or {}
+        major = dyn_module.get("major", {}) or {}
+        major_type = major.get("type", "")
+
+        if major_type == "MAJOR_TYPE_ARCHIVE":  # 视频
+            archive = major.get("archive", {}) or {}
+            cover = archive.get("cover", "") or ""
+        elif major_type == "MAJOR_TYPE_DRAW":   # 图文
+            draw = major.get("draw", {}) or {}
+            items_list = draw.get("items", [])
+            if items_list and isinstance(items_list, list) and len(items_list) > 0:
+                cover = items_list[0].get("src", "") or ""
+        elif major_type == "MAJOR_TYPE_OPUS":
+            opus = major.get("opus", {}) or {}
+            pics = opus.get("pics", [])
+            if pics and isinstance(pics, list) and len(pics) > 0:
+                cover = pics[0].get("url", "") or ""
+    except Exception:
+        cover = ""
 
     if dynamic_type == "DYNAMIC_TYPE_FORWARD":
         orig = item.get("orig")
@@ -667,6 +659,7 @@ def format_dynamic_message(item):
         "message": text,
         "time": time_str,
         "link": f"https://t.bilibili.com/{dyn_id}",
+        "cover": cover,      # 用于钉钉图片显示
         "kind": "dynamic"
     }
 
@@ -913,15 +906,12 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             continue
 
         try:
-            author = item.get("modules", {}).get("module_author", {}) or {}
-            pub_ts = int(author.get("pub_ts", 0) or 0)
-
             push_data = format_dynamic_message(item)
             ok = safe_enqueue_push(push_data)
             if ok:
                 pushed_ids.add(dyn_id)
                 add_recent_pushed_id(state, dyn_id)
-                update_last_ts_state(feed_state, dyn_id, pub_ts)
+                update_last_ts_state(feed_state, dyn_id, push_data.get("time", ""))
                 has_new = True
                 logging.info(
                     f"✅ 新动态 user={push_data.get('user', '未知UP')} dyn_id={dyn_id} "
@@ -1124,13 +1114,24 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
                 if not rpid:
                     continue
 
+                # 提取评论图片（取第一张）
+                cover = ""
+                try:
+                    content = r.get("content", {}) or {}
+                    pictures = content.get("pictures", []) or []
+                    if pictures and isinstance(pictures, list) and len(pictures) > 0:
+                        cover = pictures[0].get("img_src", "") or ""
+                except Exception:
+                    cover = ""
+
                 if add_seen_comment(seen_comments, rpid):
                     comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
                     new_list.append({
                         "user": f"[{comment_time}] {r.get('member', {}).get('uname', '')}",
                         "message": r.get("content", {}).get("message", ""),
                         "ctime": ctime,
-                        "rpid": rpid
+                        "rpid": rpid,
+                        "cover": cover
                     })
 
             except Exception as e:
@@ -1166,7 +1167,7 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         )
         if new_c:
             new_c.sort(key=lambda x: x["ctime"])
-            payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+            payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
             try:
                 notifier.send_webhook_notification(title, payload)
             except Exception as e:
@@ -1273,7 +1274,7 @@ def start_monitoring(header):
     last_comment_rescan = 0
     last_following_refresh = 0
     last_d_check = 0
-    current_interval = get_scan_interval()   # 缓存间隔
+    current_interval = get_scan_interval()
 
     oid, title = sync_latest_video(header)
 
@@ -1298,9 +1299,7 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
-    logging.info("✅ 智能爆发模式启动")
-    logging.info("✅ 评论增强版启动")
+    logging.info("✅ 动态增强版启动（带图片推送）")
     logging.info(f"✅ 监听时间窗口：工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d} - {RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d}")
 
     while True:
@@ -1318,7 +1317,7 @@ def start_monitoring(header):
                 time.sleep(OFF_HOURS_SLEEP)
                 continue
 
-            current_interval = get_scan_interval()  # 每轮更新一次
+            current_interval = get_scan_interval()
             if now - last_d_check >= current_interval:
                 try:
                     state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, int(now))
@@ -1374,7 +1373,7 @@ def start_monitoring(header):
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+                        payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
                         notifier.send_webhook_notification(title, payload)
                         logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
                 except Exception as e:
@@ -1396,7 +1395,7 @@ def start_monitoring(header):
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+                        payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
                         notifier.send_webhook_notification(title, payload)
                         logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
                 except Exception as e:
@@ -1436,7 +1435,7 @@ def start_monitoring(header):
                     logging.error(f"缓存清理异常: {repr(e)}")
                     logging.error(traceback.format_exc())
 
-            time.sleep(0.5)   # 优化：降低 CPU 占用
+            time.sleep(0.5)
 
         except Exception:
             logging.error("主循环异常")
