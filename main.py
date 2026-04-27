@@ -25,8 +25,6 @@ HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3706948578969654
 
-FULL_DAY_MODE = True        # ← 只改这里：True=24小时全天运行，False=仅工作日9:20-15:30
-
 FALLBACK_DYNAMIC_UIDS = [
     "3546905852250875",
     "3546961271589219",
@@ -53,12 +51,11 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_START_MINUTE = 20
-RUN_END_HOUR = 15
-RUN_END_MINUTE = 30
+RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
+INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
 STATE_SAVE_INTERVAL = 30
 
 BURST_MODE_DURATION = 12
@@ -164,17 +161,12 @@ def is_in_monitor_window(now_dt=None):
     if now_dt is None:
         now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
 
-    # 24小时全天模式（只需改上方 FULL_DAY_MODE = True/False）
-    if FULL_DAY_MODE:
-        return True
-
-    # 原工作时间窗口模式
     if now_dt.weekday() not in RUN_WEEKDAYS:
         return False
 
     current_hm = now_dt.hour * 60 + now_dt.minute
-    start_hm = RUN_START_HOUR * 60 + RUN_START_MINUTE
-    end_hm = RUN_END_HOUR * 60 + RUN_END_MINUTE
+    start_hm = RUN_START_HOUR * 60
+    end_hm = RUN_END_HOUR * 60
 
     return start_hm <= current_hm < end_hm
 
@@ -605,6 +597,38 @@ def extract_dynamic_text(item):
             desc_text = normalize_text(desc.get("text", ""))
             return desc_text or "【图片动态】"
 
+        if t == "MAJOR_TYPE_COMMON":
+            common = major.get("common", {}) or {}
+            title = normalize_text(common.get("title", ""))
+            desc_text = normalize_text(common.get("desc", ""))
+            if title and desc_text:
+                return f"【卡片】{title}\n{desc_text}"
+            return f"【卡片】{title or desc_text}".strip()
+
+        if t == "MAJOR_TYPE_LIVE":
+            live = major.get("live", {}) or {}
+            title = normalize_text(live.get("title", ""))
+            desc_text = normalize_text(live.get("desc_second", ""))
+            if title and desc_text:
+                return f"【直播】{title}\n{desc_text}"
+            return f"【直播】{title or desc_text}".strip()
+
+        if t == "MAJOR_TYPE_PGC":
+            pgc = major.get("pgc", {}) or {}
+            return normalize_text(f"【PGC】{pgc.get('title', '')}")
+
+        if t == "MAJOR_TYPE_COURSES":
+            c = major.get("courses", {}) or {}
+            title = normalize_text(c.get("title", ""))
+            desc_text = normalize_text(c.get("desc", ""))
+            if title and desc_text:
+                return f"【课程】{title}\n{desc_text}"
+            return f"【课程】{title or desc_text}".strip()
+
+        if t == "MAJOR_TYPE_MUSIC":
+            m = major.get("music", {}) or {}
+            return normalize_text(f"【音频】{m.get('title', '')}")
+
         return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
@@ -618,30 +642,6 @@ def format_dynamic_message(item):
 
     text = cut_text(extract_dynamic_text(item), 900)
     dynamic_type = item.get("type", "")
-
-    # 提取动态封面图
-    cover = ""
-    try:
-        modules = item.get("modules", {}) or {}
-        dyn_module = modules.get("module_dynamic", {}) or {}
-        major = dyn_module.get("major", {}) or {}
-        major_type = major.get("type", "")
-
-        if major_type == "MAJOR_TYPE_ARCHIVE":  # 视频
-            archive = major.get("archive", {}) or {}
-            cover = archive.get("cover", "") or ""
-        elif major_type == "MAJOR_TYPE_DRAW":   # 图文
-            draw = major.get("draw", {}) or {}
-            items_list = draw.get("items", [])
-            if items_list and isinstance(items_list, list) and len(items_list) > 0:
-                cover = items_list[0].get("src", "") or ""
-        elif major_type == "MAJOR_TYPE_OPUS":
-            opus = major.get("opus", {}) or {}
-            pics = opus.get("pics", [])
-            if pics and isinstance(pics, list) and len(pics) > 0:
-                cover = pics[0].get("url", "") or ""
-    except Exception:
-        cover = ""
 
     if dynamic_type == "DYNAMIC_TYPE_FORWARD":
         orig = item.get("orig")
@@ -666,7 +666,6 @@ def format_dynamic_message(item):
         "message": text,
         "time": time_str,
         "link": f"https://t.bilibili.com/{dyn_id}",
-        "cover": cover,
         "kind": "dynamic"
     }
 
@@ -881,6 +880,9 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             pub_ts = int(author.get("pub_ts", 0) or 0)
             top_type = item.get("type", "")
 
+            # 已注释掉每条动态的详细日志，消除重复输出
+            # logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
+
             if author_mid not in target_uids:
                 logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
@@ -913,6 +915,9 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             continue
 
         try:
+            author = item.get("modules", {}).get("module_author", {}) or {}
+            pub_ts = int(author.get("pub_ts", 0) or 0)
+
             push_data = format_dynamic_message(item)
             ok = safe_enqueue_push(push_data)
             if ok:
@@ -1121,24 +1126,13 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
                 if not rpid:
                     continue
 
-                # 提取评论图片（取第一张）
-                cover = ""
-                try:
-                    content = r.get("content", {}) or {}
-                    pictures = content.get("pictures", []) or []
-                    if pictures and isinstance(pictures, list) and len(pictures) > 0:
-                        cover = pictures[0].get("img_src", "") or ""
-                except Exception:
-                    cover = ""
-
                 if add_seen_comment(seen_comments, rpid):
                     comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
                     new_list.append({
                         "user": f"[{comment_time}] {r.get('member', {}).get('uname', '')}",
                         "message": r.get("content", {}).get("message", ""),
                         "ctime": ctime,
-                        "rpid": rpid,
-                        "cover": cover
+                        "rpid": rpid
                     })
 
             except Exception as e:
@@ -1174,7 +1168,7 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         )
         if new_c:
             new_c.sort(key=lambda x: x["ctime"])
-            payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
+            payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
             try:
                 notifier.send_webhook_notification(title, payload)
             except Exception as e:
@@ -1281,7 +1275,6 @@ def start_monitoring(header):
     last_comment_rescan = 0
     last_following_refresh = 0
     last_d_check = 0
-    current_interval = get_scan_interval()
 
     oid, title = sync_latest_video(header)
 
@@ -1306,8 +1299,13 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    mode_str = "24小时全天模式" if FULL_DAY_MODE else f"工作日 {RUN_START_HOUR:02d}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR:02d}:{RUN_END_MINUTE:02d}"
-    logging.info(f"✅ 动态增强版启动（带图片推送） - 当前模式: {mode_str}")
+    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
+    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
+    logging.info("✅ 连续无更新自适应降速已启用")
+    logging.info("✅ 评论去重结构优化已启用（set + deque）")
+    logging.info("✅ 动态类型过滤已启用")
+    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
+    logging.info("✅ 仅在中国时间工作日 09:00-16:00 运行监听")
 
     while True:
         try:
@@ -1318,14 +1316,13 @@ def start_monitoring(header):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
                         f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
-                        f"当前模式: {'24小时全天' if FULL_DAY_MODE else '工作时间窗口'}"
+                        f"仅工作日 09:00-16:00 运行"
                     )
                     last_hb = now
                 time.sleep(OFF_HOURS_SLEEP)
                 continue
 
-            current_interval = get_scan_interval()
-            if now - last_d_check >= current_interval:
+            if now - last_d_check >= get_scan_interval():
                 try:
                     state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, int(now))
                     if state_updated or now - last_state_save > STATE_SAVE_INTERVAL:
@@ -1380,7 +1377,7 @@ def start_monitoring(header):
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
+                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
                         notifier.send_webhook_notification(title, payload)
                         logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
                 except Exception as e:
@@ -1402,7 +1399,7 @@ def start_monitoring(header):
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"], "cover": x.get("cover", "")} for x in new_c]
+                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
                         notifier.send_webhook_notification(title, payload)
                         logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
                 except Exception as e:
@@ -1411,7 +1408,7 @@ def start_monitoring(header):
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info(
-                    f"💓 心跳正常 interval={current_interval:.2f}s "
+                    f"💓 心跳正常 interval={get_scan_interval():.2f}s "
                     f"burst={'on' if time.time() < burst_end_time else 'off'} "
                     f"fail={consecutive_failures} no_update={consecutive_no_update_rounds}"
                 )
