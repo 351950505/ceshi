@@ -51,7 +51,7 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_START_MINUTE = 20      # 已修改为 9:20 启动
+RUN_START_MINUTE = 20
 RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
@@ -642,39 +642,23 @@ def format_dynamic_message(item):
     pub_ts = int(author.get("pub_ts", 0) or 0)
 
     text = cut_text(extract_dynamic_text(item), 900)
-    dynamic_type = item.get("type", "")
-
-    if dynamic_type == "DYNAMIC_TYPE_FORWARD":
-        orig = item.get("orig")
-        if orig and isinstance(orig, dict):
-            orig_text = cut_text(extract_dynamic_text(orig), 300)
-            if orig_text:
-                if text:
-                    text = f"{text}\n\n【转发原文】\n{orig_text}"
-                else:
-                    text = f"【转发原文】\n{orig_text}"
-            orig_id = orig.get("id_str")
-            if orig_id:
-                text = f"{text}\n\n原动态： https://t.bilibili.com/{orig_id}"
-
     if not text:
         text = "（该动态无可提取正文）"
 
     time_str = datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S") if pub_ts > 0 else "未知时间"
 
-    # 提取封面图（支持图片显示）
+    # 封面提取
     cover = ""
     try:
-        modules = item.get("modules", {}) or {}
-        dyn_module = modules.get("module_dynamic", {}) or {}
-        major = dyn_module.get("major", {}) or {}
-        if major.get("type") == "MAJOR_TYPE_DRAW":
+        major = (item.get("modules", {}).get("module_dynamic", {}) or {}).get("major", {}) or {}
+        mtype = major.get("type", "")
+        if mtype == "MAJOR_TYPE_DRAW":
             cover = major.get("draw", {}).get("items", [{}])[0].get("src", "")
-        elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
+        elif mtype == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
-        elif major.get("type") == "MAJOR_TYPE_OPUS":
-            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or \
-                    major.get("opus", {}).get("cover", "")
+        elif mtype == "MAJOR_TYPE_OPUS":
+            pics = major.get("opus", {}).get("pics", [])
+            cover = pics[0].get("url", "") if pics else ""
     except Exception:
         cover = ""
 
@@ -682,11 +666,10 @@ def format_dynamic_message(item):
         "user": name,
         "message": text,
         "time": time_str,
-        "link": f"https://www.bilibili.com/opus/{dyn_id}",   # 电脑版链接
-        "cover": cover,                                      # 新增封面支持
+        "link": f"https://t.bilibili.com/{dyn_id}",   # 改为稳定电脑版链接
+        "cover": cover,
         "kind": "dynamic"
     }
-
 
 def safe_enqueue_push(item):
     try:
