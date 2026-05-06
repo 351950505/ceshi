@@ -10,6 +10,7 @@ import hashlib
 import urllib.parse
 import json
 import requests
+from requests.adapters import HTTPAdapter
 import datetime
 import threading
 import queue
@@ -96,6 +97,11 @@ ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TY
 ALLOW_FORWARD_DYNAMIC = True
 
 # =============================================
+# 网络层极限优化：开启全局 Session 持久化连接与连接池复用 (HTTP Keep-Alive)
+REQ_SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
+REQ_SESSION.mount('http://', _adapter)
+REQ_SESSION.mount('https://', _adapter)
 
 push_queue = queue.Queue(maxsize=500)
 
@@ -107,7 +113,6 @@ last_new_dynamic_time = 0
 consecutive_no_update_rounds = 0
 
 last_state_save = time.time()
-last_seen_clean = time.time()
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
@@ -168,7 +173,7 @@ def init_logging():
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动")
+    logging.info("B站监控系统启动 (Session加速版 + O(1)去重版)")
     logging.info("=" * 60)
 
 
@@ -178,7 +183,7 @@ def send_failure_notification(title, message):
         _last_notify_time[key] = time.time()
         try:
             threading.Thread(target=notifier.send_webhook_notification, 
-                           args=(title, [{"user": "系统", "message": message}]), 
+                           args=(title,[{"user": "系统", "message": message}]), 
                            daemon=True).start()
         except Exception:
             pass
@@ -186,15 +191,16 @@ def send_failure_notification(title, message):
 
 def safe_request(url, params, header, retries=5):
     h = header.copy()
-    h["Connection"] = "close"
+    # 彻底移除 h["Connection"] = "close"，激活底层 TCP Session 长连接复用！
+    h.pop("Connection", None) 
     base_delay = 3
 
     for i in range(retries):
         start_ts = time.time()
         try:
-            # 优化：普通请求日志降级为 DEBUG，隐藏刷屏
             logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
-            r = requests.get(url, headers=h, params=params, timeout=12)
+            # 使用带持久化连接池的 REQ_SESSION，速度显著提升
+            r = REQ_SESSION.get(url, headers=h, params=params, timeout=12)
             cost = time.time() - start_ts
             logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
 
@@ -354,7 +360,7 @@ def load_following_cache():
         try:
             with open(FOLLOWING_CACHE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                return data if isinstance(data, list) else []
+                return data if isinstance(data, list) else[]
         except Exception:
             return []
     return[]
@@ -415,42 +421,27 @@ def save_dynamic_state(state):
         logging.error(f"保存 dynamic_state 失败: {repr(e)}")
 
 
-def clean_old_seen(seen_dynamic_ids):
-    if len(seen_dynamic_ids) <= MAX_SEEN_DYNAMIC_IDS:
-        return
-    items = sorted(seen_dynamic_ids.items(), key=lambda x: x[1], reverse=True)
-    kept = dict(items[:MAX_SEEN_DYNAMIC_IDS])
-    seen_dynamic_ids.clear()
-    seen_dynamic_ids.update(kept)
-
-
-def init_seen_comments():
+# 终极 O(1) 通用去重结构，彻底干掉手动定时清理的开销和隐患
+def init_seen_cache():
     return {"set": set(), "queue": deque()}
 
 
-def add_seen_comment(seen_comments, rpid):
-    s = seen_comments["set"]
-    q = seen_comments["queue"]
+def add_seen_cache(cache, item_id, max_size):
+    s = cache["set"]
+    q = cache["queue"]
 
-    if rpid in s:
+    if item_id in s:
         return False
 
-    s.add(rpid)
-    q.append(rpid)
+    s.add(item_id)
+    q.append(item_id)
 
-    while len(q) > MAX_SEEN_COMMENTS:
+    # 利用双端队列，边进边出，时间复杂度 O(1)，永远不会无限膨胀
+    while len(q) > max_size:
         old = q.popleft()
         s.discard(old)
 
     return True
-
-
-def prune_seen_comments(seen_comments):
-    s = seen_comments["set"]
-    q = seen_comments["queue"]
-    while len(q) > MAX_SEEN_COMMENTS:
-        old = q.popleft()
-        s.discard(old)
 
 
 def add_recent_pushed_id(state, dyn_id):
@@ -778,7 +769,8 @@ def init_feed_state(header, target_uids):
     global last_new_dynamic_time
 
     state = load_dynamic_state()
-    seen_dynamic_ids = {}
+    # 启用全新的高性能动态缓存池
+    seen_dynamic_ids = init_seen_cache()
 
     try:
         max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
@@ -804,7 +796,7 @@ def init_feed_state(header, target_uids):
 
                 dyn_id = item.get("id_str")
                 if dyn_id:
-                    seen_dynamic_ids[dyn_id] = time.time()
+                    add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS)
 
                 author = item.get("modules", {}).get("module_author", {}) or {}
                 author_mid = str(author.get("mid", ""))
@@ -864,7 +856,8 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             if not dyn_id:
                 continue
 
-            seen_dynamic_ids[dyn_id] = time.time()
+            # 使用高性能结构，无感写入，超限自动剔除最老记录
+            add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS)
 
             author = item.get("modules", {}).get("module_author", {}) or {}
             author_mid = str(author.get("mid", ""))
@@ -1059,7 +1052,7 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
                 if not rpid:
                     continue
 
-                if add_seen_comment(seen_comments, rpid):
+                if add_seen_cache(seen_comments, rpid, MAX_SEEN_COMMENTS):
                     comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
                     member_info = r.get("member") or {}
                     content_info = r.get("content") or {}
@@ -1188,7 +1181,7 @@ def refresh_cookie():
 
 
 def start_monitoring(header):
-    global last_state_save, last_seen_clean, last_new_dynamic_time
+    global last_state_save, last_new_dynamic_time
 
     last_v_check = 0
     last_hb = 0
@@ -1199,7 +1192,8 @@ def start_monitoring(header):
 
     oid, title = sync_latest_video(header)
 
-    seen_comments = init_seen_comments()
+    # 两大去重系统已完成高效率合并
+    seen_comments = init_seen_cache()
     last_read_time = int(time.time())
 
     if oid:
@@ -1305,7 +1299,7 @@ def start_monitoring(header):
                         last_read_time = new_t
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+                        payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
                         threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
                         logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
                 except Exception:
@@ -1324,7 +1318,8 @@ def start_monitoring(header):
                     res = sync_latest_video(header)
                     if res:
                         oid, title = res
-                        seen_comments = init_seen_comments()
+                        # 注意：遇到新视频时，重建空缓存池
+                        seen_comments = init_seen_cache()
                         last_read_time = int(time.time())
                         if oid:
                             last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
@@ -1332,14 +1327,8 @@ def start_monitoring(header):
                     pass
                 last_v_check = now
 
-            if now - last_seen_clean > 3600:
-                try:
-                    clean_old_seen(seen_dynamic_ids)
-                    prune_seen_comments(seen_comments)
-                    last_seen_clean = now
-                    logging.info("🧹 已清理历史动态/评论去重缓存")
-                except Exception:
-                    pass
+            # 由于引入了 O(1) deqeue + set 自动去重数据结构
+            # 原有的 last_seen_clean 和 每隔3600秒清理老旧字典的代码块被彻底删除，极大提升稳定性。
 
             time.sleep(0.5)
 
