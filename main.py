@@ -52,7 +52,7 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_START_MINUTE = 20      # 确认为 9:20 启动
+RUN_START_MINUTE = 20
 RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
@@ -148,7 +148,7 @@ def normalize_text(text):
         return ""
     text = str(text).replace("\r", "\n")
     lines = [line.strip() for line in text.split("\n")]
-    lines = [line for line in lines if line]
+    lines =[line for line in lines if line]
     return "\n".join(lines).strip()
 
 
@@ -174,27 +174,29 @@ def is_in_monitor_window(now_dt=None):
 
 
 def init_logging():
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    # 彻底清理所有已有 handler，防止重复
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+
+    formatter = logging.Formatter("%(asctime)s[%(levelname)s] %(message)s")
 
     file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8"
+        LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
     )
-    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
     stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
 
-    # 关键修复：加 force=True 强制覆盖接管！避免被别的库或文件重复配置导致打印两次
-    logging.basicConfig(
-        level=logging.INFO,
-        handlers=[file_handler, stream_handler],
-        force=True
-    )
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+    root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（修复日志重复版 + 全局Cookie刷新版）")
+    logging.info("B站监控系统启动（终极去重日志版）")
     logging.info("=" * 60)
 
 
@@ -205,7 +207,7 @@ def send_failure_notification(title, message):
         try:
             threading.Thread(
                 target=notifier.send_webhook_notification, 
-                args=(title,[{"user": "系统", "message": message}]), 
+                args=(title, [{"user": "系统", "message": message}]), 
                 daemon=True
             ).start()
         except Exception:
@@ -235,14 +237,13 @@ def safe_request(url, params, header, retries=5):
             logging.info(f"[请求结果] url={url} code={code}")
 
             if code == -101:
-                # 关键优化：底层自动拦截 -101 并全局更新 Cookie
                 logging.warning(f"检测到 Cookie 失效 (-101)，尝试自动重新登录... url={url}")
                 if refresh_cookie():
                     new_h = get_header()
-                    header["Cookie"] = new_h["Cookie"]  # 引用修改：直接更新最外层主循环的字典，让后续所有请求生效
-                    h["Cookie"] = new_h["Cookie"]       # 更新当前这次重试的字典
+                    header["Cookie"] = new_h["Cookie"]  
+                    h["Cookie"] = new_h["Cookie"]       
                     time.sleep(2)
-                    continue  # 带着新 Cookie 重新尝试拉取
+                    continue  
                 else:
                     logging.error("Cookie 失效且重新登录失败！")
                     send_failure_notification("Cookie 失效", "需要手动重新登录")
@@ -384,7 +385,7 @@ def load_following_cache():
                 data = json.load(f)
                 return data if isinstance(data, list) else []
         except Exception:
-            return[]
+            return []
     return[]
 
 
@@ -399,7 +400,7 @@ def load_dynamic_state():
     default_state = {
         "feed": {
             "last_ts": 0,
-            "last_ts_ids":[],
+            "last_ts_ids": [],
             "baseline": "",
             "offset": "",
             "recent_pushed_ids":[]
@@ -681,7 +682,7 @@ def format_dynamic_message(item):
         elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
         elif major.get("type") == "MAJOR_TYPE_OPUS":
-            cover = major.get("opus", {}).get("pics",[{}])[0].get("url", "") or \
+            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or \
                     major.get("opus", {}).get("cover", "")
     except Exception:
         cover = ""
@@ -722,10 +723,9 @@ def push_worker():
 
             title = f"{item.get('user', '未知UP')} 发布了新动态"
             ok = notifier.send_webhook_notification(
-               title,
-               [item],
+               title,[item],
                notify_type="dynamic"
-             )
+            )
 
             if ok:
                 logging.info(f"[推送队列] 发送成功 link={item.get('link', '')}")
@@ -1146,7 +1146,6 @@ def get_latest_video(header):
         {"host_mid": TARGET_UID},
         header
     )
-    # 因为底层 safe_request 已经具备全局自动处理 Cookie 的能力，如果还是报错那直接丢弃即可
     if data.get("code") != 0:
         return None
 
@@ -1236,7 +1235,7 @@ def start_monitoring(header):
         last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
 
     following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
-    following_list =[str(uid) for uid in following_list]
+    following_list = [str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list:
         following_list.append(str(SOURCE_UID))
     save_following_cache(following_list)
@@ -1287,7 +1286,7 @@ def start_monitoring(header):
                 try:
                     new_list = get_following_list(SOURCE_UID, header)
                     if new_list:
-                        new_list =[str(uid) for uid in new_list]
+                        new_list = [str(uid) for uid in new_list]
                         if str(SOURCE_UID) not in new_list:
                             new_list.append(str(SOURCE_UID))
 
