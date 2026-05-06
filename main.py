@@ -147,24 +147,18 @@ def is_in_monitor_window(now_dt=None):
 
 
 def init_logging():
-    # 彻底暴力清空当前环境内所有日志通道
     root = logging.getLogger()
     if root.hasHandlers():
         root.handlers.clear()
     
-    # 【标记测试】：注意这里加了 [BILI] 前缀！
-    # 如果输出两行，只有一行带 [BILI]，说明 100% 有老旧进程没被杀掉！
-    formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
+    formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
 
-    # 配置 1：文件写入器
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    # 配置 2：终端打印器（加了环境检测防冲突）
-    # sys.stdout.isatty() 可以判断是否为真实屏幕。如果是在宝塔面板或被重定向到了文件，则跳过终端打印！
     if sys.stdout.isatty():
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
@@ -174,7 +168,7 @@ def init_logging():
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（环境隔离+追踪版）")
+    logging.info("B站监控系统启动")
     logging.info("=" * 60)
 
 
@@ -198,10 +192,11 @@ def safe_request(url, params, header, retries=5):
     for i in range(retries):
         start_ts = time.time()
         try:
-            logging.info(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
+            # 优化：普通请求日志降级为 DEBUG，隐藏刷屏
+            logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = requests.get(url, headers=h, params=params, timeout=12)
             cost = time.time() - start_ts
-            logging.info(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
+            logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
 
             try:
                 data = r.json()
@@ -210,7 +205,7 @@ def safe_request(url, params, header, retries=5):
                 data = {"code": -500, "message": f"invalid json http={r.status_code}"}
 
             code = data.get("code")
-            logging.info(f"[请求结果] url={url} code={code}")
+            logging.debug(f"[请求结果] url={url} code={code}")
 
             if code == -101:
                 logging.warning(f"检测到 Cookie 失效 (-101)，尝试自动重新登录... url={url}")
@@ -654,7 +649,7 @@ def format_dynamic_message(item):
         dyn_module = modules.get("module_dynamic", {}) or {}
         major = dyn_module.get("major", {}) or {}
         if major.get("type") == "MAJOR_TYPE_DRAW":
-            cover = major.get("draw", {}).get("items", [{}])[0].get("src", "")
+            cover = major.get("draw", {}).get("items",[{}])[0].get("src", "")
         elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
         elif major.get("type") == "MAJOR_TYPE_OPUS":
@@ -689,16 +684,30 @@ def push_worker():
     while True:
         try:
             item = push_queue.get(timeout=1)
-            if not item: continue
+            if not item:
+                continue
+
+            logging.info(
+                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
+                f"time={item.get('time', '')} link={item.get('link', '')}"
+            )
 
             title = f"{item.get('user', '未知UP')} 发布了新动态"
-            ok = notifier.send_webhook_notification(title, [item], notify_type="dynamic")
+            ok = notifier.send_webhook_notification(
+               title,[item],
+               notify_type="dynamic"
+            )
 
-            logging.info(f"[推送] {'成功' if ok else '失败'} {item.get('user')} {item.get('link','')}")
+            if ok:
+                logging.info(f"[推送队列] 发送成功 link={item.get('link', '')}")
+            else:
+                logging.warning(f"[推送队列] 发送失败 link={item.get('link', '')}")
+
         except queue.Empty:
             continue
         except Exception as e:
             logging.error(f"推送失败: {repr(e)}")
+            logging.error(traceback.format_exc())
 
 
 def fetch_following_feed(header, offset="", update_baseline=""):
@@ -1197,7 +1206,7 @@ def start_monitoring(header):
         last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
 
     following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
-    following_list = [str(uid) for uid in following_list]
+    following_list =[str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list:
         following_list.append(str(SOURCE_UID))
     save_following_cache(following_list)
@@ -1211,13 +1220,7 @@ def start_monitoring(header):
 
     threading.Thread(target=push_worker, daemon=True).start()
 
-    logging.info("✅ 动态增强版启动（排障日志 + 二次确认补拉 + 清晰推送日志）")
-    logging.info("✅ 智能爆发模式启动（冷却 + 续爆上限 + 失败退出 + 失败降速 + idle慢速）")
-    logging.info("✅ 连续无更新自适应降速已启用")
-    logging.info("✅ 评论去重结构优化已启用（set + deque）")
-    logging.info("✅ 动态类型过滤已启用")
-    logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
-    logging.info(f"✅ 仅在中国时间工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
+    logging.info(f"✅ 系统初始化完成，开始在工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
 
     while True:
         try:
