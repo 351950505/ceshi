@@ -4,7 +4,7 @@ import time
 import subprocess
 import random
 import logging
-import logging.handlers  # 新增：用于日志自动切割
+import logging.handlers
 import traceback
 import hashlib
 import urllib.parse
@@ -174,13 +174,8 @@ def is_in_monitor_window(now_dt=None):
 
 
 def init_logging():
-    logger = logging.getLogger()
-    logger.handlers.clear()
-    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 
-    formatter = logging.Formatter("%(asctime)s[%(levelname)s] %(message)s")
-
-    # 优化：每个日志文件最大 10MB，最多保留 3 个备份，防止磁盘撑爆
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8"
     )
@@ -191,11 +186,15 @@ def init_logging():
     stream_handler.setLevel(logging.INFO)
     stream_handler.setFormatter(formatter)
 
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
+    # 关键修复：加 force=True 强制覆盖接管！避免被别的库或文件重复配置导致打印两次
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[file_handler, stream_handler],
+        force=True
+    )
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（增强排障版 + 防阻塞优化）")
+    logging.info("B站监控系统启动（修复日志重复版 + 全局Cookie刷新版）")
     logging.info("=" * 60)
 
 
@@ -236,9 +235,18 @@ def safe_request(url, params, header, retries=5):
             logging.info(f"[请求结果] url={url} code={code}")
 
             if code == -101:
-                logging.error("Cookie失效")
-                send_failure_notification("Cookie 失效", "需要重新登录")
-                return {"code": -101, "need_refresh": True}
+                # 关键优化：底层自动拦截 -101 并全局更新 Cookie
+                logging.warning(f"检测到 Cookie 失效 (-101)，尝试自动重新登录... url={url}")
+                if refresh_cookie():
+                    new_h = get_header()
+                    header["Cookie"] = new_h["Cookie"]  # 引用修改：直接更新最外层主循环的字典，让后续所有请求生效
+                    h["Cookie"] = new_h["Cookie"]       # 更新当前这次重试的字典
+                    time.sleep(2)
+                    continue  # 带着新 Cookie 重新尝试拉取
+                else:
+                    logging.error("Cookie 失效且重新登录失败！")
+                    send_failure_notification("Cookie 失效", "需要手动重新登录")
+                    return {"code": -101, "need_refresh": True}
 
             if code in (-799, -352, -509):
                 wait = base_delay * (2 ** i) + random.uniform(2.5, 6)
@@ -376,7 +384,7 @@ def load_following_cache():
                 data = json.load(f)
                 return data if isinstance(data, list) else []
         except Exception:
-            return []
+            return[]
     return[]
 
 
@@ -391,7 +399,7 @@ def load_dynamic_state():
     default_state = {
         "feed": {
             "last_ts": 0,
-            "last_ts_ids": [],
+            "last_ts_ids":[],
             "baseline": "",
             "offset": "",
             "recent_pushed_ids":[]
@@ -663,7 +671,6 @@ def format_dynamic_message(item):
 
     time_str = datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S") if pub_ts > 0 else "未知时间"
 
-    # 提取封面图（支持图片显示）
     cover = ""
     try:
         modules = item.get("modules", {}) or {}
@@ -683,7 +690,7 @@ def format_dynamic_message(item):
         "user": name,
         "message": text,
         "time": time_str,
-        "link": f"https://t.bilibili.com/{dyn_id}",          # 优化：统一自适应链接
+        "link": f"https://t.bilibili.com/{dyn_id}",
         "cover": cover,
         "kind": "dynamic"
     }
@@ -719,18 +726,11 @@ def push_worker():
                [item],
                notify_type="dynamic"
              )
-            
 
             if ok:
-                logging.info(
-                    f"[推送队列] 发送成功 user={item.get('user', '未知UP')} "
-                    f"link={item.get('link', '')}"
-                )
+                logging.info(f"[推送队列] 发送成功 link={item.get('link', '')}")
             else:
-                logging.warning(
-                    f"[推送队列] 发送失败 user={item.get('user', '未知UP')} "
-                    f"link={item.get('link', '')}"
-                )
+                logging.warning(f"[推送队列] 发送失败 link={item.get('link', '')}")
 
         except queue.Empty:
             continue
@@ -865,7 +865,6 @@ def init_feed_state(header, target_uids):
         logging.info(f"关注流初始化完成 baseline={baseline} offset={offset} last_ts={max_ts}")
     except Exception as e:
         logging.error(f"关注流初始化异常: {repr(e)}")
-        logging.error(traceback.format_exc())
 
     return seen_dynamic_ids, state
 
@@ -899,39 +898,27 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author = item.get("modules", {}).get("module_author", {}) or {}
             author_mid = str(author.get("mid", ""))
             pub_ts = int(author.get("pub_ts", 0) or 0)
-            top_type = item.get("type", "")
 
             if author_mid not in target_uids:
-                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
                 continue
-
             if not is_allowed_dynamic(item):
-                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=类型不允许")
                 continue
-
             if is_recent_pushed(state, dyn_id):
-                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=recent_pushed")
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 continue
-
             if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
-                logging.info(f"[动态命中] dyn_id={dyn_id} 进入候选")
                 new_items.add(dyn_id)
                 candidate_items[dyn_id] = item
-            else:
-                logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不是新动态候选")
-        except Exception as e:
-            logging.warning(f"处理单条动态异常: {repr(e)}")
+        except Exception:
+            pass
 
     pushed_ids = set()
     for dyn_id in new_items:
         if dyn_id in pushed_ids:
             continue
-
         item = candidate_items.get(dyn_id)
         if not item:
             continue
-
         try:
             author = item.get("modules", {}).get("module_author", {}) or {}
             pub_ts = int(author.get("pub_ts", 0) or 0)
@@ -943,15 +930,8 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
                 add_recent_pushed_id(state, dyn_id)
                 update_last_ts_state(feed_state, dyn_id, pub_ts)
                 has_new = True
-                logging.info(
-                    f"✅ 新动态 user={push_data.get('user', '未知UP')} dyn_id={dyn_id} "
-                    f"pub_time={push_data.get('time', '')} link={push_data.get('link', '')}"
-                )
-            else:
-                logging.warning(f"动态入队失败，放弃推送 dyn_id={dyn_id}")
         except Exception as e:
-            logging.error(f"动态推送处理异常 dyn_id={dyn_id} err={repr(e)}")
-            logging.error(traceback.format_exc())
+            logging.error(f"动态推送异常 dyn_id={dyn_id} err={repr(e)}")
 
     if has_new:
         last_new_dynamic_time = time.time()
@@ -976,32 +956,22 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     baseline = feed_state.get("baseline", "")
     old_baseline = baseline
 
-    logging.info(f"[动态扫描] 开始检查 update, baseline={baseline or 'EMPTY'}")
-
     update_data = check_feed_update(header, baseline)
     direct_fallback = False
 
     if update_data.get("code") != 0:
         consecutive_failures += 1
-        logging.warning(
-            f"[动态扫描] update 接口失败 code={update_data.get('code')}，连续失败={consecutive_failures}，退化到首页兜底"
-        )
         direct_fallback = True
         if consecutive_failures >= FAILURE_EXIT_BURST:
             exit_burst_mode("update_failed")
     else:
         update_num = update_data.get("data", {}).get("update_num", 0)
         consecutive_failures = 0
-
-        logging.info(f"[动态扫描] update 接口成功，update_num={update_num}")
-
         if update_num <= 0:
             consecutive_no_update_rounds += 1
-            logging.info(f"[动态扫描] 无更新，no_update_rounds={consecutive_no_update_rounds}")
             return False
 
         consecutive_no_update_rounds = 0
-        logging.info(f"📡 检测到关注流更新 {update_num} 条，开始拉取")
 
     has_new = False
     offset = ""
@@ -1011,15 +981,11 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
     any_success_page = False
 
     while page_count < FEED_FETCH_MAX_PAGES:
-        logging.info(f"[动态扫描] 拉取第 {page_count + 1} 页，offset={offset or 'EMPTY'}")
         data = fetch_following_feed_retry(header, offset=offset)
 
         if data.get("code") != 0:
             consecutive_failures += 1
             completed = False
-            logging.warning(
-                f"[动态扫描] 关注流拉取失败 page={page_count + 1} code={data.get('code')} 连续失败={consecutive_failures}"
-            )
             if consecutive_failures >= FAILURE_EXIT_BURST:
                 exit_burst_mode("feed_page_failed")
             break
@@ -1029,75 +995,54 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
         feed = data.get("data", {}) or {}
         items = feed.get("items") or[]
-        logging.info(f"[动态扫描] 第 {page_count + 1} 页返回 items={len(items)}")
 
         if not items:
-            logging.info(f"[动态扫描] 第 {page_count + 1} 页无 items，结束")
             break
 
         if page_count == 0:
             first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
             if first_page_baseline:
                 candidate_baseline = first_page_baseline
-            logging.info(f"[动态扫描] 候选 baseline={candidate_baseline or 'EMPTY'}")
 
         page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
-        logging.info(f"[动态扫描] 第 {page_count + 1} 页处理完成，page_has_new={page_has_new}")
-
         if page_has_new:
             has_new = True
 
         reached_old = False
         if old_baseline:
             for item in items:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("id_str") == old_baseline:
+                if isinstance(item, dict) and item.get("id_str") == old_baseline:
                     reached_old = True
-                    logging.info(f"[动态扫描] 命中旧 baseline={old_baseline}，停止翻页")
                     break
 
         offset = feed.get("offset", "")
         page_count += 1
 
-        if direct_fallback:
-            logging.info("[动态扫描] 当前为 fallback 模式，只拉首页后结束")
-            break
-        if reached_old:
-            break
-        if not offset:
-            logging.info("[动态扫描] offset 为空，停止翻页")
+        if direct_fallback or reached_old or not offset:
             break
 
         time.sleep(random.uniform(0.4, 0.8))
 
     if not has_new and not direct_fallback:
         try:
-            logging.info("[动态扫描] 本轮检测到 update 但未命中新动态，1秒后补拉首页确认")
             time.sleep(1.0)
             retry_data = fetch_following_feed_retry(header, offset="")
             if retry_data.get("code") == 0:
-                retry_items = (retry_data.get("data", {}) or {}).get("items") or []
-                logging.info(f"[动态扫描] 二次确认首页返回 items={len(retry_items)}")
+                retry_items = (retry_data.get("data", {}) or {}).get("items") or[]
                 if retry_items:
                     retry_has_new = process_feed_items(
                         retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
                     )
                     if retry_has_new:
                         has_new = True
-                        logging.info("[动态扫描] 二次确认补拉命中新动态")
-        except Exception as e:
-            logging.warning(f"[动态扫描] 二次确认补拉异常: {repr(e)}")
+        except Exception:
+            pass
 
     if completed and any_success_page:
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
         feed_state["offset"] = offset
-        logging.info(f"[动态扫描] baseline 已更新为 {feed_state['baseline']}, offset={offset or 'EMPTY'}")
-    else:
-        logging.warning("[动态扫描] 本轮关注流未完整成功，baseline 不前移")
 
-    logging.info(f"[动态扫描] 本轮结束 has_new={has_new}")
     return has_new
 
 
@@ -1116,7 +1061,6 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
         params = {"type": 1, "oid": oid, "sort": 0, "nohot": 1, "ps": 20, "pn": pn}
         data = wbi_request(url, params, header)
         if data.get("code") != 0:
-            logging.warning(f"评论扫描失败 code={data.get('code')} oid={oid} pn={pn}")
             break
 
         replies = data.get("data", {}).get("replies",[])
@@ -1146,7 +1090,6 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
 
                 if add_seen_comment(seen_comments, rpid):
                     comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
-                    # 优化：增强防空保护
                     member_info = r.get("member") or {}
                     content_info = r.get("content") or {}
                     new_list.append({
@@ -1156,8 +1099,8 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
                         "rpid": rpid
                     })
 
-            except Exception as e:
-                logging.warning(f"处理单条评论异常: {repr(e)}")
+            except Exception:
+                pass
 
         if startup_mode:
             if len(replies) < 20:
@@ -1190,18 +1133,10 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         if new_c:
             new_c.sort(key=lambda x: x["ctime"])
             payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-            try:
-                # 优化：异步发送启动补扫评论
-                threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
-            except Exception as e:
-                logging.error(f"启动补扫评论推送失败: {repr(e)}")
+            threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
             logging.info(f"🧩 启动补扫发送 {len(new_c)} 条评论")
-        else:
-            logging.info("🧩 启动补扫未发现新评论")
         return new_t
-    except Exception as e:
-        logging.error(f"启动补扫评论异常: {repr(e)}")
-        logging.error(traceback.format_exc())
+    except Exception:
         return int(time.time())
 
 
@@ -1211,10 +1146,7 @@ def get_latest_video(header):
         {"host_mid": TARGET_UID},
         header
     )
-    if data.get("code") == -101:
-        if refresh_cookie():
-            return get_latest_video(get_header())
-        return None
+    # 因为底层 safe_request 已经具备全局自动处理 Cookie 的能力，如果还是报错那直接丢弃即可
     if data.get("code") != 0:
         return None
 
@@ -1230,8 +1162,6 @@ def get_latest_video(header):
 
 def get_video_info(bv, header):
     data = safe_request(f"https://api.bilibili.com/x/web-interface/view?bvid={bv}", None, header)
-    if data.get("code") == -101 and refresh_cookie():
-        return get_video_info(bv, get_header())
     if data.get("code") == 0:
         d = data.get("data", {}) or {}
         aid = d.get("aid")
@@ -1276,7 +1206,7 @@ def get_header():
 
 
 def refresh_cookie():
-    logging.warning("Cookie失效，尝试重新登录...")
+    logging.warning("尝试通过 login_bilibili.py 重新登录...")
     try:
         subprocess.run([sys.executable, "login_bilibili.py"], check=True)
         logging.info("重新登录成功")
@@ -1284,7 +1214,6 @@ def refresh_cookie():
     except Exception as e:
         msg = f"重新登录失败: {e}"
         logging.error(msg)
-        send_failure_notification("Cookie 刷新失败", msg)
         return False
 
 
@@ -1307,7 +1236,7 @@ def start_monitoring(header):
         last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
 
     following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
-    following_list = [str(uid) for uid in following_list]
+    following_list =[str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list:
         following_list.append(str(SOURCE_UID))
     save_following_cache(following_list)
@@ -1352,7 +1281,6 @@ def start_monitoring(header):
                         last_state_save = now
                 except Exception as e:
                     logging.error(f"关注流扫描异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
                 last_d_check = now
 
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
@@ -1369,19 +1297,12 @@ def start_monitoring(header):
                         removed = old_set - new_set
 
                         if added or removed:
-                            for uid in added:
-                                logging.info(f"新UID {uid} 已加入过滤名单")
-                            for uid in removed:
-                                logging.info(f"UID {uid} 已移出过滤名单")
-
                             following_list = new_list
                             target_uids = set(following_list)
                             save_following_cache(following_list)
                             logging.info(f"过滤UID已刷新，当前共 {len(target_uids)} 个")
                 except Exception as e:
-                    logging.error(f"刷新关注列表异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
-
+                    pass
                 last_following_refresh = now
 
             if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
@@ -1400,12 +1321,10 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        # 优化：异步发送常规评论
                         threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
                         logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
-                except Exception as e:
-                    logging.error(f"常规评论扫描异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
+                except Exception:
+                    pass
 
             if oid and now - last_comment_rescan >= COMMENT_RESCAN_INTERVAL:
                 try:
@@ -1423,12 +1342,10 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        # 优化：异步发送补扫评论
                         threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
                         logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
-                except Exception as e:
-                    logging.error(f"评论补扫异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
+                except Exception:
+                    pass
 
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info(
@@ -1447,10 +1364,8 @@ def start_monitoring(header):
                         last_read_time = int(time.time())
                         if oid:
                             last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
-                except Exception as e:
-                    logging.error(f"视频同步异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
-
+                except Exception:
+                    pass
                 last_v_check = now
 
             if now - last_seen_clean > 3600:
@@ -1459,15 +1374,13 @@ def start_monitoring(header):
                     prune_seen_comments(seen_comments)
                     last_seen_clean = now
                     logging.info("🧹 已清理历史动态/评论去重缓存")
-                except Exception as e:
-                    logging.error(f"缓存清理异常: {repr(e)}")
-                    logging.error(traceback.format_exc())
+                except Exception:
+                    pass
 
             time.sleep(0.5)
 
         except Exception:
             logging.error("主循环异常")
-            logging.error(traceback.format_exc())
             time.sleep(8)
 
 
