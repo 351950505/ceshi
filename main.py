@@ -4,6 +4,7 @@ import time
 import subprocess
 import random
 import logging
+import logging.handlers  # 新增：用于日志自动切割
 import traceback
 import hashlib
 import urllib.parse
@@ -25,7 +26,7 @@ HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3706948578969654
 
-FALLBACK_DYNAMIC_UIDS = [
+FALLBACK_DYNAMIC_UIDS =[
     "3546905852250875",
     "3546961271589219",
     "3546610447419885",
@@ -51,7 +52,7 @@ FOLLOWING_CACHE_FILE = "following_cache.json"
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
-RUN_START_MINUTE = 20      # 已修改为 9:20 启动
+RUN_START_MINUTE = 20      # 确认为 9:20 启动
 RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
@@ -127,7 +128,7 @@ last_seen_clean = time.time()
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab = [
+mixinKeyEncTab =[
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
     37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
@@ -173,20 +174,16 @@ def is_in_monitor_window(now_dt=None):
 
 
 def init_logging():
-    try:
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "w", encoding="utf-8") as f:
-                f.truncate()
-    except Exception:
-        pass
-
     logger = logging.getLogger()
     logger.handlers.clear()
     logger.setLevel(logging.INFO)
 
-    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    formatter = logging.Formatter("%(asctime)s[%(levelname)s] %(message)s")
 
-    file_handler = logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")
+    # 优化：每个日志文件最大 10MB，最多保留 3 个备份，防止磁盘撑爆
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
@@ -198,7 +195,7 @@ def init_logging():
     logger.addHandler(stream_handler)
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（增强排障版）")
+    logging.info("B站监控系统启动（增强排障版 + 防阻塞优化）")
     logging.info("=" * 60)
 
 
@@ -207,7 +204,11 @@ def send_failure_notification(title, message):
     if time.time() - _last_notify_time.get(key, 0) >= 600:
         _last_notify_time[key] = time.time()
         try:
-            notifier.send_webhook_notification(title, [{"user": "系统", "message": message}])
+            threading.Thread(
+                target=notifier.send_webhook_notification, 
+                args=(title,[{"user": "系统", "message": message}]), 
+                daemon=True
+            ).start()
         except Exception:
             pass
 
@@ -376,7 +377,7 @@ def load_following_cache():
                 return data if isinstance(data, list) else []
         except Exception:
             return []
-    return []
+    return[]
 
 
 def save_following_cache(uids):
@@ -393,7 +394,7 @@ def load_dynamic_state():
             "last_ts_ids": [],
             "baseline": "",
             "offset": "",
-            "recent_pushed_ids": []
+            "recent_pushed_ids":[]
         }
     }
 
@@ -415,7 +416,7 @@ def load_dynamic_state():
                     "last_ts_ids": list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT],
                     "baseline": feed.get("baseline", ""),
                     "offset": feed.get("offset", ""),
-                    "recent_pushed_ids": list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
+                    "recent_pushed_ids": list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
                 }
             }
         except Exception:
@@ -428,7 +429,7 @@ def save_dynamic_state(state):
     try:
         feed = state.setdefault("feed", {})
         feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
-        feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
+        feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
     except Exception as e:
         logging.error(f"保存 dynamic_state 失败: {repr(e)}")
@@ -474,7 +475,7 @@ def prune_seen_comments(seen_comments):
 
 def add_recent_pushed_id(state, dyn_id):
     feed = state.setdefault("feed", {})
-    recent = list(feed.get("recent_pushed_ids", []) or [])
+    recent = list(feed.get("recent_pushed_ids", []) or[])
     if dyn_id in recent:
         recent.remove(dyn_id)
     recent.insert(0, dyn_id)
@@ -483,13 +484,13 @@ def add_recent_pushed_id(state, dyn_id):
 
 def is_recent_pushed(state, dyn_id):
     feed = state.setdefault("feed", {})
-    recent = feed.get("recent_pushed_ids", []) or []
+    recent = feed.get("recent_pushed_ids", []) or[]
     return dyn_id in recent
 
 
 def update_last_ts_state(feed_state, dyn_id, pub_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
-    last_ts_ids = list(feed_state.get("last_ts_ids", []) or [])
+    last_ts_ids = list(feed_state.get("last_ts_ids", []) or[])
 
     if pub_ts > last_ts:
         feed_state["last_ts"] = pub_ts
@@ -502,7 +503,7 @@ def update_last_ts_state(feed_state, dyn_id, pub_ts):
 
 def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
-    last_ts_ids = set(feed_state.get("last_ts_ids", []) or [])
+    last_ts_ids = set(feed_state.get("last_ts_ids", []) or[])
 
     if now_ts - pub_ts > DYNAMIC_NEW_WINDOW:
         return False
@@ -547,7 +548,7 @@ def extract_dynamic_text(item):
         dyn = modules.get("module_dynamic") or {}
 
         desc = dyn.get("desc") or {}
-        nodes = desc.get("rich_text_nodes") or []
+        nodes = desc.get("rich_text_nodes") or[]
         if nodes:
             text = "".join(
                 n.get("text", "")
@@ -586,7 +587,7 @@ def extract_dynamic_text(item):
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
-            nodes = summary.get("rich_text_nodes") or []
+            nodes = summary.get("rich_text_nodes") or[]
             text = "".join(n.get("text", "") for n in nodes if isinstance(n, dict)).strip()
             text = normalize_text(text)
             title = normalize_text(opus.get("title") or "")
@@ -673,7 +674,7 @@ def format_dynamic_message(item):
         elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
         elif major.get("type") == "MAJOR_TYPE_OPUS":
-            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or \
+            cover = major.get("opus", {}).get("pics",[{}])[0].get("url", "") or \
                     major.get("opus", {}).get("cover", "")
     except Exception:
         cover = ""
@@ -682,8 +683,8 @@ def format_dynamic_message(item):
         "user": name,
         "message": text,
         "time": time_str,
-        "link": f"https://www.bilibili.com/opus/{dyn_id}",   # 电脑版链接
-        "cover": cover,                                      # 新增封面支持
+        "link": f"https://t.bilibili.com/{dyn_id}",          # 优化：统一自适应链接
+        "cover": cover,
         "kind": "dynamic"
     }
 
@@ -774,7 +775,7 @@ def check_feed_update(header, update_baseline):
 
 
 def get_following_list(uid, header):
-    following = []
+    following =[]
     pn = 1
     ps = 50
 
@@ -784,7 +785,7 @@ def get_following_list(uid, header):
         if data.get("code") != 0:
             break
 
-        items = data.get("data", {}).get("list", [])
+        items = data.get("data", {}).get("list",[])
         if not items:
             break
 
@@ -810,7 +811,7 @@ def init_feed_state(header, target_uids):
 
     try:
         max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
-        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids", []) or [])
+        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids", []) or[])
         offset = ""
         baseline = state.get("feed", {}).get("baseline", "")
 
@@ -821,7 +822,7 @@ def init_feed_state(header, target_uids):
                 break
 
             feed = data.get("data", {}) or {}
-            items = feed.get("items") or []
+            items = feed.get("items") or[]
 
             if page_idx == 0:
                 baseline = feed.get("update_baseline", "") or baseline
@@ -856,7 +857,7 @@ def init_feed_state(header, target_uids):
         state["feed"]["last_ts"] = max_ts
         state["feed"]["last_ts_ids"] = list(max_ts_ids)[:LAST_TS_IDS_LIMIT]
         if "recent_pushed_ids" not in state["feed"]:
-            state["feed"]["recent_pushed_ids"] = []
+            state["feed"]["recent_pushed_ids"] =[]
 
         save_dynamic_state(state)
         last_new_dynamic_time = time.time()
@@ -875,10 +876,10 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
     has_new = False
     feed_state = state.setdefault("feed", {
         "last_ts": 0,
-        "last_ts_ids": [],
+        "last_ts_ids":[],
         "baseline": "",
         "offset": "",
-        "recent_pushed_ids": []
+        "recent_pushed_ids":[]
     })
 
     candidate_items = {}
@@ -899,9 +900,6 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             author_mid = str(author.get("mid", ""))
             pub_ts = int(author.get("pub_ts", 0) or 0)
             top_type = item.get("type", "")
-
-            # 已注释掉每条动态的详细日志，消除重复输出
-            # logging.info(f"[动态项] dyn_id={dyn_id} mid={author_mid} pub_ts={pub_ts} type={top_type}")
 
             if author_mid not in target_uids:
                 logging.info(f"[动态过滤] dyn_id={dyn_id} 原因=不在目标UID")
@@ -969,10 +967,10 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
     feed_state = state.setdefault("feed", {
         "last_ts": 0,
-        "last_ts_ids": [],
+        "last_ts_ids":[],
         "baseline": "",
         "offset": "",
-        "recent_pushed_ids": []
+        "recent_pushed_ids":[]
     })
 
     baseline = feed_state.get("baseline", "")
@@ -1030,7 +1028,7 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
         any_success_page = True
 
         feed = data.get("data", {}) or {}
-        items = feed.get("items") or []
+        items = feed.get("items") or[]
         logging.info(f"[动态扫描] 第 {page_count + 1} 页返回 items={len(items)}")
 
         if not items:
@@ -1104,7 +1102,7 @@ def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
 
 
 def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1, startup_mode=False):
-    new_list = []
+    new_list =[]
     max_ctime = last_read_time
     safe_time = last_read_time - COMMENT_SAFE_WINDOW
     now_ts = int(time.time())
@@ -1121,7 +1119,7 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
             logging.warning(f"评论扫描失败 code={data.get('code')} oid={oid} pn={pn}")
             break
 
-        replies = data.get("data", {}).get("replies", [])
+        replies = data.get("data", {}).get("replies",[])
         if not replies:
             break
 
@@ -1148,9 +1146,12 @@ def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1,
 
                 if add_seen_comment(seen_comments, rpid):
                     comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
+                    # 优化：增强防空保护
+                    member_info = r.get("member") or {}
+                    content_info = r.get("content") or {}
                     new_list.append({
-                        "user": f"[{comment_time}] {r.get('member', {}).get('uname', '')}",
-                        "message": r.get("content", {}).get("message", ""),
+                        "user": f"[{comment_time}] {member_info.get('uname', '未知用户')}",
+                        "message": content_info.get("message", "（无内容）"),
                         "ctime": ctime,
                         "rpid": rpid
                     })
@@ -1190,7 +1191,8 @@ def startup_backfill_comments(oid, title, header, seen_comments):
             new_c.sort(key=lambda x: x["ctime"])
             payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
             try:
-                notifier.send_webhook_notification(title, payload)
+                # 优化：异步发送启动补扫评论
+                threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
             except Exception as e:
                 logging.error(f"启动补扫评论推送失败: {repr(e)}")
             logging.info(f"🧩 启动补扫发送 {len(new_c)} 条评论")
@@ -1216,7 +1218,7 @@ def get_latest_video(header):
     if data.get("code") != 0:
         return None
 
-    for item in (data.get("data", {}).get("items") or []):
+    for item in (data.get("data", {}).get("items") or[]):
         if item.get("type") == "DYNAMIC_TYPE_AV":
             try:
                 return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
@@ -1325,7 +1327,7 @@ def start_monitoring(header):
     logging.info("✅ 评论去重结构优化已启用（set + deque）")
     logging.info("✅ 动态类型过滤已启用")
     logging.info("✅ 评论增强版启动（常规1页 + 定时补扫2页 + 启动补扫）")
-    logging.info("✅ 仅在中国时间工作日 09:00-16:00 运行监听")
+    logging.info(f"✅ 仅在中国时间工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
 
     while True:
         try:
@@ -1336,7 +1338,7 @@ def start_monitoring(header):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
                         f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
-                        f"仅工作日 09:00-16:00 运行"
+                        f"仅工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行"
                     )
                     last_hb = now
                 time.sleep(OFF_HOURS_SLEEP)
@@ -1357,7 +1359,7 @@ def start_monitoring(header):
                 try:
                     new_list = get_following_list(SOURCE_UID, header)
                     if new_list:
-                        new_list = [str(uid) for uid in new_list]
+                        new_list =[str(uid) for uid in new_list]
                         if str(SOURCE_UID) not in new_list:
                             new_list.append(str(SOURCE_UID))
 
@@ -1398,7 +1400,8 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        notifier.send_webhook_notification(title, payload)
+                        # 优化：异步发送常规评论
+                        threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
                         logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
                 except Exception as e:
                     logging.error(f"常规评论扫描异常: {repr(e)}")
@@ -1420,7 +1423,8 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        notifier.send_webhook_notification(title, payload)
+                        # 优化：异步发送补扫评论
+                        threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
                         logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
                 except Exception as e:
                     logging.error(f"评论补扫异常: {repr(e)}")
