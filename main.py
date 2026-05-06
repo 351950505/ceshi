@@ -57,9 +57,6 @@ RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
-INIT_SLEEP_MIN, INIT_SLEEP_MAX = 3.5, 7.0
-STATE_SAVE_INTERVAL = 30
-
 BURST_MODE_DURATION = 12
 BURST_COOLDOWN = 20
 BURST_MAX_CHAIN = 3
@@ -79,7 +76,6 @@ FAILURE_SLOWDOWN_THRESHOLD = 3
 FAILURE_SLOW_INTERVAL_MIN = 3.5
 FAILURE_SLOW_INTERVAL_MAX = 5.0
 
-# ===== 连续无更新自适应降速 =====
 NO_UPDATE_SLOWDOWN_THRESHOLD_1 = 10
 NO_UPDATE_SLOWDOWN_THRESHOLD_2 = 30
 NO_UPDATE_INTERVAL_1_MIN = 2.6
@@ -95,23 +91,10 @@ RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
 
 # ===== 动态类型过滤 =====
-ALLOWED_DYNAMIC_TYPES = {
-    "",
-    "MAJOR_TYPE_OPUS",
-    "MAJOR_TYPE_ARCHIVE",
-    "MAJOR_TYPE_ARTICLE",
-    "MAJOR_TYPE_DRAW"
-}
-
-ALLOWED_TOP_LEVEL_TYPES = {
-    "DYNAMIC_TYPE_WORD",
-    "DYNAMIC_TYPE_DRAW",
-    "DYNAMIC_TYPE_AV",
-    "DYNAMIC_TYPE_ARTICLE",
-    "DYNAMIC_TYPE_FORWARD"
-}
-
+ALLOWED_DYNAMIC_TYPES = {"", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_ARTICLE", "MAJOR_TYPE_DRAW"}
+ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_AV", "DYNAMIC_TYPE_ARTICLE", "DYNAMIC_TYPE_FORWARD"}
 ALLOW_FORWARD_DYNAMIC = True
+
 # =============================================
 
 push_queue = queue.Queue(maxsize=500)
@@ -128,12 +111,7 @@ last_seen_clean = time.time()
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab =[
-    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
-    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
-    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
-    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
-]
+mixinKeyEncTab =[46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
 
 def atomic_write_json(path, data):
@@ -144,11 +122,9 @@ def atomic_write_json(path, data):
 
 
 def normalize_text(text):
-    if not text:
-        return ""
+    if not text: return ""
     text = str(text).replace("\r", "\n")
-    lines = [line.strip() for line in text.split("\n")]
-    lines =[line for line in lines if line]
+    lines =[line.strip() for line in text.split("\n") if line.strip()]
     return "\n".join(lines).strip()
 
 
@@ -156,47 +132,49 @@ def cut_text(text, max_len=800):
     text = normalize_text(text)
     if len(text) <= max_len:
         return text
-    return text[:max_len - 3].rstrip() + "..."
+    return text[:max_len-3].rstrip() + "..."
 
 
 def is_in_monitor_window(now_dt=None):
     if now_dt is None:
         now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
-
     if now_dt.weekday() not in RUN_WEEKDAYS:
         return False
-
-    current_hm = now_dt.hour * 60 + now_dt.minute
-    start_hm = RUN_START_HOUR * 60 + RUN_START_MINUTE
-    end_hm = RUN_END_HOUR * 60
-
-    return start_hm <= current_hm < end_hm
+    current = now_dt.hour * 60 + now_dt.minute
+    start = RUN_START_HOUR * 60 + RUN_START_MINUTE
+    end = RUN_END_HOUR * 60
+    return start <= current < end
 
 
 def init_logging():
-    # 彻底清理所有已有 handler，防止重复
+    # 彻底暴力清空当前环境内所有日志通道
     root = logging.getLogger()
-    for h in root.handlers[:]:
-        root.removeHandler(h)
-    root.handlers.clear()
-    root.setLevel(logging.INFO)
+    if root.hasHandlers():
+        root.handlers.clear()
+    
+    # 【标记测试】：注意这里加了 [BILI] 前缀！
+    # 如果输出两行，只有一行带 [BILI]，说明 100% 有老旧进程没被杀掉！
+    formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
 
-    formatter = logging.Formatter("%(asctime)s[%(levelname)s] %(message)s")
-
+    # 配置 1：文件写入器
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
-
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(formatter)
-
     root.addHandler(file_handler)
-    root.addHandler(stream_handler)
+
+    # 配置 2：终端打印器（加了环境检测防冲突）
+    # sys.stdout.isatty() 可以判断是否为真实屏幕。如果是在宝塔面板或被重定向到了文件，则跳过终端打印！
+    if sys.stdout.isatty():
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        root.addHandler(stream_handler)
+
+    root.setLevel(logging.INFO)
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动（终极去重日志版）")
+    logging.info("B站监控系统启动（环境隔离+追踪版）")
     logging.info("=" * 60)
 
 
@@ -205,11 +183,9 @@ def send_failure_notification(title, message):
     if time.time() - _last_notify_time.get(key, 0) >= 600:
         _last_notify_time[key] = time.time()
         try:
-            threading.Thread(
-                target=notifier.send_webhook_notification, 
-                args=(title, [{"user": "系统", "message": message}]), 
-                daemon=True
-            ).start()
+            threading.Thread(target=notifier.send_webhook_notification, 
+                           args=(title, [{"user": "系统", "message": message}]), 
+                           daemon=True).start()
         except Exception:
             pass
 
@@ -400,7 +376,7 @@ def load_dynamic_state():
     default_state = {
         "feed": {
             "last_ts": 0,
-            "last_ts_ids": [],
+            "last_ts_ids":[],
             "baseline": "",
             "offset": "",
             "recent_pushed_ids":[]
@@ -713,30 +689,16 @@ def push_worker():
     while True:
         try:
             item = push_queue.get(timeout=1)
-            if not item:
-                continue
-
-            logging.info(
-                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
-                f"time={item.get('time', '')} link={item.get('link', '')}"
-            )
+            if not item: continue
 
             title = f"{item.get('user', '未知UP')} 发布了新动态"
-            ok = notifier.send_webhook_notification(
-               title,[item],
-               notify_type="dynamic"
-            )
+            ok = notifier.send_webhook_notification(title, [item], notify_type="dynamic")
 
-            if ok:
-                logging.info(f"[推送队列] 发送成功 link={item.get('link', '')}")
-            else:
-                logging.warning(f"[推送队列] 发送失败 link={item.get('link', '')}")
-
+            logging.info(f"[推送] {'成功' if ok else '失败'} {item.get('user')} {item.get('link','')}")
         except queue.Empty:
             continue
         except Exception as e:
             logging.error(f"推送失败: {repr(e)}")
-            logging.error(traceback.format_exc())
 
 
 def fetch_following_feed(header, offset="", update_baseline=""):
@@ -1132,7 +1094,7 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         )
         if new_c:
             new_c.sort(key=lambda x: x["ctime"])
-            payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
+            payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
             threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
             logging.info(f"🧩 启动补扫发送 {len(new_c)} 条评论")
         return new_t
@@ -1286,7 +1248,7 @@ def start_monitoring(header):
                 try:
                     new_list = get_following_list(SOURCE_UID, header)
                     if new_list:
-                        new_list = [str(uid) for uid in new_list]
+                        new_list =[str(uid) for uid in new_list]
                         if str(SOURCE_UID) not in new_list:
                             new_list.append(str(SOURCE_UID))
 
