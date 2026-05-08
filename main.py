@@ -14,8 +14,16 @@ from requests.adapters import HTTPAdapter
 import datetime
 import threading
 import queue
-from zoneinfo import ZoneInfo
+import signal
 from collections import deque
+
+# 兼容 CentOS 7 的 Python 3.6
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    import pytz
+    def ZoneInfo(tz_str):
+        return pytz.timezone(tz_str)
 
 import database as db
 import notifier
@@ -98,14 +106,18 @@ ALLOWED_DYNAMIC_TYPES = {"", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_ARCHIVE", "MAJOR_TYP
 ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TYPE_AV", "DYNAMIC_TYPE_ARTICLE", "DYNAMIC_TYPE_FORWARD"}
 ALLOW_FORWARD_DYNAMIC = True
 
-# =============================================
-# 网络层极限优化：开启全局 Session 持久化连接与连接池复用 (HTTP Keep-Alive)
+# ================= 全局状态与网络层 =================
+# 全局运行标识 (Graceful Shutdown)
+IS_RUNNING = True
+
+# 网络层极限优化：全局 Session 持久化连接池
 REQ_SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=1)
 REQ_SESSION.mount('http://', _adapter)
 REQ_SESSION.mount('https://', _adapter)
 
-push_queue = queue.Queue(maxsize=500)
+# 全局统一推送队列 (限流防熔断核心)
+notify_queue = queue.Queue(maxsize=1000)
 
 burst_end_time = 0
 last_burst_trigger_time = 0
@@ -121,12 +133,18 @@ WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab =[46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
 
+# ================== 工具函数 ==================
+def signal_handler(signum, frame):
+    """接管退出信号，实现优雅退出"""
+    global IS_RUNNING
+    logging.info("\n🛑 接收到关闭信号 (SIGTERM/SIGINT)，准备保存数据安全退出...")
+    IS_RUNNING = False
+
 def atomic_write_json(path, data):
     tmp_path = f"{path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, path)
-
 
 def normalize_text(text):
     if not text: return ""
@@ -134,17 +152,20 @@ def normalize_text(text):
     lines =[line.strip() for line in text.split("\n") if line.strip()]
     return "\n".join(lines).strip()
 
-
 def cut_text(text, max_len=800):
     text = normalize_text(text)
     if len(text) <= max_len:
         return text
     return text[:max_len-3].rstrip() + "..."
 
-
 def is_in_monitor_window(now_dt=None):
     if now_dt is None:
-        now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
+        try:
+            now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
+        except Exception:
+            # 兼容极老系统兜底
+            now_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            
     if now_dt.weekday() not in RUN_WEEKDAYS:
         return False
     current = now_dt.hour * 60 + now_dt.minute
@@ -152,8 +173,7 @@ def is_in_monitor_window(now_dt=None):
     end = RUN_END_HOUR * 60
     return start <= current < end
 
-
-# 日志过滤器：拦截并隐藏钉钉 310000（预期内的关键词拦截）报错
+# 日志过滤器：拦截并隐藏钉钉 310000 报错
 class DingTalkFilter(logging.Filter):
     def filter(self, record):
         if "310000" in record.getMessage():
@@ -165,45 +185,82 @@ def init_logging():
     if root.hasHandlers():
         root.handlers.clear()
     
-    formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
+    formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
-    file_handler.addFilter(ding_filter) # 注入日志静音拦截器
+    file_handler.addFilter(ding_filter) 
     root.addHandler(file_handler)
 
     if sys.stdout.isatty():
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
-        stream_handler.addFilter(ding_filter) # 注入日志静音拦截器
+        stream_handler.addFilter(ding_filter) 
         root.addHandler(stream_handler)
 
     root.setLevel(logging.INFO)
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (Session加速版 + O(1)去重版)")
+    logging.info("B站监控系统启动 (企业级最终版: 队列限流 + 优雅退出)")
     logging.info("=" * 60)
 
-
 def send_failure_notification(title, message):
+    global _last_notify_time
+    if len(_last_notify_time) > 200:
+        _last_notify_time.clear() # 防内存泄漏极简回收
+        
     key = f"{title}:{message[:100]}"
     if time.time() - _last_notify_time.get(key, 0) >= 600:
         _last_notify_time[key] = time.time()
+        # 错误通知直接塞入全局发送队列排队
+        safe_enqueue_notify(title, [{"user": "系统", "message": message}], "system")
+
+# ================== 统一推送队列 ==================
+def safe_enqueue_notify(title, items, notify_type="dynamic"):
+    try:
+        notify_queue.put_nowait({"title": title, "items": items, "notify_type": notify_type})
+        return True
+    except queue.Full:
+        logging.warning("notify_queue 推送队列已满，丢弃一条推送！(可能被严重限流)")
+        return False
+    except Exception as e:
+        logging.error(f"推送入队失败: {repr(e)}")
+        return False
+
+def notify_worker():
+    """统一推送消费线程：匀速排队，彻底防止钉钉/飞书限流熔断"""
+    while IS_RUNNING:
         try:
-            threading.Thread(target=notifier.send_webhook_notification, 
-                           args=(title,[{"user": "系统", "message": message}]), 
-                           daemon=True).start()
-        except Exception:
-            pass
+            task = notify_queue.get(timeout=1)
+            title = task.get("title")
+            items = task.get("items")
+            ntype = task.get("notify_type")
+
+            if ntype == "dynamic":
+                logging.info(f"[排队发送] 正在推送新动态: {items[0].get('link', '')}")
+            elif ntype == "comment":
+                logging.info(f"[排队发送] 正在推送新评论: {len(items)}条")
+
+            ok = notifier.send_webhook_notification(title, items, notify_type=ntype)
+
+            if not ok and ntype != "system":
+                logging.warning(f"[发送失败] 类型: {ntype}")
+            
+            # 【重要】严格控制频率，每隔 2 秒发一次，永远不会触发第三方平台的拦截限制
+            time.sleep(2)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logging.error(f"推送消费失败: {repr(e)}")
 
 
 def safe_request(url, params, header, retries=5):
     h = header.copy()
-    h.pop("Connection", None) # 彻底移除 close 强制激活底层持久化连接
+    h.pop("Connection", None) # 激活底层持久化连接
     base_delay = 3
 
     for i in range(retries):
@@ -409,7 +466,7 @@ def load_dynamic_state():
             return {
                 "feed": {
                     "last_ts": int(feed.get("last_ts", 0) or 0),
-                    "last_ts_ids": list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT],
+                    "last_ts_ids": list(feed.get("last_ts_ids", []) or[])[:LAST_TS_IDS_LIMIT],
                     "baseline": feed.get("baseline", ""),
                     "offset": feed.get("offset", ""),
                     "recent_pushed_ids": list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
@@ -475,7 +532,7 @@ def update_last_ts_state(feed_state, dyn_id, pub_ts):
 
     if pub_ts > last_ts:
         feed_state["last_ts"] = pub_ts
-        feed_state["last_ts_ids"] = [dyn_id]
+        feed_state["last_ts_ids"] =[dyn_id]
     elif pub_ts == last_ts:
         if dyn_id not in last_ts_ids:
             last_ts_ids.append(dyn_id)
@@ -669,48 +726,6 @@ def format_dynamic_message(item):
     }
 
 
-def safe_enqueue_push(item):
-    try:
-        push_queue.put_nowait(item)
-        return True
-    except queue.Full:
-        logging.warning("push_queue 已满，丢弃一条动态推送")
-        return False
-    except Exception as e:
-        logging.error(f"推送入队失败: {repr(e)}")
-        return False
-
-
-def push_worker():
-    while True:
-        try:
-            item = push_queue.get(timeout=1)
-            if not item:
-                continue
-
-            logging.info(
-                f"[推送队列] 开始发送 user={item.get('user', '未知UP')} "
-                f"time={item.get('time', '')} link={item.get('link', '')}"
-            )
-
-            title = f"{item.get('user', '未知UP')} 发布了新动态"
-            ok = notifier.send_webhook_notification(
-               title,[item],
-               notify_type="dynamic"
-            )
-
-            if ok:
-                logging.info(f"[推送队列] 发送成功 link={item.get('link', '')}")
-            else:
-                logging.warning(f"[推送队列] 发送失败 link={item.get('link', '')}")
-
-        except queue.Empty:
-            continue
-        except Exception as e:
-            logging.error(f"推送失败: {repr(e)}")
-            logging.error(traceback.format_exc())
-
-
 def fetch_following_feed(header, offset="", update_baseline=""):
     params = {
         "type": "all",
@@ -779,12 +794,11 @@ def init_feed_state(header, target_uids):
     global last_new_dynamic_time
 
     state = load_dynamic_state()
-    # 启用全新的高性能动态缓存池
     seen_dynamic_ids = init_seen_cache()
 
     try:
         max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
-        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids", []) or[])
+        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids",[]) or[])
         offset = ""
         baseline = state.get("feed", {}).get("baseline", "")
 
@@ -866,7 +880,6 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             if not dyn_id:
                 continue
 
-            # 使用高性能结构，无感写入，超限自动剔除最老记录
             add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS)
 
             author = item.get("modules", {}).get("module_author", {}) or {}
@@ -898,7 +911,8 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             pub_ts = int(author.get("pub_ts", 0) or 0)
 
             push_data = format_dynamic_message(item)
-            ok = safe_enqueue_push(push_data)
+            # 通过全局队列推送动态
+            ok = safe_enqueue_notify(f"{push_data.get('user', '未知UP')} 发布了新动态", [push_data], "dynamic")
             if ok:
                 pushed_ids.add(dyn_id)
                 add_recent_pushed_id(state, dyn_id)
@@ -1107,8 +1121,9 @@ def startup_backfill_comments(oid, title, header, seen_comments):
         if new_c:
             new_c.sort(key=lambda x: x["ctime"])
             payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
-            threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
-            logging.info(f"🧩 启动补扫发送 {len(new_c)} 条评论")
+            # 加入全局队列
+            safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
+            logging.info(f"🧩 启动补扫发现在队评论: {len(new_c)} 条")
         return new_t
     except Exception:
         return int(time.time())
@@ -1193,6 +1208,10 @@ def refresh_cookie():
 def start_monitoring(header):
     global last_state_save, last_new_dynamic_time
 
+    # 注册优雅退出信号
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     last_v_check = 0
     last_hb = 0
     last_comment_check = 0
@@ -1221,11 +1240,13 @@ def start_monitoring(header):
     if last_new_dynamic_time == 0:
         last_new_dynamic_time = time.time()
 
-    threading.Thread(target=push_worker, daemon=True).start()
+    # 开启统一推送消费线程
+    threading.Thread(target=notify_worker, daemon=True).start()
 
     logging.info(f"✅ 系统初始化完成，开始在工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
 
-    while True:
+    # 使用全局标志替换死循环，支持 Graceful Shutdown
+    while IS_RUNNING:
         try:
             now = time.time()
 
@@ -1288,8 +1309,8 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
-                        logging.info(f"💬 常规扫描发送 {len(new_c)} 条评论")
+                        # 统一放入全局队列，防止并发封控
+                        safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
                 except Exception:
                     pass
 
@@ -1309,8 +1330,7 @@ def start_monitoring(header):
                     if new_c:
                         new_c.sort(key=lambda x: x["ctime"])
                         payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
-                        threading.Thread(target=notifier.send_webhook_notification, args=(title, payload), daemon=True).start()
-                        logging.info(f"🔁 补扫发送 {len(new_c)} 条评论")
+                        safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
                 except Exception:
                     pass
 
@@ -1338,8 +1358,15 @@ def start_monitoring(header):
             time.sleep(0.5)
 
         except Exception:
-            logging.error("主循环异常")
-            time.sleep(8)
+            if IS_RUNNING:
+                logging.error("主循环异常")
+                time.sleep(8)
+            else:
+                break
+
+    # 当接收到结束信号退出循环后执行：安全保存进度
+    save_dynamic_state(state)
+    logging.info("💾 内存读取进度已安全落盘，主程序完美退出。")
 
 
 if __name__ == "__main__":
