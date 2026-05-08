@@ -58,7 +58,8 @@ RUN_END_HOUR = 16
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
-STATE_SAVE_INTERVAL = 30
+STATE_SAVE_INTERVAL = 30     # 定时保存状态的间隔
+
 BURST_MODE_DURATION = 12
 BURST_COOLDOWN = 20
 BURST_MAX_CHAIN = 3
@@ -152,22 +153,32 @@ def is_in_monitor_window(now_dt=None):
     return start <= current < end
 
 
+# 日志过滤器：拦截并隐藏钉钉 310000（预期内的关键词拦截）报错
+class DingTalkFilter(logging.Filter):
+    def filter(self, record):
+        if "310000" in record.getMessage():
+            return False
+        return True
+
 def init_logging():
     root = logging.getLogger()
     if root.hasHandlers():
         root.handlers.clear()
     
     formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
+    ding_filter = DingTalkFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
+    file_handler.addFilter(ding_filter) # 注入日志静音拦截器
     root.addHandler(file_handler)
 
     if sys.stdout.isatty():
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
+        stream_handler.addFilter(ding_filter) # 注入日志静音拦截器
         root.addHandler(stream_handler)
 
     root.setLevel(logging.INFO)
@@ -192,15 +203,13 @@ def send_failure_notification(title, message):
 
 def safe_request(url, params, header, retries=5):
     h = header.copy()
-    # 彻底移除 h["Connection"] = "close"，激活底层 TCP Session 长连接复用！
-    h.pop("Connection", None) 
+    h.pop("Connection", None) # 彻底移除 close 强制激活底层持久化连接
     base_delay = 3
 
     for i in range(retries):
         start_ts = time.time()
         try:
             logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
-            # 使用带持久化连接池的 REQ_SESSION，速度显著提升
             r = REQ_SESSION.get(url, headers=h, params=params, timeout=12)
             cost = time.time() - start_ts
             logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
@@ -1193,7 +1202,6 @@ def start_monitoring(header):
 
     oid, title = sync_latest_video(header)
 
-    # 两大去重系统已完成高效率合并
     seen_comments = init_seen_cache()
     last_read_time = int(time.time())
 
@@ -1319,7 +1327,6 @@ def start_monitoring(header):
                     res = sync_latest_video(header)
                     if res:
                         oid, title = res
-                        # 注意：遇到新视频时，重建空缓存池
                         seen_comments = init_seen_cache()
                         last_read_time = int(time.time())
                         if oid:
@@ -1327,9 +1334,6 @@ def start_monitoring(header):
                 except Exception:
                     pass
                 last_v_check = now
-
-            # 由于引入了 O(1) deqeue + set 自动去重数据结构
-            # 原有的 last_seen_clean 和 每隔3600秒清理老旧字典的代码块被彻底删除，极大提升稳定性。
 
             time.sleep(0.5)
 
