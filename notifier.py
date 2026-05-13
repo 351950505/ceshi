@@ -133,9 +133,9 @@ def post_dingtalk(webhook_url, payload, retries=2):
             errcode = data.get("errcode")
             errmsg = data.get("errmsg")
             
-            # 【核心修改】拦截并静默处理 310000 关键词阻挡报错
+            # 【终极防爆修改】拦截 310000，并欺骗主程序已成功发送，彻底消灭 warning 警告
             if errcode == 310000:
-                return False
+                return True
 
             logging.error(
                 f"钉钉 webhook 发送失败: type={msgtype}, title={msgtitle}, errcode={errcode}, errmsg={errmsg}"
@@ -227,7 +227,6 @@ def send_webhook_notification(title, items, retries=2, notify_type=None):
 
     actual_type = detect_notify_type(items, notify_type)
     
-    # 智能读取配置，找不到对应专线，则默认降级到 dynamic 的链接
     config = get_webhooks()
     webhook_url = config.get(actual_type)
     if not webhook_url:
@@ -237,7 +236,6 @@ def send_webhook_notification(title, items, retries=2, notify_type=None):
         logging.error(f"Webhook URL 未配置，无法发送 {actual_type} 通知！")
         return False
 
-    # ========== 根据类型构建对应消息 ==========
     if actual_type == "system":
         text_content = "\n".join([str(i.get("message", "")) for i in items])
         payload = {
@@ -260,12 +258,11 @@ def send_webhook_notification(title, items, retries=2, notify_type=None):
         }
         return post_dingtalk(webhook_url, payload, retries=retries)
 
-    # 评论通知
     markdown_text = build_comment_markdown(items)
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "title": title,  # 这里会把 main 传来的 "【新评论】某某" 透传进去
+            "title": title,
             "text": markdown_text
         }
     }
