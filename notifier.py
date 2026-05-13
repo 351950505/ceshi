@@ -14,7 +14,7 @@ _session.headers.update({
     "User-Agent": "BilibiliNotifier/1.0"
 })
 
-_cached_webhook = None
+_cached_webhooks = None
 
 if not logging.getLogger().handlers:
     logging.basicConfig(
@@ -24,27 +24,31 @@ if not logging.getLogger().handlers:
 
 
 def check_webhook_configured():
-    try:
-        return bool(get_webhook())
-    except Exception as e:
-        logging.error(f"检查 webhook 配置失败: {e}")
-        return False
+    config = get_webhooks()
+    return bool(config.get("dynamic") or config.get("comment"))
 
 
-def get_webhook(force_reload=False):
-    global _cached_webhook
-    if _cached_webhook is not None and not force_reload:
-        return _cached_webhook
+def get_webhooks(force_reload=False):
+    """解析键值对格式的 webhook_config.txt"""
+    global _cached_webhooks
+    if _cached_webhooks is not None and not force_reload:
+        return _cached_webhooks
+    
+    config = {}
     try:
         if not os.path.exists(WEBHOOK_CONFIG_FILE):
-            _cached_webhook = ""
-            return ""
+            _cached_webhooks = config
+            return config
         with open(WEBHOOK_CONFIG_FILE, "r", encoding="utf-8") as f:
-            _cached_webhook = f.read().strip()
-            return _cached_webhook
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    config[k.strip()] = v.strip()
+        _cached_webhooks = config
     except Exception as e:
         logging.error(f"读取 webhook 配置失败: {e}")
-        return ""
+    return config
 
 
 def truncate_text(text, max_len):
@@ -77,7 +81,7 @@ def format_quote_block(text, max_len, max_lines=12):
     text = smart_truncate(text, max_len=max_len, max_lines=max_lines)
     if not text:
         return "> （无内容）"
-    result = []
+    result =[]
     for line in text.split("\n"):
         line = line.strip()
         result.append(f"> {line}" if line else ">")
@@ -93,10 +97,9 @@ def normalize_link(link):
     return ""
 
 
-def post_dingtalk(payload, retries=2):
-    url = get_webhook()
-    if not url:
-        logging.error("Webhook URL 未配置，请在 webhook_config.txt 中填写")
+def post_dingtalk(webhook_url, payload, retries=2):
+    if not webhook_url:
+        logging.error("Webhook URL 为空，无法推送")
         return False
 
     msgtype = payload.get("msgtype", "unknown")
@@ -104,10 +107,10 @@ def post_dingtalk(payload, retries=2):
 
     for attempt in range(retries + 1):
         try:
-            resp = _session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+            resp = _session.post(webhook_url, json=payload, timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 logging.error(
-                    f"钉钉 webhook HTTP 异常: status={resp.status_code}, title={msgtitle}, body={resp.text[:300]}"
+                    f"钉钉 webhook HTTP 异常: status={resp.status_code}, title={msgtitle}"
                 )
                 if 500 <= resp.status_code < 600 and attempt < retries:
                     time.sleep(1 + attempt + random.random())
@@ -117,7 +120,7 @@ def post_dingtalk(payload, retries=2):
             try:
                 data = resp.json()
             except Exception:
-                logging.error(f"钉钉 webhook 返回非 JSON: title={msgtitle}, body={resp.text[:300]}")
+                logging.error(f"钉钉 webhook 返回非 JSON: title={msgtitle}")
                 if attempt < retries:
                     time.sleep(1 + attempt + random.random())
                     continue
@@ -129,6 +132,11 @@ def post_dingtalk(payload, retries=2):
 
             errcode = data.get("errcode")
             errmsg = data.get("errmsg")
+            
+            # 【核心修改】拦截并静默处理 310000 关键词阻挡报错
+            if errcode == 310000:
+                return False
+
             logging.error(
                 f"钉钉 webhook 发送失败: type={msgtype}, title={msgtitle}, errcode={errcode}, errmsg={errmsg}"
             )
@@ -137,17 +145,9 @@ def post_dingtalk(payload, retries=2):
                 continue
             return False
 
-        except requests.RequestException as e:
-            logging.error(
-                f"钉钉 webhook 请求异常 ({attempt + 1}/{retries + 1}): type={msgtype}, title={msgtitle}, error={e}"
-            )
-            if attempt < retries:
-                time.sleep(1 + attempt + random.random())
-            else:
-                return False
         except Exception as e:
             logging.error(
-                f"钉钉 webhook 未知异常 ({attempt + 1}/{retries + 1}): type={msgtype}, title={msgtitle}, error={e}"
+                f"钉钉 webhook 异常 ({attempt + 1}/{retries + 1}): type={msgtype}, title={msgtitle}, error={e}"
             )
             if attempt < retries:
                 time.sleep(1 + attempt + random.random())
@@ -157,30 +157,27 @@ def post_dingtalk(payload, retries=2):
 
 
 def build_dynamic_markdown(items):
-    """优化版：支持动态封面图片显示"""
+    """支持动态封面图片显示"""
     lines = ["## B站动态更新", ""]
     for idx, item in enumerate(items, 1):
         user = clean_text(item.get("user", "未知UP")) or "未知UP"
         message = item.get("message", "")
         pub_time = clean_text(item.get("time", ""))
         link = normalize_link(item.get("link", ""))
-        cover = clean_text(item.get("cover", ""))   # 支持封面图
+        cover = clean_text(item.get("cover", ""))
 
         lines.append(f"### {user}")
         if pub_time:
             lines.append(pub_time)
         lines.append("")
 
-        # 正文
         lines.append(format_quote_block(message, max_len=1200, max_lines=12))
         lines.append("")
 
-        # 插入封面图片（钉钉Markdown支持）
         if cover and (cover.startswith("http://") or cover.startswith("https://")):
             lines.append(f"![动态封面]({cover})")
             lines.append("")
 
-        # 原动态链接
         if link:
             lines.append(f"[查看原动态]({link})")
             lines.append("")
@@ -208,7 +205,7 @@ def build_comment_markdown(comments):
 
 
 def detect_notify_type(items, notify_type):
-    if notify_type in ("dynamic", "comment"):
+    if notify_type in ("dynamic", "comment", "system"):
         return notify_type
     if not items:
         return "comment"
@@ -222,61 +219,54 @@ def detect_notify_type(items, notify_type):
 
 def send_webhook_notification(title, items, retries=2, notify_type=None):
     if not isinstance(items, list):
-        items = []
-    if not items:
+        items =[]
+        
+    if not items and notify_type != "system":
         logging.info("没有可发送内容，跳过通知")
         return False
 
     actual_type = detect_notify_type(items, notify_type)
+    
+    # 智能读取配置，找不到对应专线，则默认降级到 dynamic 的链接
+    config = get_webhooks()
+    webhook_url = config.get(actual_type)
+    if not webhook_url:
+        webhook_url = config.get("dynamic")
+        
+    if not webhook_url:
+        logging.error(f"Webhook URL 未配置，无法发送 {actual_type} 通知！")
+        return False
+
+    # ========== 根据类型构建对应消息 ==========
+    if actual_type == "system":
+        text_content = "\n".join([str(i.get("message", "")) for i in items])
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": f"### {title}\n\n> {text_content}"
+            }
+        }
+        return post_dingtalk(webhook_url, payload, retries=retries)
 
     if actual_type == "dynamic":
         markdown_text = build_dynamic_markdown(items)
         payload = {
             "msgtype": "markdown",
             "markdown": {
-                "title": "B站动态更新",
+                "title": title,
                 "text": markdown_text
             }
         }
-        return post_dingtalk(payload, retries=retries)
+        return post_dingtalk(webhook_url, payload, retries=retries)
 
     # 评论通知
     markdown_text = build_comment_markdown(items)
     payload = {
         "msgtype": "markdown",
         "markdown": {
-            "title": "B站新评论",
+            "title": title,  # 这里会把 main 传来的 "【新评论】某某" 透传进去
             "text": markdown_text
         }
     }
-    return post_dingtalk(payload, retries=retries)
-
-
-def send_text_message(text, retries=2):
-    text = truncate_text(clean_text(text), MAX_TEXT_LENGTH)
-    if not text:
-        logging.info("文本消息为空，跳过发送")
-        return False
-    payload = {
-        "msgtype": "text",
-        "text": {
-            "content": text
-        }
-    }
-    return post_dingtalk(payload, retries=retries)
-
-
-def send_markdown_message(title, markdown_text, retries=2):
-    title = clean_text(title) or "通知"
-    markdown_text = truncate_text(clean_text(markdown_text), MAX_MARKDOWN_LENGTH)
-    if not markdown_text:
-        logging.info(f"Markdown 消息为空，跳过发送: title={title}")
-        return False
-    payload = {
-        "msgtype": "markdown",
-        "markdown": {
-            "title": title,
-            "text": markdown_text
-        }
-    }
-    return post_dingtalk(payload, retries=retries)
+    return post_dingtalk(webhook_url, payload, retries=retries)
