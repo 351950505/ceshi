@@ -1,1 +1,2 @@
-https://oapi.dingtalk.com/robot/send?access_token=679c76bcd80e85ab677362b890ab1a9d2853b1373d66465681ae0934b0f413d6
+dynamic=https://oapi.dingtalk.com/robot/send?access_token=679c76bcd80e85ab677362b890ab1a9d2853b1373d66465681ae0934b0f413d6
+comment=https://oapi.dingtalk.com/robot/send?access_token=7a2d34b77db67eb5c085290ae869268878888363a55c62d0347233e63fe3aa0e
