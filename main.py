@@ -51,7 +51,7 @@ RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
 RUN_START_MINUTE = 20
-RUN_END_HOUR = 19       # 支持 19:00 前进行测试
+RUN_END_HOUR = 16       # 支持 19:00 前进行测试
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
