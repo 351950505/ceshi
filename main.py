@@ -189,17 +189,30 @@ def get_header():
 
 def safe_request(url, params, header, retries=5):
     h = header.copy(); h.pop("Connection", None) 
-    base_delay = 3
+    base_delay = 1
     for i in range(retries):
         try:
             r = REQ_SESSION.get(url, headers=h, params=params, timeout=12)
             try: data = r.json()
             except Exception: data = {"code": -500}
+            
             code = data.get("code")
-            if code in (-799, -352, -509): time.sleep(base_delay * (2 ** i) + random.uniform(2.5, 6)); continue
-            if code != 0 and i < retries - 1: time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5)); continue
+            
+            # 【核心修复】：如果是纯匿名请求，返回 -101 是预期结果，直接放行秒过，不要原地发呆等重试！
+            if code == -101: 
+                return data
+                
+            if code in (-799, -352, -509): 
+                time.sleep(base_delay * (2 ** i) + random.uniform(1.0, 3.0))
+                continue
+                
+            if code != 0 and i < retries - 1: 
+                time.sleep(base_delay * (2 ** i) + random.uniform(0.5, 1.5))
+                continue
+                
             return data
-        except Exception: time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
+        except Exception: 
+            time.sleep(base_delay * (2 ** i) + random.uniform(0.5, 1.5))
     return {"code": -500}
 
 def getMixinKey(orig): return ''.join([orig[i] for i in mixinKeyEncTab])[:32]
@@ -215,14 +228,14 @@ def encWbi(params, img_key, sub_key):
 def update_wbi_keys(header):
     try:
         data = safe_request("https://api.bilibili.com/x/web-interface/nav", None, header)
-        if data.get("code") == 0:
-            img = data.get("data", {}).get("wbi_img", {})
-            img_url, sub_url = img.get("img_url", ""), img.get("sub_url", "")
-            if img_url and sub_url:
-                WBI_KEYS["img_key"] = img_url.rsplit("/", 1)[1].split(".")[0]
-                WBI_KEYS["sub_key"] = sub_url.rsplit("/", 1)[1].split(".")[0]
-                WBI_KEYS["last_update"] = time.time()
-                logging.info("WBI密钥已匿名更新")
+        # 【核心修复】：不再用 code == 0 判断，因为匿名请求会返回 -101，但依然带有 wbi_img 信息
+        img = data.get("data", {}).get("wbi_img", {})
+        img_url, sub_url = img.get("img_url", ""), img.get("sub_url", "")
+        if img_url and sub_url:
+            WBI_KEYS["img_key"] = img_url.rsplit("/", 1)[1].split(".")[0]
+            WBI_KEYS["sub_key"] = sub_url.rsplit("/", 1)[1].split(".")[0]
+            WBI_KEYS["last_update"] = time.time()
+            logging.info("✅ 匿名 WBI 签名密钥已成功获取！")
     except Exception: pass
 
 def wbi_request(url, params, header):
@@ -352,7 +365,6 @@ def format_dynamic_message(item):
     except Exception: cover = ""
     return {"user": name, "message": text, "time": time_str, "link": f"https://t.bilibili.com/{dyn_id}", "cover": cover, "kind": "dynamic"}
 
-# ================== 匿名轮询引擎 ==================
 def fetch_space_feed(header, uid):
     params = {"host_mid": str(uid), "timezone_offset": "-480", "platform": "web", "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete", "web_location": "333.1365"}
     return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", params, header)
@@ -443,20 +455,31 @@ def start_monitoring():
     global last_state_save, consecutive_no_update_rounds
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+    
     header = get_header()
+    
+    logging.info("⏳ 正在获取匿名 WBI 签名密钥...")
     update_wbi_keys(header)
+    
     last_hb = 0; last_following_refresh = 0; last_d_check = 0
 
-    following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
+    logging.info("⏳ 正在构建监控目标列表...")
+    following_list = load_following_cache()
+    if not following_list:
+        following_list = get_following_list(SOURCE_UID, header)
+    if not following_list:
+        logging.info("⚠️ 匿名状态下无权读取公共关注列表，自动启用备用的内置监控白名单。")
+        following_list = FALLBACK_DYNAMIC_UIDS[:]
+        
     following_list = [str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list: following_list.append(str(SOURCE_UID))
     save_following_cache(following_list)
 
     target_uids = list(set(following_list))
-    logging.info(f"雷达矩阵设定：共锁定 {len(target_uids)} 个目标 UP 主。")
+    logging.info(f"🎯 雷达矩阵设定：共锁定 {len(target_uids)} 个目标 UP 主。")
     if target_uids:
         est_time = len(target_uids) * ((NORMAL_INTERVAL_MIN + NORMAL_INTERVAL_MAX)/2)
-        logging.info(f"单轮空间雷达扫描预估耗时：{est_time:.1f} 秒")
+        logging.info(f"⏱️ 单轮空间雷达扫描预估耗时：{est_time:.1f} 秒")
     
     seen_dynamic_ids, state = init_space_state(header, target_uids)
     threading.Thread(target=notify_worker, daemon=True).start()
@@ -534,3 +557,8 @@ def start_monitoring():
 if __name__ == "__main__":
     init_logging()
     start_monitoring()
+EOF
+
+pkill -f main.py
+nohup python3 /opt/bilibili-comment/ceshi/main.py > /opt/bilibili-comment/ceshi/bili_monitor.log 2>&1 &
+tail -f /opt/bilibili-comment/ceshi/bili_monitor.log
