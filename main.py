@@ -1,9 +1,11 @@
 import sys
 import os
 import time
+import subprocess
 import random
 import logging
 import logging.handlers
+import traceback
 import hashlib
 import urllib.parse
 import json
@@ -27,11 +29,12 @@ except ImportError:
 import notifier
 
 # ================= 核心配置 =================
-HEARTBEAT_INTERVAL = 60
+TARGET_UID = 1671203508
+VIDEO_CHECK_INTERVAL = 21600
+HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3707011984264075  # 已修改为你的新 UID
+SOURCE_UID = 3707011984264075  # 你的最新目标 UID
 
-# 如果获取关注列表失败，将默认监控以下备用 UID
 FALLBACK_DYNAMIC_UIDS =[
     "3546905852250875",
     "3546961271589219",
@@ -49,7 +52,7 @@ RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
 RUN_START_MINUTE = 20
-RUN_END_HOUR = 19       # 支持 19:00 点前测试
+RUN_END_HOUR = 19       # 支持 19:00 前进行测试
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
@@ -59,7 +62,6 @@ BURST_MODE_DURATION = 12
 BURST_COOLDOWN = 20
 BURST_MAX_CHAIN = 3
 
-# 关注流接口支持标准 human 速率
 BURST_INTERVAL_MIN = 1.4
 BURST_INTERVAL_MAX = 1.9
 
@@ -83,9 +85,11 @@ NO_UPDATE_INTERVAL_2_MIN = 3.2
 NO_UPDATE_INTERVAL_2_MAX = 4.5
 
 MAX_SEEN_DYNAMIC_IDS = 3000
-DYNAMIC_NEW_WINDOW = 3600
-LAST_TS_IDS_LIMIT = 100
+DYNAMIC_NEW_WINDOW = 3600     # 设为 3600 秒(1小时)，防止 B 站服务器自身延迟导致漏掉新动态
+FEED_FETCH_MAX_PAGES = 3
+FEED_INIT_PAGES = 2           # 加上这行，解决 NameError 报错！
 RECENT_PUSHED_IDS_LIMIT = 1000
+LAST_TS_IDS_LIMIT = 100
 
 # ===== 动态类型过滤 =====
 ALLOWED_DYNAMIC_TYPES = {"", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_ARTICLE", "MAJOR_TYPE_DRAW"}
@@ -96,7 +100,7 @@ ALLOW_FORWARD_DYNAMIC = True
 # 全局运行标识 (Graceful Shutdown)
 IS_RUNNING = True
 
-# 极致优化：使用统一会话管理连接池、Header、Cookie与防风控指纹
+# 网络层极限优化：全局 Session 持久化连接池
 REQ_SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=15, pool_maxsize=15, max_retries=1)
 REQ_SESSION.mount('http://', _adapter)
@@ -167,53 +171,6 @@ def is_in_monitor_window(now_dt=None):
     end = RUN_END_HOUR * 60
     return start <= current < end
 
-def activate_session_cookies():
-    """模拟首页访问获取设备指纹 (buvid3/b_nut)"""
-    try:
-        logging.info("⏳ 正在模拟设备指纹并向 B 站注册安全 Cookie...")
-        resp = REQ_SESSION.get("https://www.bilibili.com/", timeout=10)
-        resp.close()
-        
-        uuid_sec = str(uuid.uuid4())
-        time_sec = str(int(time.time() * 1000 % 1e5)).ljust(5, "0")
-        _uuid = f"{uuid_sec}{time_sec}infoc"
-        
-        REQ_SESSION.cookies.set("_uuid", _uuid, domain=".bilibili.com")
-        REQ_SESSION.cookies.set("CURRENT_FNVAL", "4048", domain=".bilibili.com")
-        REQ_SESSION.cookies.set("blackside_state", "1", domain=".bilibili.com")
-        logging.info("✅ 浏览器安全指纹及 buvid3 风控 Cookie 激活成功！")
-        return True
-    except Exception as e:
-        logging.warning(f"⚠️ 模拟首页指纹激活失败 (可能影响高频防封): {e}")
-        return False
-
-def load_cookies_into_session():
-    """从 bili_cookie.txt 读取凭证并注入会话"""
-    try:
-        if not os.path.exists("bili_cookie.txt"):
-            logging.error("❌ 未找到 bili_cookie.txt，关注流需要 Cookie 支持！")
-            return False
-        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
-            cookie_str = f.read().strip()
-        
-        if not cookie_str:
-            logging.error("❌ bili_cookie.txt 内容为空！")
-            return False
-
-        # 解析并注入全局 Session
-        for item in cookie_str.split(";"):
-            item = item.strip()
-            if not item or "=" not in item:
-                continue
-            k, v = item.split("=", 1)
-            REQ_SESSION.cookies.set(k.strip(), v.strip(), domain=".bilibili.com")
-        
-        logging.info("✅ 账号登录 Cookie 载入成功！")
-        return True
-    except Exception as e:
-        logging.error(f"❌ 加载 Cookie 异常: {e}")
-        return False
-
 # 日志过滤器：拦截并隐藏钉钉 310000 报错
 class DingTalkFilter(logging.Filter):
     def filter(self, record):
@@ -226,7 +183,7 @@ def init_logging():
     if root.hasHandlers():
         root.handlers.clear()
     
-    formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
+    formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
@@ -246,19 +203,19 @@ def init_logging():
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (企业级最终版: 关注流防风控版)")
+    logging.info("B站监控系统启动 (关注流防风控版)")
     logging.info("=" * 60)
 
 def send_failure_notification(title, message):
     global _last_notify_time
     if len(_last_notify_time) > 200:
-        _last_notify_time.clear() 
+        _last_notify_time.clear() # 防内存泄漏极简回收
         
     key = f"{title}:{message[:100]}"
     if time.time() - _last_notify_time.get(key, 0) >= 600:
         _last_notify_time[key] = time.time()
+        # 错误通知直接塞入全局发送队列排队
         safe_enqueue_notify(title, [{"user": "系统", "message": message}], "system")
-
 
 # ================== 统一推送队列 ==================
 def safe_enqueue_notify(title, items, notify_type="dynamic"):
@@ -269,10 +226,13 @@ def safe_enqueue_notify(title, items, notify_type="dynamic"):
         return False
 
 def notify_worker():
+    """统一推送消费线程：匀速排队，彻底防止钉钉/飞书限流熔断"""
     while IS_RUNNING:
         try:
             task = notify_queue.get(timeout=1)
-            title, items, ntype = task.get("title"), task.get("items"), task.get("notify_type")
+            title = task.get("title")
+            items = task.get("items")
+            ntype = task.get("notify_type")
 
             if ntype == "dynamic":
                 logging.info(f"[排队发送] 正在推送新动态: {items[0].get('link', '')}")
@@ -282,14 +242,14 @@ def notify_worker():
             if not ok and ntype != "system":
                 logging.warning(f"[发送失败] 类型: {ntype}")
             
-            time.sleep(2.5) # 稳妥限流
+            # 【重要】严格控制频率，每隔 2.5 秒发一次，防止触发钉钉频率限制
+            time.sleep(2.5)
         except queue.Empty:
             continue
-        except Exception:
-            pass
+        except Exception as e:
+            logging.error(f"推送消费失败: {repr(e)}")
 
 
-# ================== 核心请求层 ==================
 def safe_request(url, params, retries=5):
     base_delay = 3
     for i in range(retries):
@@ -344,6 +304,7 @@ def encWbi(params, img_key, sub_key):
     sign = hashlib.md5((query + mixin_key).encode()).hexdigest()
     filtered["w_rid"] = sign
     return filtered
+
 
 def update_wbi_keys():
     try:
