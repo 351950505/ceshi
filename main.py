@@ -27,9 +27,9 @@ except ImportError:
 import notifier
 
 # ================= 核心配置 =================
-HEARTBEAT_INTERVAL = 30
+HEARTBEAT_INTERVAL = 60
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3707011984264075  # 将从这个 UID 的公开关注列表中获取监控目标
+SOURCE_UID = 3707011984264075  # 已修改为你的新 UID
 
 # 如果获取关注列表失败，将默认监控以下备用 UID
 FALLBACK_DYNAMIC_UIDS =[
@@ -37,7 +37,7 @@ FALLBACK_DYNAMIC_UIDS =[
     "3546961271589219",
     "3546610447419885",
     "285340365",
-    "3706948578969654"
+    "3707011984264075"
 ]
 
 LOG_FILE = "bili_monitor.log"
@@ -49,7 +49,7 @@ RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
 RUN_START_MINUTE = 20
-RUN_END_HOUR = 19
+RUN_END_HOUR = 19       # 支持 19:00 点前测试
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
@@ -84,10 +84,8 @@ NO_UPDATE_INTERVAL_2_MAX = 4.5
 
 MAX_SEEN_DYNAMIC_IDS = 3000
 DYNAMIC_NEW_WINDOW = 3600
-FEED_FETCH_MAX_PAGES = 3
-FEED_INIT_PAGES = 2
-RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
+RECENT_PUSHED_IDS_LIMIT = 1000
 
 # ===== 动态类型过滤 =====
 ALLOWED_DYNAMIC_TYPES = {"", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_ARTICLE", "MAJOR_TYPE_DRAW"}
@@ -95,7 +93,7 @@ ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TY
 ALLOW_FORWARD_DYNAMIC = True
 
 # ================= 全局状态与网络层 =================
-# 全局运行标识
+# 全局运行标识 (Graceful Shutdown)
 IS_RUNNING = True
 
 # 极致优化：使用统一会话管理连接池、Header、Cookie与防风控指纹
@@ -112,7 +110,7 @@ REQ_SESSION.headers.update({
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"
 })
 
-# 全局统一推送队列
+# 全局统一推送队列 (限流防熔断核心)
 notify_queue = queue.Queue(maxsize=1000)
 
 burst_end_time = 0
@@ -159,6 +157,7 @@ def is_in_monitor_window(now_dt=None):
         try:
             now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
         except Exception:
+            # 兼容极老系统兜底
             now_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             
     if now_dt.weekday() not in RUN_WEEKDAYS:
@@ -169,14 +168,12 @@ def is_in_monitor_window(now_dt=None):
     return start <= current < end
 
 def activate_session_cookies():
-    """参考 Nemo2011/bilibili-api，模拟浏览器获取并激活 buvid3、b_nut 以及注入 _uuid 设备指纹"""
+    """模拟首页访问获取设备指纹 (buvid3/b_nut)"""
     try:
         logging.info("⏳ 正在模拟设备指纹并向 B 站注册安全 Cookie...")
-        # 1. 模拟首次访问 B站 首页，服务器会自动下发 buvid3 和 b_nut
         resp = REQ_SESSION.get("https://www.bilibili.com/", timeout=10)
         resp.close()
         
-        # 2. 生成符合 B 站加密算法的标准 _uuid 注入会话，防止 -352 风控
         uuid_sec = str(uuid.uuid4())
         time_sec = str(int(time.time() * 1000 % 1e5)).ljust(5, "0")
         _uuid = f"{uuid_sec}{time_sec}infoc"
@@ -351,7 +348,7 @@ def encWbi(params, img_key, sub_key):
 def update_wbi_keys():
     try:
         data = safe_request("https://api.bilibili.com/x/web-interface/nav", None)
-        if data.get("code") == 0:
+        if data.get("code") == 0 or data.get("code") == -101: # 兼容匿名与登录态获取 Wbi
             img = data.get("data", {}).get("wbi_img", {})
             img_url = img.get("img_url", "")
             sub_url = img.get("sub_url", "")
@@ -415,7 +412,7 @@ def trigger_burst_mode():
     burst_end_time = now + BURST_MODE_DURATION
     last_burst_trigger_time = now
     burst_chain_count = 1
-    logging.info(f"🚀 捕获新动态，进入极速雷达扫描模式 {BURST_MODE_DURATION}s")
+    logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
 
 def exit_burst_mode(reason=""):
     global burst_end_time, burst_chain_count
@@ -532,32 +529,89 @@ def is_allowed_dynamic(item):
     except Exception:
         return False
 
+# ================== 核心正文提取引擎（已修复无法获取图文的Bug） ==================
 def extract_dynamic_text(item):
     try:
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
 
+        # 1. 尝试从 rich_text_nodes 节点中提取文本（含文字表情等）
         desc = dyn.get("desc") or {}
         nodes = desc.get("rich_text_nodes") or[]
         if nodes:
             text = "".join(
-                n.get("text", "") for n in nodes
-                if isinstance(n, dict) and "RICH_TEXT" in n.get("type", "")
+                n.get("text", "")
+                for n in nodes
+                if isinstance(n, dict) and n.get("type") in (
+                    "RICH_TEXT_NODE_TYPE_TEXT",
+                    "RICH_TEXT_NODE_TYPE_TOPIC",
+                    "RICH_TEXT_NODE_TYPE_AT",
+                    "RICH_TEXT_NODE_TYPE_EMOJI",
+                    "RICH_TEXT_NODE_TYPE_LOTTERY"
+                )
             ).strip()
+            text = normalize_text(text)
             if text:
-                return normalize_text(text)
+                return text
 
         major = dyn.get("major") or {}
         t = major.get("type", "")
 
+        # 2. 如果是视频
         if t == "MAJOR_TYPE_ARCHIVE":
-            return normalize_text(f"【视频】{major.get('archive', {}).get('title', '')}")
+            a = major.get("archive") or {}
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【视频】{title}\n{desc_text}"
+            return f"【视频】{title or desc_text}".strip()
+
+        # 3. 如果是专栏
         if t == "MAJOR_TYPE_ARTICLE":
-            return normalize_text(f"【专栏】{major.get('article', {}).get('title', '')}")
+            a = major.get("article", {}) or {}
+            title = normalize_text(a.get("title", ""))
+            desc_text = normalize_text(a.get("desc", ""))
+            if title and desc_text:
+                return f"【专栏】{title}\n{desc_text}"
+            return f"【专栏】{title or desc_text}".strip()
+
+        # 4. 【核心修复】：如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
         if t == "MAJOR_TYPE_OPUS":
-            return normalize_text(f"【图文】{major.get('opus', {}).get('title', '')}")
-        
-        return normalize_text(dyn.get("desc", {}).get("text", ""))
+            opus = major.get("opus", {}) or {}
+            summary = opus.get("summary", {}) or {}
+            nodes = summary.get("rich_text_nodes") or []
+            text = "".join(n.get("text", "") for n in nodes if isinstance(n, dict)).strip()
+            text = normalize_text(text)
+            title = normalize_text(opus.get("title") or "")
+            if title and text:
+                return f"【图文】{title}\n{text}"
+            return text or f"【图文】{title}".strip()
+
+        # 5. 如果是老版图片动态
+        if t == "MAJOR_TYPE_DRAW":
+            desc_text = normalize_text(desc.get("text", ""))
+            return desc_text or "【图片动态】"
+
+        # 6. 如果是普通卡片链接
+        if t == "MAJOR_TYPE_COMMON":
+            common = major.get("common", {}) or {}
+            title = normalize_text(common.get("title", ""))
+            desc_text = normalize_text(common.get("desc", ""))
+            if title and desc_text:
+                return f"【卡片】{title}\n{desc_text}"
+            return f"【卡片】{title or desc_text}".strip()
+
+        # 7. 如果是直播推荐
+        if t == "MAJOR_TYPE_LIVE":
+            live = major.get("live", {}) or {}
+            title = normalize_text(live.get("title", ""))
+            desc_text = normalize_text(live.get("desc_second", ""))
+            if title and desc_text:
+                return f"【直播】{title}\n{desc_text}"
+            return f"【直播】{title or desc_text}".strip()
+
+        # 8. 兜底解析最外层的 desc 文本
+        return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
 
@@ -774,6 +828,7 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             pub_ts = int(author.get("pub_ts", 0) or 0)
 
             push_data = format_dynamic_message(item)
+            # 通过全局队列推送动态
             ok = safe_enqueue_notify(f"{push_data.get('user', '未知UP')} 发布了新动态", [push_data], "dynamic")
             if ok:
                 pushed_ids.add(dyn_id)
