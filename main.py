@@ -34,7 +34,7 @@ HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3707011984264075  # 你的最新目标 UID
 
-FALLBACK_DYNAMIC_UIDS = [
+FALLBACK_DYNAMIC_UIDS =[
     "3546905852250875",
     "3546961271589219",
     "3546610447419885",
@@ -57,34 +57,34 @@ OFF_HOURS_SLEEP = 20
 # ===== 动态参数 / 智能爆发模式 =====
 STATE_SAVE_INTERVAL = 30     # 定时保存状态的间隔
 
-BURST_MODE_DURATION = 15     # 爆发持续 15 秒
-BURST_COOLDOWN = 30          # 冷却 30 秒
-BURST_MAX_CHAIN = 2          # 最大续期 2 次
+BURST_MODE_DURATION = 12
+BURST_COOLDOWN = 20
+BURST_MAX_CHAIN = 3
 
-BURST_INTERVAL_MIN = 2.5     # 爆发时 2.5 ~ 3.5 秒（依然比人手速快）
-BURST_INTERVAL_MAX = 3.5
+BURST_INTERVAL_MIN = 1.4
+BURST_INTERVAL_MAX = 1.9
 
-NORMAL_INTERVAL_MIN = 3.5    # 正常巡航 3.5 ~ 5.0 秒（极度安全）
-NORMAL_INTERVAL_MAX = 5.0
+NORMAL_INTERVAL_MIN = 1.9
+NORMAL_INTERVAL_MAX = 2.6
 
-IDLE_INTERVAL_MIN = 5.0      # 空闲时 5 ~ 8 秒一刷
-IDLE_INTERVAL_MAX = 8.0
+IDLE_INTERVAL_MIN = 2.4
+IDLE_INTERVAL_MAX = 3.2
 IDLE_MODE_THRESHOLD = 300
 
 FAILURE_EXIT_BURST = 2
 FAILURE_SLOWDOWN_THRESHOLD = 3
-FAILURE_SLOW_INTERVAL_MIN = 6.0   # 失败后立刻大幅退避到 6 ~ 10 秒
-FAILURE_SLOW_INTERVAL_MAX = 10.0
+FAILURE_SLOW_INTERVAL_MIN = 3.5
+FAILURE_SLOW_INTERVAL_MAX = 5.0
 
 NO_UPDATE_SLOWDOWN_THRESHOLD_1 = 10
 NO_UPDATE_SLOWDOWN_THRESHOLD_2 = 30
-NO_UPDATE_INTERVAL_1_MIN = 4.0
-NO_UPDATE_INTERVAL_1_MAX = 6.0
-NO_UPDATE_INTERVAL_2_MIN = 6.0
-NO_UPDATE_INTERVAL_2_MAX = 9.0
+NO_UPDATE_INTERVAL_1_MIN = 2.6
+NO_UPDATE_INTERVAL_1_MAX = 3.4
+NO_UPDATE_INTERVAL_2_MIN = 3.2
+NO_UPDATE_INTERVAL_2_MAX = 4.5
 
 MAX_SEEN_DYNAMIC_IDS = 3000
-DYNAMIC_NEW_WINDOW = 3600     # 设为 3600 秒(1小时)，防止 B 站服务器自身延迟导致漏掉新动态
+DYNAMIC_NEW_WINDOW = 3600     
 FEED_FETCH_MAX_PAGES = 3
 FEED_INIT_PAGES = 2           
 RECENT_PUSHED_IDS_LIMIT = 1000
@@ -96,7 +96,7 @@ ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TY
 ALLOW_FORWARD_DYNAMIC = True
 
 # ================= 全局状态与网络层 =================
-# 全局运行标识 (Graceful Shutdown)
+# 全局运行标识
 IS_RUNNING = True
 
 # 网络层极限优化：全局 Session 持久化连接池
@@ -170,7 +170,7 @@ def is_in_monitor_window(now_dt=None):
     end = RUN_END_HOUR * 60
     return start <= current < end
 
-# 自动生成设备浏览器指纹，完美绕过 B 站高频请求风控
+# 自动生成设备浏览器指纹，补齐 B 站防封缺口
 def activate_session_cookies():
     """模拟首页访问获取设备指纹 (buvid3/b_nut)"""
     try:
@@ -309,14 +309,26 @@ def safe_request(url, params, retries=5):
 
             code = data.get("code")
 
+            # 1. 拦截 Cookie 失效
             if code == -101:
                 logging.error("❌ B站 Cookie 已失效！请重新获取并覆盖 bili_cookie.txt")
-                send_failure_notification("B站 Cookie 失效", "Cookie 验证失败，请重新获取并替换 bili_cookie.txt")
+                send_failure_notification("❌ B站 Cookie 失效预警", "Cookie 验证失败，请重新获取并替换 bili_cookie.txt，否则程序无法正常获取关注流。")
                 return data
 
-            if code in (-799, -352, -509):
+            # 2. 【新增】：智能拦截高风险风控状态码，并拉响钉钉警报（含10分钟冷却，防止报警轰炸）
+            if code in (-799, -352, -509, -412):
                 wait = base_delay * (2 ** i) + random.uniform(2.5, 6)
                 logging.warning(f"⚠️ 触发风控 {code}，自动避让等待 {wait:.1f}s")
+                
+                # 预警内容
+                warning_msg = (
+                    f"服务器 IP 疑似被 B 站安全网关风控锁定。\n\n"
+                    f"- 异常状态码: **{code}**\n"
+                    f"- 自动避让延迟: **{wait:.1f} 秒**\n\n"
+                    f"**安全建议**：若此警报频繁出现，说明你的服务器 IP/账号已被重点标记。建议立刻检查并调低刷新频率，或者更换服务器 IP！"
+                )
+                send_failure_notification("🚨 B站风控安全预警", warning_msg)
+                
                 time.sleep(wait)
                 continue
 
@@ -331,6 +343,8 @@ def safe_request(url, params, retries=5):
         except Exception as e:
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
 
+    logging.error(f"请求最终失败: {url}")
+    send_failure_notification("❌ B站 API 请求最终失败", f"接口 {url} 连续重试 {retries} 次均宣告失败，网络可能发生中断，或者服务器 IP 已经被 B 站物理封锁。")
     return {"code": -500}
 
 
@@ -465,7 +479,7 @@ def load_dynamic_state():
 def save_dynamic_state(state):
     try:
         feed = state.setdefault("feed", {})
-        feed["last_ts_ids"] = list(feed.get("last_ts", []) or [])[:LAST_TS_IDS_LIMIT]
+        feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
         feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
     except Exception:
@@ -537,7 +551,7 @@ def is_allowed_dynamic(item):
     except Exception:
         return False
 
-# ================== 核心正文提取引擎（已修复无法获取图文的Bug） ==================
+# ================== 核心正文提取引擎 ==================
 def extract_dynamic_text(item):
     try:
         modules = item.get("modules") or {}
@@ -583,7 +597,7 @@ def extract_dynamic_text(item):
                 return f"【专栏】{title}\n{desc_text}"
             return f"【专栏】{title or desc_text}".strip()
 
-        # 4. 【核心修复】：如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
+        # 4. 如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
