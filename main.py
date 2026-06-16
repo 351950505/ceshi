@@ -1,11 +1,9 @@
 import sys
 import os
 import time
-import subprocess
 import random
 import logging
 import logging.handlers
-import traceback
 import hashlib
 import urllib.parse
 import json
@@ -25,16 +23,14 @@ except ImportError:
     def ZoneInfo(tz_str):
         return pytz.timezone(tz_str)
 
-import database as db
 import notifier
 
 # ================= 核心配置 =================
-TARGET_UID = 1671203508
-VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 30
+HEARTBEAT_INTERVAL = 60
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3706948578969654
+SOURCE_UID = 3706948578969654  # 将从这个 UID 的公开关注列表中获取监控目标
 
+# 如果获取关注列表失败，将默认监控以下备用 UID
 FALLBACK_DYNAMIC_UIDS =[
     "3546905852250875",
     "3546961271589219",
@@ -42,16 +38,6 @@ FALLBACK_DYNAMIC_UIDS =[
     "285340365",
     "3706948578969654"
 ]
-
-# ===== 评论监控配置 =====
-COMMENT_SCAN_INTERVAL = 5
-COMMENT_NORMAL_PAGES = 1
-COMMENT_RESCAN_INTERVAL = 60
-COMMENT_RESCAN_PAGES = 2
-COMMENT_STARTUP_LOOKBACK = 300
-COMMENT_SAFE_WINDOW = 60
-COMMENT_MAX_RETRY_PAGES = 3
-MAX_SEEN_COMMENTS = 5000
 
 LOG_FILE = "bili_monitor.log"
 DYNAMIC_STATE_FILE = "dynamic_state.json"
@@ -72,34 +58,32 @@ BURST_MODE_DURATION = 12
 BURST_COOLDOWN = 20
 BURST_MAX_CHAIN = 3
 
-BURST_INTERVAL_MIN = 1.4
-BURST_INTERVAL_MAX = 1.9
+# 因为是轮询单人空间，请求间隔可以稍微放宽，避免匿名 IP 被限制
+BURST_INTERVAL_MIN = 1.6
+BURST_INTERVAL_MAX = 2.2
 
-NORMAL_INTERVAL_MIN = 1.9
-NORMAL_INTERVAL_MAX = 2.6
+NORMAL_INTERVAL_MIN = 2.0
+NORMAL_INTERVAL_MAX = 3.0
 
-IDLE_INTERVAL_MIN = 2.4
-IDLE_INTERVAL_MAX = 3.2
+IDLE_INTERVAL_MIN = 2.8
+IDLE_INTERVAL_MAX = 3.8
 IDLE_MODE_THRESHOLD = 300
 
 FAILURE_EXIT_BURST = 2
 FAILURE_SLOWDOWN_THRESHOLD = 3
-FAILURE_SLOW_INTERVAL_MIN = 3.5
-FAILURE_SLOW_INTERVAL_MAX = 5.0
+FAILURE_SLOW_INTERVAL_MIN = 4.0
+FAILURE_SLOW_INTERVAL_MAX = 6.0
 
-NO_UPDATE_SLOWDOWN_THRESHOLD_1 = 10
-NO_UPDATE_SLOWDOWN_THRESHOLD_2 = 30
-NO_UPDATE_INTERVAL_1_MIN = 2.6
-NO_UPDATE_INTERVAL_1_MAX = 3.4
-NO_UPDATE_INTERVAL_2_MIN = 3.2
-NO_UPDATE_INTERVAL_2_MAX = 4.5
+NO_UPDATE_SLOWDOWN_THRESHOLD_1 = 20
+NO_UPDATE_SLOWDOWN_THRESHOLD_2 = 50
+NO_UPDATE_INTERVAL_1_MIN = 3.0
+NO_UPDATE_INTERVAL_1_MAX = 4.0
+NO_UPDATE_INTERVAL_2_MIN = 4.0
+NO_UPDATE_INTERVAL_2_MAX = 5.5
 
 MAX_SEEN_DYNAMIC_IDS = 3000
-DYNAMIC_NEW_WINDOW = 300
-FEED_FETCH_MAX_PAGES = 3
-FEED_INIT_PAGES = 2
+DYNAMIC_NEW_WINDOW = 3600  # 判定为新动态的时间窗口放宽到1小时（主要依靠O(1)去重，绝对不会复推）
 RECENT_PUSHED_IDS_LIMIT = 1000
-LAST_TS_IDS_LIMIT = 100
 
 # ===== 动态类型过滤 =====
 ALLOWED_DYNAMIC_TYPES = {"", "MAJOR_TYPE_OPUS", "MAJOR_TYPE_ARCHIVE", "MAJOR_TYPE_ARTICLE", "MAJOR_TYPE_DRAW"}
@@ -135,9 +119,8 @@ mixinKeyEncTab =[46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42
 
 # ================== 工具函数 ==================
 def signal_handler(signum, frame):
-    """接管退出信号，实现优雅退出"""
     global IS_RUNNING
-    logging.info("\n🛑 接收到关闭信号 (SIGTERM/SIGINT)，准备保存数据安全退出...")
+    logging.info("\n🛑 接收到关闭信号，准备保存数据安全退出...")
     IS_RUNNING = False
 
 def atomic_write_json(path, data):
@@ -163,7 +146,6 @@ def is_in_monitor_window(now_dt=None):
         try:
             now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
         except Exception:
-            # 兼容极老系统兜底
             now_dt = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
             
     if now_dt.weekday() not in RUN_WEEKDAYS:
@@ -173,7 +155,6 @@ def is_in_monitor_window(now_dt=None):
     end = RUN_END_HOUR * 60
     return start <= current < end
 
-# 日志过滤器：拦截并隐藏钉钉 310000 报错
 class DingTalkFilter(logging.Filter):
     def filter(self, record):
         if "310000" in record.getMessage():
@@ -185,7 +166,7 @@ def init_logging():
     if root.hasHandlers():
         root.handlers.clear()
     
-    formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
+    formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
 
     file_handler = logging.handlers.RotatingFileHandler(
@@ -205,19 +186,19 @@ def init_logging():
     root.propagate = False
 
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (企业级最终版: 队列限流 + 优雅退出)")
+    logging.info("B站监控系统启动 (纯匿名雷达轮询版 - Zero Cookie)")
     logging.info("=" * 60)
 
 def send_failure_notification(title, message):
     global _last_notify_time
     if len(_last_notify_time) > 200:
-        _last_notify_time.clear() # 防内存泄漏极简回收
+        _last_notify_time.clear() 
         
     key = f"{title}:{message[:100]}"
     if time.time() - _last_notify_time.get(key, 0) >= 600:
         _last_notify_time[key] = time.time()
-        # 错误通知直接塞入全局发送队列排队
         safe_enqueue_notify(title, [{"user": "系统", "message": message}], "system")
+
 
 # ================== 统一推送队列 ==================
 def safe_enqueue_notify(title, items, notify_type="dynamic"):
@@ -225,14 +206,9 @@ def safe_enqueue_notify(title, items, notify_type="dynamic"):
         notify_queue.put_nowait({"title": title, "items": items, "notify_type": notify_type})
         return True
     except queue.Full:
-        logging.warning("notify_queue 推送队列已满，丢弃一条推送！(可能被严重限流)")
-        return False
-    except Exception as e:
-        logging.error(f"推送入队失败: {repr(e)}")
         return False
 
 def notify_worker():
-    """统一推送消费线程：匀速排队，彻底防止钉钉/飞书限流熔断"""
     while IS_RUNNING:
         try:
             task = notify_queue.get(timeout=1)
@@ -242,88 +218,61 @@ def notify_worker():
 
             if ntype == "dynamic":
                 logging.info(f"[排队发送] 正在推送新动态: {items[0].get('link', '')}")
-            elif ntype == "comment":
-                logging.info(f"[排队发送] 正在推送新评论: {len(items)}条")
 
             ok = notifier.send_webhook_notification(title, items, notify_type=ntype)
 
             if not ok and ntype != "system":
                 logging.warning(f"[发送失败] 类型: {ntype}")
             
-            # 【重要】严格控制频率，每隔 2 秒发一次，永远不会触发第三方平台的拦截限制
-            time.sleep(2)
+            time.sleep(2.5) # 稳妥限流
         except queue.Empty:
             continue
-        except Exception as e:
-            logging.error(f"推送消费失败: {repr(e)}")
+        except Exception:
+            pass
 
+
+# ================== 核心请求层 (纯匿名) ==================
+def get_header():
+    # 纯匿名请求头，不再依赖本地 Cookie 文件
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://www.bilibili.com/"
+    }
 
 def safe_request(url, params, header, retries=5):
     h = header.copy()
-    h.pop("Connection", None) # 激活底层持久化连接
+    h.pop("Connection", None) 
     base_delay = 3
 
     for i in range(retries):
-        start_ts = time.time()
         try:
-            logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = REQ_SESSION.get(url, headers=h, params=params, timeout=12)
-            cost = time.time() - start_ts
-            logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
-
             try:
                 data = r.json()
-            except Exception as je:
-                logging.warning(f"JSON解析失败: url={url} status={r.status_code} err={je}")
-                data = {"code": -500, "message": f"invalid json http={r.status_code}"}
+            except Exception:
+                data = {"code": -500}
 
             code = data.get("code")
-            logging.debug(f"[请求结果] url={url} code={code}")
-
-            if code == -101:
-                logging.warning(f"检测到 Cookie 失效 (-101)，尝试自动重新登录... url={url}")
-                if refresh_cookie():
-                    new_h = get_header()
-                    header["Cookie"] = new_h["Cookie"]  
-                    h["Cookie"] = new_h["Cookie"]       
-                    time.sleep(2)
-                    continue  
-                else:
-                    logging.error("Cookie 失效且重新登录失败！")
-                    send_failure_notification("Cookie 失效", "需要手动重新登录")
-                    return {"code": -101, "need_refresh": True}
 
             if code in (-799, -352, -509):
-                wait = base_delay * (2 ** i) + random.uniform(2.5, 6)
-                logging.warning(f"风控 {code}，等待 {wait:.1f}s")
-                time.sleep(wait)
+                time.sleep(base_delay * (2 ** i) + random.uniform(2.5, 6))
                 continue
 
+            # -101 或其它非0错误均视为失败但不再触发登录
             if code != 0 and i < retries - 1:
-                wait = base_delay * (2 ** i) + random.uniform(0.8, 2.5)
-                logging.warning(f"[请求重试] url={url} code={code} wait={wait:.1f}s")
-                time.sleep(wait)
+                time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
                 continue
 
             return data
 
-        except requests.RequestException as e:
-            cost = time.time() - start_ts
-            logging.warning(f"请求异常: url={url} params={params} cost={cost:.2f}s err={repr(e)}")
-            time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
-        except Exception as e:
-            cost = time.time() - start_ts
-            logging.warning(f"未知请求异常: url={url} params={params} cost={cost:.2f}s err={repr(e)}")
+        except Exception:
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
 
-    logging.error(f"请求最终失败: {url}")
-    send_failure_notification("API 请求最终失败", f"{url} 所有重试均失败")
     return {"code": -500}
 
 
 def getMixinKey(orig):
     return ''.join([orig[i] for i in mixinKeyEncTab])[:32]
-
 
 def encWbi(params, img_key, sub_key):
     mixin_key = getMixinKey(img_key + sub_key)
@@ -340,7 +289,6 @@ def encWbi(params, img_key, sub_key):
     filtered["w_rid"] = sign
     return filtered
 
-
 def update_wbi_keys(header):
     try:
         data = safe_request("https://api.bilibili.com/x/web-interface/nav", None, header)
@@ -352,27 +300,25 @@ def update_wbi_keys(header):
                 WBI_KEYS["img_key"] = img_url.rsplit("/", 1)[1].split(".")[0]
                 WBI_KEYS["sub_key"] = sub_url.rsplit("/", 1)[1].split(".")[0]
                 WBI_KEYS["last_update"] = time.time()
-                logging.info("WBI密钥已更新")
-    except Exception as e:
-        logging.error(f"更新WBI异常: {repr(e)}")
-
+                logging.info("WBI密钥已匿名更新")
+    except Exception:
+        pass
 
 def wbi_request(url, params, header):
     if not WBI_KEYS["img_key"] or time.time() - WBI_KEYS["last_update"] > 21600:
         update_wbi_keys(header)
 
     if not WBI_KEYS["img_key"] or not WBI_KEYS["sub_key"]:
-        logging.warning("WBI密钥不可用，退化为普通请求")
         return safe_request(url, params, header)
 
     try:
         signed = encWbi(params.copy(), WBI_KEYS["img_key"], WBI_KEYS["sub_key"])
         return safe_request(url, signed, header)
-    except Exception as e:
-        logging.error(f"WBI签名异常: {repr(e)}")
+    except Exception:
         return safe_request(url, params, header)
 
 
+# ================== 业务控制与状态流 ==================
 def get_scan_interval():
     global burst_end_time, consecutive_failures, last_new_dynamic_time, consecutive_no_update_rounds
 
@@ -395,7 +341,6 @@ def get_scan_interval():
 
     return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
 
-
 def trigger_burst_mode():
     global burst_end_time, last_burst_trigger_time, burst_chain_count
 
@@ -411,13 +356,10 @@ def trigger_burst_mode():
     burst_end_time = now + BURST_MODE_DURATION
     last_burst_trigger_time = now
     burst_chain_count = 1
-    logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
-
+    logging.info(f"🚀 捕获新动态，进入极速雷达扫描模式 {BURST_MODE_DURATION}s")
 
 def exit_burst_mode(reason=""):
     global burst_end_time, burst_chain_count
-    if time.time() < burst_end_time:
-        logging.info(f"🛑 退出爆发模式 reason={reason}")
     burst_end_time = 0
     burst_chain_count = 0
 
@@ -432,247 +374,103 @@ def load_following_cache():
             return []
     return[]
 
-
 def save_following_cache(uids):
     try:
         atomic_write_json(FOLLOWING_CACHE_FILE, uids)
-    except Exception as e:
-        logging.error(f"保存 following_cache 失败: {repr(e)}")
-
+    except Exception:
+        pass
 
 def load_dynamic_state():
     default_state = {
-        "feed": {
-            "last_ts": 0,
-            "last_ts_ids":[],
-            "baseline": "",
-            "offset": "",
-            "recent_pushed_ids":[]
-        }
+        "uids": {},
+        "recent_pushed_ids":[]
     }
-
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
-
-            if not isinstance(state, dict):
-                return default_state
-
-            feed = state.get("feed", {})
-            if not isinstance(feed, dict):
-                feed = {}
-
-            return {
-                "feed": {
-                    "last_ts": int(feed.get("last_ts", 0) or 0),
-                    "last_ts_ids": list(feed.get("last_ts_ids", []) or[])[:LAST_TS_IDS_LIMIT],
-                    "baseline": feed.get("baseline", ""),
-                    "offset": feed.get("offset", ""),
-                    "recent_pushed_ids": list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
-                }
-            }
+            # 结构迁移隔离旧版 feed 字段
+            if "uids" not in state:
+                state["uids"] = {}
+            if "recent_pushed_ids" not in state:
+                state["recent_pushed_ids"] = []
+            return state
         except Exception:
             return default_state
-
     return default_state
-
 
 def save_dynamic_state(state):
     try:
-        feed = state.setdefault("feed", {})
-        feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
-        feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
+        state["recent_pushed_ids"] = list(state.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
-    except Exception as e:
-        logging.error(f"保存 dynamic_state 失败: {repr(e)}")
+    except Exception:
+        pass
 
-
-# 终极 O(1) 通用去重结构，彻底干掉手动定时清理的开销和隐患
 def init_seen_cache():
     return {"set": set(), "queue": deque()}
-
 
 def add_seen_cache(cache, item_id, max_size):
     s = cache["set"]
     q = cache["queue"]
-
     if item_id in s:
         return False
-
     s.add(item_id)
     q.append(item_id)
-
-    # 利用双端队列，边进边出，时间复杂度 O(1)，永远不会无限膨胀
     while len(q) > max_size:
-        old = q.popleft()
-        s.discard(old)
-
+        s.discard(q.popleft())
     return True
 
-
 def add_recent_pushed_id(state, dyn_id):
-    feed = state.setdefault("feed", {})
-    recent = list(feed.get("recent_pushed_ids", []) or[])
+    recent = list(state.get("recent_pushed_ids", []) or[])
     if dyn_id in recent:
         recent.remove(dyn_id)
     recent.insert(0, dyn_id)
-    feed["recent_pushed_ids"] = recent[:RECENT_PUSHED_IDS_LIMIT]
-
-
-def is_recent_pushed(state, dyn_id):
-    feed = state.setdefault("feed", {})
-    recent = feed.get("recent_pushed_ids", []) or[]
-    return dyn_id in recent
-
-
-def update_last_ts_state(feed_state, dyn_id, pub_ts):
-    last_ts = int(feed_state.get("last_ts", 0) or 0)
-    last_ts_ids = list(feed_state.get("last_ts_ids", []) or[])
-
-    if pub_ts > last_ts:
-        feed_state["last_ts"] = pub_ts
-        feed_state["last_ts_ids"] =[dyn_id]
-    elif pub_ts == last_ts:
-        if dyn_id not in last_ts_ids:
-            last_ts_ids.append(dyn_id)
-            feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_IDS_LIMIT]
-
-
-def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
-    last_ts = int(feed_state.get("last_ts", 0) or 0)
-    last_ts_ids = set(feed_state.get("last_ts_ids", []) or[])
-
-    if now_ts - pub_ts > DYNAMIC_NEW_WINDOW:
-        return False
-
-    if pub_ts > last_ts:
-        return True
-
-    if pub_ts == last_ts and dyn_id not in last_ts_ids:
-        return True
-
-    return False
+    state["recent_pushed_ids"] = recent[:RECENT_PUSHED_IDS_LIMIT]
 
 
 def is_allowed_dynamic(item):
     try:
-        if not isinstance(item, dict):
-            return False
-
         top_type = item.get("type", "")
         modules = item.get("modules", {}) or {}
-        dyn = modules.get("module_dynamic", {}) or {}
-        major = dyn.get("major", {}) or {}
-        major_type = major.get("type", "")
+        major_type = modules.get("module_dynamic", {}).get("major", {}).get("type", "")
 
         if top_type == "DYNAMIC_TYPE_FORWARD":
             return ALLOW_FORWARD_DYNAMIC
-
         if top_type and top_type not in ALLOWED_TOP_LEVEL_TYPES:
             return False
-
         if major_type not in ALLOWED_DYNAMIC_TYPES:
             return False
-
         return True
     except Exception:
         return False
-
 
 def extract_dynamic_text(item):
     try:
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
 
-        desc = dyn.get("desc") or {}
-        nodes = desc.get("rich_text_nodes") or[]
+        nodes = dyn.get("desc", {}).get("rich_text_nodes") or[]
         if nodes:
             text = "".join(
-                n.get("text", "")
-                for n in nodes
-                if isinstance(n, dict) and n.get("type") in (
-                    "RICH_TEXT_NODE_TYPE_TEXT",
-                    "RICH_TEXT_NODE_TYPE_TOPIC",
-                    "RICH_TEXT_NODE_TYPE_AT",
-                    "RICH_TEXT_NODE_TYPE_EMOJI",
-                    "RICH_TEXT_NODE_TYPE_LOTTERY"
-                )
+                n.get("text", "") for n in nodes
+                if isinstance(n, dict) and "RICH_TEXT" in n.get("type", "")
             ).strip()
-            text = normalize_text(text)
             if text:
-                return text
+                return normalize_text(text)
 
         major = dyn.get("major") or {}
         t = major.get("type", "")
 
         if t == "MAJOR_TYPE_ARCHIVE":
-            a = major.get("archive") or {}
-            title = normalize_text(a.get("title", ""))
-            desc_text = normalize_text(a.get("desc", ""))
-            if title and desc_text:
-                return f"【视频】{title}\n{desc_text}"
-            return f"【视频】{title or desc_text}".strip()
-
+            return normalize_text(f"【视频】{major.get('archive', {}).get('title', '')}")
         if t == "MAJOR_TYPE_ARTICLE":
-            a = major.get("article", {}) or {}
-            title = normalize_text(a.get("title", ""))
-            desc_text = normalize_text(a.get("desc", ""))
-            if title and desc_text:
-                return f"【专栏】{title}\n{desc_text}"
-            return f"【专栏】{title or desc_text}".strip()
-
+            return normalize_text(f"【专栏】{major.get('article', {}).get('title', '')}")
         if t == "MAJOR_TYPE_OPUS":
-            opus = major.get("opus", {}) or {}
-            summary = opus.get("summary", {}) or {}
-            nodes = summary.get("rich_text_nodes") or[]
-            text = "".join(n.get("text", "") for n in nodes if isinstance(n, dict)).strip()
-            text = normalize_text(text)
-            title = normalize_text(opus.get("title") or "")
-            if title and text:
-                return f"【图文】{title}\n{text}"
-            return text or f"【图文】{title}".strip()
-
-        if t == "MAJOR_TYPE_DRAW":
-            desc_text = normalize_text(desc.get("text", ""))
-            return desc_text or "【图片动态】"
-
-        if t == "MAJOR_TYPE_COMMON":
-            common = major.get("common", {}) or {}
-            title = normalize_text(common.get("title", ""))
-            desc_text = normalize_text(common.get("desc", ""))
-            if title and desc_text:
-                return f"【卡片】{title}\n{desc_text}"
-            return f"【卡片】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_LIVE":
-            live = major.get("live", {}) or {}
-            title = normalize_text(live.get("title", ""))
-            desc_text = normalize_text(live.get("desc_second", ""))
-            if title and desc_text:
-                return f"【直播】{title}\n{desc_text}"
-            return f"【直播】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_PGC":
-            pgc = major.get("pgc", {}) or {}
-            return normalize_text(f"【PGC】{pgc.get('title', '')}")
-
-        if t == "MAJOR_TYPE_COURSES":
-            c = major.get("courses", {}) or {}
-            title = normalize_text(c.get("title", ""))
-            desc_text = normalize_text(c.get("desc", ""))
-            if title and desc_text:
-                return f"【课程】{title}\n{desc_text}"
-            return f"【课程】{title or desc_text}".strip()
-
-        if t == "MAJOR_TYPE_MUSIC":
-            m = major.get("music", {}) or {}
-            return normalize_text(f"【音频】{m.get('title', '')}")
-
-        return normalize_text(desc.get("text", ""))
+            return normalize_text(f"【图文】{major.get('opus', {}).get('title', '')}")
+        
+        return normalize_text(dyn.get("desc", {}).get("text", ""))
     except Exception:
         return ""
-
 
 def format_dynamic_message(item):
     dyn_id = item.get("id_str", "")
@@ -681,17 +479,11 @@ def format_dynamic_message(item):
     pub_ts = int(author.get("pub_ts", 0) or 0)
 
     text = cut_text(extract_dynamic_text(item), 900)
-    dynamic_type = item.get("type", "")
-
-    if dynamic_type == "DYNAMIC_TYPE_FORWARD":
+    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
         orig = item.get("orig")
         if orig and isinstance(orig, dict):
             orig_text = cut_text(extract_dynamic_text(orig), 300)
-            if orig_text:
-                if text:
-                    text = f"{text}\n\n【转发原文】\n{orig_text}"
-                else:
-                    text = f"【转发原文】\n{orig_text}"
+            text = f"{text}\n\n【转发原文】\n{orig_text}" if text else f"【转发原文】\n{orig_text}"
             orig_id = orig.get("id_str")
             if orig_id:
                 text = f"{text}\n\n原动态： https://t.bilibili.com/{orig_id}"
@@ -703,16 +495,14 @@ def format_dynamic_message(item):
 
     cover = ""
     try:
-        modules = item.get("modules", {}) or {}
-        dyn_module = modules.get("module_dynamic", {}) or {}
-        major = dyn_module.get("major", {}) or {}
-        if major.get("type") == "MAJOR_TYPE_DRAW":
+        major = item.get("modules", {}).get("module_dynamic", {}).get("major", {}) or {}
+        t = major.get("type")
+        if t == "MAJOR_TYPE_DRAW":
             cover = major.get("draw", {}).get("items",[{}])[0].get("src", "")
-        elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
+        elif t == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
-        elif major.get("type") == "MAJOR_TYPE_OPUS":
-            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or \
-                    major.get("opus", {}).get("cover", "")
+        elif t == "MAJOR_TYPE_OPUS":
+            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or major.get("opus", {}).get("cover", "")
     except Exception:
         cover = ""
 
@@ -726,200 +516,130 @@ def format_dynamic_message(item):
     }
 
 
-def fetch_following_feed(header, offset="", update_baseline=""):
+# ================== 匿名轮询引擎 ==================
+def fetch_space_feed(header, uid):
     params = {
-        "type": "all",
+        "host_mid": str(uid),
         "timezone_offset": "-480",
         "platform": "web",
         "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,onlyfansAssetsV2,forwardListHidden,ugcDelete",
         "web_location": "333.1365"
     }
-    if offset:
-        params["offset"] = offset
-    if update_baseline:
-        params["update_baseline"] = update_baseline
-    return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all", params, header)
+    # 彻底告别 feed/all 关注流，改用公开的 UP 主空间 API 进行轮询
+    return wbi_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space", params, header)
 
-
-def fetch_following_feed_retry(header, offset="", update_baseline="", retries=2):
+def fetch_space_feed_retry(header, uid, retries=2):
     last = None
     for _ in range(retries + 1):
-        data = fetch_following_feed(header, offset=offset, update_baseline=update_baseline)
+        data = fetch_space_feed(header, uid)
         last = data
         if data.get("code") == 0:
             return data
         time.sleep(random.uniform(0.8, 1.6))
     return last or {"code": -500}
 
-
-def check_feed_update(header, update_baseline):
-    params = {
-        "type": "all",
-        "update_baseline": update_baseline or "0",
-        "web_location": "333.1365"
-    }
-    return safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params, header)
-
-
 def get_following_list(uid, header):
-    following =[]
+    following = []
     pn = 1
     ps = 50
-
     while True:
         params = {"vmid": uid, "pn": pn, "ps": ps, "order": "desc", "order_type": "attention"}
         data = safe_request("https://api.bilibili.com/x/relation/followings", params, header)
         if data.get("code") != 0:
             break
-
         items = data.get("data", {}).get("list",[])
         if not items:
             break
-
         for item in items:
             mid = item.get("mid")
             if mid:
                 following.append(str(mid))
-
         if len(items) < ps:
             break
-
         pn += 1
         time.sleep(random.uniform(0.6, 1.2))
-
     return following
 
-
-def init_feed_state(header, target_uids):
-    global last_new_dynamic_time
-
+def init_space_state(header, target_uids):
     state = load_dynamic_state()
     seen_dynamic_ids = init_seen_cache()
 
-    try:
-        max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
-        max_ts_ids = set(state.get("feed", {}).get("last_ts_ids",[]) or[])
-        offset = ""
-        baseline = state.get("feed", {}).get("baseline", "")
-
-        for page_idx in range(FEED_INIT_PAGES):
-            data = fetch_following_feed_retry(header, offset=offset)
-            if data.get("code") != 0:
-                logging.warning(f"关注流初始化第 {page_idx + 1} 页失败 code={data.get('code')}")
-                break
-
-            feed = data.get("data", {}) or {}
-            items = feed.get("items") or[]
-
-            if page_idx == 0:
-                baseline = feed.get("update_baseline", "") or baseline
+    logging.info(f"🚀 开始初始化雷达矩阵，缓存 {len(target_uids)} 个目标的状态...")
+    
+    for uid in target_uids:
+        data = fetch_space_feed_retry(header, uid)
+        if data.get("code") == 0:
+            items = data.get("data", {}).get("items", [])
+            uid_state = state.setdefault("uids", {}).setdefault(str(uid), {"last_ts": 0})
+            max_ts = uid_state["last_ts"]
 
             for item in items:
-                if not isinstance(item, dict):
-                    continue
-
                 dyn_id = item.get("id_str")
                 if dyn_id:
                     add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS)
-
+                
                 author = item.get("modules", {}).get("module_author", {}) or {}
-                author_mid = str(author.get("mid", ""))
-                pub_ts = int(author.get("pub_ts", 0) or 0)
+                pub_ts = int(author.get("pub_ts", 0))
+                if pub_ts > max_ts:
+                    max_ts = pub_ts
+                    
+            uid_state["last_ts"] = max_ts
+        # 初始化时稍微慢一点，防止第一次就撞墙
+        time.sleep(random.uniform(0.3, 0.7))
 
-                if author_mid in target_uids:
-                    if pub_ts > max_ts:
-                        max_ts = pub_ts
-                        max_ts_ids = {dyn_id} if dyn_id else set()
-                    elif pub_ts == max_ts and dyn_id:
-                        max_ts_ids.add(dyn_id)
-
-            offset = feed.get("offset", "")
-            if not offset or not items:
-                break
-
-            time.sleep(random.uniform(0.4, 0.8))
-
-        state["feed"]["baseline"] = baseline
-        state["feed"]["offset"] = offset
-        state["feed"]["last_ts"] = max_ts
-        state["feed"]["last_ts_ids"] = list(max_ts_ids)[:LAST_TS_IDS_LIMIT]
-        if "recent_pushed_ids" not in state["feed"]:
-            state["feed"]["recent_pushed_ids"] =[]
-
-        save_dynamic_state(state)
-        last_new_dynamic_time = time.time()
-
-        logging.info(f"关注流初始化完成 baseline={baseline} offset={offset} last_ts={max_ts}")
-    except Exception as e:
-        logging.error(f"关注流初始化异常: {repr(e)}")
-
+    save_dynamic_state(state)
+    logging.info("✅ 匿名雷达矩阵初始化完毕，准备进入巡航状态！")
     return seen_dynamic_ids, state
 
 
-def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
+def process_space_items(items, uid, seen_dynamic_ids, state, now_ts):
     global last_new_dynamic_time, consecutive_failures, consecutive_no_update_rounds
-
+    
     has_new = False
-    feed_state = state.setdefault("feed", {
-        "last_ts": 0,
-        "last_ts_ids":[],
-        "baseline": "",
-        "offset": "",
-        "recent_pushed_ids":[]
-    })
-
-    candidate_items = {}
-    new_items = set()
+    uid_state = state.setdefault("uids", {}).setdefault(str(uid), {"last_ts": 0})
+    max_ts = uid_state["last_ts"]
+    
+    candidate_items = []
 
     for item in items:
-        try:
-            if not isinstance(item, dict):
-                continue
-
-            dyn_id = item.get("id_str")
-            if not dyn_id:
-                continue
-
-            add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS)
-
-            author = item.get("modules", {}).get("module_author", {}) or {}
-            author_mid = str(author.get("mid", ""))
-            pub_ts = int(author.get("pub_ts", 0) or 0)
-
-            if author_mid not in target_uids:
-                continue
-            if not is_allowed_dynamic(item):
-                continue
-            if is_recent_pushed(state, dyn_id):
-                update_last_ts_state(feed_state, dyn_id, pub_ts)
-                continue
-            if is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
-                new_items.add(dyn_id)
-                candidate_items[dyn_id] = item
-        except Exception:
-            pass
-
-    pushed_ids = set()
-    for dyn_id in new_items:
-        if dyn_id in pushed_ids:
+        if not isinstance(item, dict):
             continue
-        item = candidate_items.get(dyn_id)
-        if not item:
+        dyn_id = item.get("id_str")
+        if not dyn_id:
             continue
-        try:
-            author = item.get("modules", {}).get("module_author", {}) or {}
-            pub_ts = int(author.get("pub_ts", 0) or 0)
 
-            push_data = format_dynamic_message(item)
-            # 通过全局队列推送动态
-            ok = safe_enqueue_notify(f"{push_data.get('user', '未知UP')} 发布了新动态", [push_data], "dynamic")
-            if ok:
-                pushed_ids.add(dyn_id)
-                add_recent_pushed_id(state, dyn_id)
-                update_last_ts_state(feed_state, dyn_id, pub_ts)
-                has_new = True
-        except Exception as e:
-            logging.error(f"动态推送异常 dyn_id={dyn_id} err={repr(e)}")
+        author = item.get("modules", {}).get("module_author", {}) or {}
+        pub_ts = int(author.get("pub_ts", 0))
+
+        # 使用 O(1) 结构判定是否为新抓取
+        if not add_seen_cache(seen_dynamic_ids, dyn_id, MAX_SEEN_DYNAMIC_IDS):
+            continue
+            
+        if pub_ts > max_ts:
+            max_ts = pub_ts
+
+        if dyn_id in state.get("recent_pushed_ids", []):
+            continue
+
+        if not is_allowed_dynamic(item):
+            continue
+
+        # 防止置顶的老动态在刚启动时被误推送
+        if now_ts - pub_ts > DYNAMIC_NEW_WINDOW:
+            continue
+
+        candidate_items.append((dyn_id, pub_ts, item))
+
+    # 倒序推送，保证发布早的在上面
+    for dyn_id, pub_ts, item in reversed(candidate_items):
+        push_data = format_dynamic_message(item)
+        ok = safe_enqueue_notify(f"{push_data.get('user', '未知UP')} 发布了新动态", [push_data], "dynamic")
+        if ok:
+            has_new = True
+            add_recent_pushed_id(state, dyn_id)
+
+    if max_ts > uid_state["last_ts"]:
+        uid_state["last_ts"] = max_ts
 
     if has_new:
         last_new_dynamic_time = time.time()
@@ -930,327 +650,45 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
     return has_new
 
 
-def scan_following_feed(header, target_uids, seen_dynamic_ids, state, now_ts):
-    global consecutive_failures, consecutive_no_update_rounds
+def start_monitoring():
+    global last_state_save, consecutive_no_update_rounds
 
-    feed_state = state.setdefault("feed", {
-        "last_ts": 0,
-        "last_ts_ids":[],
-        "baseline": "",
-        "offset": "",
-        "recent_pushed_ids":[]
-    })
-
-    baseline = feed_state.get("baseline", "")
-    old_baseline = baseline
-
-    update_data = check_feed_update(header, baseline)
-    direct_fallback = False
-
-    if update_data.get("code") != 0:
-        consecutive_failures += 1
-        direct_fallback = True
-        if consecutive_failures >= FAILURE_EXIT_BURST:
-            exit_burst_mode("update_failed")
-    else:
-        update_num = update_data.get("data", {}).get("update_num", 0)
-        consecutive_failures = 0
-        if update_num <= 0:
-            consecutive_no_update_rounds += 1
-            return False
-
-        consecutive_no_update_rounds = 0
-
-    has_new = False
-    offset = ""
-    page_count = 0
-    candidate_baseline = baseline
-    completed = True
-    any_success_page = False
-
-    while page_count < FEED_FETCH_MAX_PAGES:
-        data = fetch_following_feed_retry(header, offset=offset)
-
-        if data.get("code") != 0:
-            consecutive_failures += 1
-            completed = False
-            if consecutive_failures >= FAILURE_EXIT_BURST:
-                exit_burst_mode("feed_page_failed")
-            break
-
-        consecutive_failures = 0
-        any_success_page = True
-
-        feed = data.get("data", {}) or {}
-        items = feed.get("items") or[]
-
-        if not items:
-            break
-
-        if page_count == 0:
-            first_page_baseline = feed.get("update_baseline", "") or (items[0].get("id_str", "") if items else "")
-            if first_page_baseline:
-                candidate_baseline = first_page_baseline
-
-        page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
-        if page_has_new:
-            has_new = True
-
-        reached_old = False
-        if old_baseline:
-            for item in items:
-                if isinstance(item, dict) and item.get("id_str") == old_baseline:
-                    reached_old = True
-                    break
-
-        offset = feed.get("offset", "")
-        page_count += 1
-
-        if direct_fallback or reached_old or not offset:
-            break
-
-        time.sleep(random.uniform(0.4, 0.8))
-
-    if not has_new and not direct_fallback:
-        try:
-            time.sleep(1.0)
-            retry_data = fetch_following_feed_retry(header, offset="")
-            if retry_data.get("code") == 0:
-                retry_items = (retry_data.get("data", {}) or {}).get("items") or[]
-                if retry_items:
-                    retry_has_new = process_feed_items(
-                        retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
-                    )
-                    if retry_has_new:
-                        has_new = True
-        except Exception:
-            pass
-
-    if completed and any_success_page:
-        if candidate_baseline:
-            feed_state["baseline"] = candidate_baseline
-        feed_state["offset"] = offset
-
-    return has_new
-
-
-def scan_comments_pages(oid, header, last_read_time, seen_comments, max_pages=1, startup_mode=False):
-    new_list =[]
-    max_ctime = last_read_time
-    safe_time = last_read_time - COMMENT_SAFE_WINDOW
-    now_ts = int(time.time())
-    url = "https://api.bilibili.com/x/v2/reply"
-
-    max_pages = max(1, min(max_pages, COMMENT_MAX_RETRY_PAGES))
-    pn = 1
-    fetched = 0
-
-    while fetched < max_pages:
-        params = {"type": 1, "oid": oid, "sort": 0, "nohot": 1, "ps": 20, "pn": pn}
-        data = wbi_request(url, params, header)
-        if data.get("code") != 0:
-            break
-
-        replies = data.get("data", {}).get("replies",[])
-        if not replies:
-            break
-
-        all_old = True
-
-        for r in replies:
-            try:
-                ctime = int(r.get("ctime", 0) or 0)
-                if ctime > max_ctime:
-                    max_ctime = ctime
-
-                if startup_mode:
-                    if now_ts - ctime > COMMENT_STARTUP_LOOKBACK:
-                        continue
-                else:
-                    if ctime <= safe_time:
-                        continue
-
-                all_old = False
-
-                rpid = str(r.get("rpid", ""))
-                if not rpid:
-                    continue
-
-                if add_seen_cache(seen_comments, rpid, MAX_SEEN_COMMENTS):
-                    comment_time = datetime.datetime.fromtimestamp(ctime).strftime('%H:%M:%S')
-                    member_info = r.get("member") or {}
-                    content_info = r.get("content") or {}
-                    new_list.append({
-                        "user": f"[{comment_time}] {member_info.get('uname', '未知用户')}",
-                        "message": content_info.get("message", "（无内容）"),
-                        "ctime": ctime,
-                        "rpid": rpid
-                    })
-
-            except Exception:
-                pass
-
-        if startup_mode:
-            if len(replies) < 20:
-                break
-        else:
-            if all_old or len(replies) < 20:
-                break
-
-        pn += 1
-        fetched += 1
-        time.sleep(random.uniform(0.4, 0.8))
-
-    return new_list, max_ctime
-
-
-def startup_backfill_comments(oid, title, header, seen_comments):
-    if not oid:
-        return int(time.time())
-
-    logging.info("🧩 启动评论补扫开始")
-    try:
-        new_c, new_t = scan_comments_pages(
-            oid=oid,
-            header=header,
-            last_read_time=int(time.time()) - COMMENT_STARTUP_LOOKBACK,
-            seen_comments=seen_comments,
-            max_pages=COMMENT_RESCAN_PAGES,
-            startup_mode=True
-        )
-        if new_c:
-            new_c.sort(key=lambda x: x["ctime"])
-            payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
-            # 加入全局队列
-            safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
-            logging.info(f"🧩 启动补扫发现在队评论: {len(new_c)} 条")
-        return new_t
-    except Exception:
-        return int(time.time())
-
-
-def get_latest_video(header):
-    data = safe_request(
-        "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-        {"host_mid": TARGET_UID},
-        header
-    )
-    if data.get("code") != 0:
-        return None
-
-    for item in (data.get("data", {}).get("items") or[]):
-        if item.get("type") == "DYNAMIC_TYPE_AV":
-            try:
-                return item["modules"]["module_dynamic"]["major"]["archive"]["bvid"]
-            except Exception:
-                pass
-
-    return None
-
-
-def get_video_info(bv, header):
-    data = safe_request(f"https://api.bilibili.com/x/web-interface/view?bvid={bv}", None, header)
-    if data.get("code") == 0:
-        d = data.get("data", {}) or {}
-        aid = d.get("aid")
-        title = d.get("title")
-        if aid and title:
-            return str(aid), title
-    return None, None
-
-
-def sync_latest_video(header):
-    bv = get_latest_video(header)
-    if not bv:
-        return None, None
-
-    videos = db.get_monitored_videos()
-    if videos and videos[0][1] == bv:
-        return videos[0][0], videos[0][2]
-
-    oid, title = get_video_info(bv, header)
-    if oid:
-        db.clear_videos()
-        db.add_video_to_db(oid, bv, title)
-        return oid, title
-
-    return None, None
-
-
-def get_header():
-    try:
-        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
-            cookie = f.read().strip()
-    except Exception:
-        subprocess.run([sys.executable, "login_bilibili.py"])
-        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
-            cookie = f.read().strip()
-
-    return {
-        "Cookie": cookie,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://www.bilibili.com/"
-    }
-
-
-def refresh_cookie():
-    logging.warning("尝试通过 login_bilibili.py 重新登录...")
-    try:
-        subprocess.run([sys.executable, "login_bilibili.py"], check=True)
-        logging.info("重新登录成功")
-        return True
-    except Exception as e:
-        msg = f"重新登录失败: {e}"
-        logging.error(msg)
-        return False
-
-
-def start_monitoring(header):
-    global last_state_save, last_new_dynamic_time
-
-    # 注册优雅退出信号
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    last_v_check = 0
+    header = get_header()
+    update_wbi_keys(header)
+
     last_hb = 0
-    last_comment_check = 0
-    last_comment_rescan = 0
     last_following_refresh = 0
     last_d_check = 0
 
-    oid, title = sync_latest_video(header)
-
-    seen_comments = init_seen_cache()
-    last_read_time = int(time.time())
-
-    if oid:
-        last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
-
     following_list = load_following_cache() or get_following_list(SOURCE_UID, header) or FALLBACK_DYNAMIC_UIDS[:]
-    following_list =[str(uid) for uid in following_list]
+    following_list = [str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list:
         following_list.append(str(SOURCE_UID))
     save_following_cache(following_list)
 
-    target_uids = set(following_list)
-    logging.info(f"监控 {len(target_uids)} 个 UID（关注流模式）")
+    target_uids = list(set(following_list))
+    logging.info(f"雷达矩阵设定：共锁定 {len(target_uids)} 个目标 UP 主。")
+    if target_uids:
+        # 预估一圈轮询所需要的时间
+        est_time = len(target_uids) * ((NORMAL_INTERVAL_MIN + NORMAL_INTERVAL_MAX)/2)
+        logging.info(f"单轮空间雷达扫描预估耗时：{est_time:.1f} 秒")
 
-    seen_dynamic_ids, state = init_feed_state(header, target_uids)
-    if last_new_dynamic_time == 0:
-        last_new_dynamic_time = time.time()
-
-    # 开启统一推送消费线程
+    seen_dynamic_ids, state = init_space_state(header, target_uids)
+    
     threading.Thread(target=notify_worker, daemon=True).start()
 
-    logging.info(f"✅ 系统初始化完成，开始在工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
+    logging.info(f"🚀 系统点火完成，开始在工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 进行雷达隐形扫描！")
 
-    # 使用全局标志替换死循环，支持 Graceful Shutdown
+    current_uid_idx = 0
+
     while IS_RUNNING:
         try:
             now = time.time()
-
             china_now = datetime.datetime.now(ZoneInfo(RUN_TZ))
+            
             if not is_in_monitor_window(china_now):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
@@ -1261,117 +699,76 @@ def start_monitoring(header):
                 time.sleep(OFF_HOURS_SLEEP)
                 continue
 
-            if now - last_d_check >= get_scan_interval():
+            if target_uids and now - last_d_check >= get_scan_interval():
+                uid = target_uids[current_uid_idx]
+                current_uid_idx = (current_uid_idx + 1) % len(target_uids)
+                
                 try:
-                    state_updated = scan_following_feed(header, target_uids, seen_dynamic_ids, state, int(now))
-                    if state_updated or now - last_state_save > STATE_SAVE_INTERVAL:
-                        save_dynamic_state(state)
-                        last_state_save = now
+                    data = fetch_space_feed_retry(header, uid)
+                    if data.get("code") == 0:
+                        items = data.get("data", {}).get("items", [])
+                        has_new = process_space_items(items, uid, seen_dynamic_ids, state, int(now))
+                        
+                        if has_new or now - last_state_save > STATE_SAVE_INTERVAL:
+                            save_dynamic_state(state)
+                            last_state_save = now
+                            
+                        global consecutive_failures
+                        consecutive_failures = 0
+                        
+                        if not has_new:
+                            consecutive_no_update_rounds += 1
+                        else:
+                            consecutive_no_update_rounds = 0
+                            
+                    else:
+                        consecutive_failures += 1
+                        if consecutive_failures >= FAILURE_EXIT_BURST:
+                            exit_burst_mode("space_api_failed")
                 except Exception as e:
-                    logging.error(f"关注流扫描异常: {repr(e)}")
+                    logging.error(f"空间雷达扫描异常 (UID: {uid}): {repr(e)}")
+                    
                 last_d_check = now
 
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 try:
                     new_list = get_following_list(SOURCE_UID, header)
                     if new_list:
-                        new_list =[str(uid) for uid in new_list]
+                        new_list = [str(u) for u in new_list]
                         if str(SOURCE_UID) not in new_list:
                             new_list.append(str(SOURCE_UID))
 
-                        old_set = set(following_list)
+                        old_set = set(target_uids)
                         new_set = set(new_list)
-                        added = new_set - old_set
-                        removed = old_set - new_set
-
-                        if added or removed:
-                            following_list = new_list
-                            target_uids = set(following_list)
-                            save_following_cache(following_list)
-                            logging.info(f"过滤UID已刷新，当前共 {len(target_uids)} 个")
-                except Exception as e:
+                        if old_set != new_set:
+                            target_uids = list(new_set)
+                            save_following_cache(new_list)
+                            logging.info(f"雷达矩阵目标已刷新，当前共锁定 {len(target_uids)} 个目标。")
+                except Exception:
                     pass
                 last_following_refresh = now
 
-            if oid and now - last_comment_check >= COMMENT_SCAN_INTERVAL:
-                try:
-                    new_c, new_t = scan_comments_pages(
-                        oid=oid,
-                        header=header,
-                        last_read_time=last_read_time,
-                        seen_comments=seen_comments,
-                        max_pages=COMMENT_NORMAL_PAGES,
-                        startup_mode=False
-                    )
-                    last_comment_check = now
-                    if new_t > last_read_time:
-                        last_read_time = new_t
-                    if new_c:
-                        new_c.sort(key=lambda x: x["ctime"])
-                        payload = [{"user": x["user"], "message": x["message"]} for x in new_c]
-                        # 统一放入全局队列，防止并发封控
-                        safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
-                except Exception:
-                    pass
-
-            if oid and now - last_comment_rescan >= COMMENT_RESCAN_INTERVAL:
-                try:
-                    new_c, new_t = scan_comments_pages(
-                        oid=oid,
-                        header=header,
-                        last_read_time=last_read_time,
-                        seen_comments=seen_comments,
-                        max_pages=COMMENT_RESCAN_PAGES,
-                        startup_mode=False
-                    )
-                    last_comment_rescan = now
-                    if new_t > last_read_time:
-                        last_read_time = new_t
-                    if new_c:
-                        new_c.sort(key=lambda x: x["ctime"])
-                        payload =[{"user": x["user"], "message": x["message"]} for x in new_c]
-                        safe_enqueue_notify(f"【新评论】{title}", payload, "comment")
-                except Exception:
-                    pass
-
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 logging.info(
-                    f"💓 心跳正常 interval={get_scan_interval():.2f}s "
+                    f"💓 匿名雷达隐形运转中 interval={get_scan_interval():.2f}s "
                     f"burst={'on' if time.time() < burst_end_time else 'off'} "
                     f"fail={consecutive_failures} no_update={consecutive_no_update_rounds}"
                 )
                 last_hb = now
 
-            if now - last_v_check > VIDEO_CHECK_INTERVAL:
-                try:
-                    res = sync_latest_video(header)
-                    if res:
-                        oid, title = res
-                        seen_comments = init_seen_cache()
-                        last_read_time = int(time.time())
-                        if oid:
-                            last_read_time = startup_backfill_comments(oid, title, header, seen_comments)
-                except Exception:
-                    pass
-                last_v_check = now
-
             time.sleep(0.5)
 
         except Exception:
             if IS_RUNNING:
-                logging.error("主循环异常")
+                logging.error("主雷达循环异常")
                 time.sleep(8)
             else:
                 break
 
-    # 当接收到结束信号退出循环后执行：安全保存进度
     save_dynamic_state(state)
-    logging.info("💾 内存读取进度已安全落盘，主程序完美退出。")
+    logging.info("💾 雷达矩阵进度已安全落盘，引擎完美熄火。")
 
 
 if __name__ == "__main__":
     init_logging()
-    db.init_db()
-    h = get_header()
-    update_wbi_keys(h)
-    start_monitoring(h)
+    start_monitoring()
