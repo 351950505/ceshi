@@ -1,4 +1,3 @@
-cat > /opt/bilibili-comment/ceshi/main.py << 'EOF'
 import sys
 import os
 import time
@@ -455,6 +454,9 @@ def start_monitoring():
 
     target_uids = list(set(following_list))
     logging.info(f"雷达矩阵设定：共锁定 {len(target_uids)} 个目标 UP 主。")
+    if target_uids:
+        est_time = len(target_uids) * ((NORMAL_INTERVAL_MIN + NORMAL_INTERVAL_MAX)/2)
+        logging.info(f"单轮空间雷达扫描预估耗时：{est_time:.1f} 秒")
     
     seen_dynamic_ids, state = init_space_state(header, target_uids)
     threading.Thread(target=notify_worker, daemon=True).start()
@@ -532,10 +534,3 @@ def start_monitoring():
 if __name__ == "__main__":
     init_logging()
     start_monitoring()
-EOF
-
-# 杀掉旧的错误进程，使用纯匿名版重启
-cd /opt/bilibili-comment/ceshi
-pkill -f main.py
-nohup python3 main.py > bili_monitor.log 2>&1 &
-tail -f bili_monitor.log
