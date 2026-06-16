@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import subprocess
 import random
 import logging
 import logging.handlers
@@ -28,7 +29,6 @@ except ImportError:
 import notifier
 
 # ================= 核心配置 =================
-TARGET_UID = 1671203508
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
@@ -84,7 +84,7 @@ NO_UPDATE_INTERVAL_2_MIN = 3.2
 NO_UPDATE_INTERVAL_2_MAX = 4.5
 
 MAX_SEEN_DYNAMIC_IDS = 3000
-DYNAMIC_NEW_WINDOW = 3600     
+DYNAMIC_NEW_WINDOW = 3600     # 设为 3600 秒(1小时)，防止 B 站服务器自身延迟导致漏掉新动态
 FEED_FETCH_MAX_PAGES = 3
 FEED_INIT_PAGES = 2           
 RECENT_PUSHED_IDS_LIMIT = 1000
@@ -96,7 +96,7 @@ ALLOWED_TOP_LEVEL_TYPES = {"DYNAMIC_TYPE_WORD", "DYNAMIC_TYPE_DRAW", "DYNAMIC_TY
 ALLOW_FORWARD_DYNAMIC = True
 
 # ================= 全局状态与网络层 =================
-# 全局运行标识
+# 全局运行标识 (Graceful Shutdown)
 IS_RUNNING = True
 
 # 网络层极限优化：全局 Session 持久化连接池
@@ -300,8 +300,13 @@ def notify_worker():
 def safe_request(url, params, retries=5):
     base_delay = 3
     for i in range(retries):
+        start_ts = time.time()
         try:
+            logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = REQ_SESSION.get(url, params=params, timeout=12)
+            cost = time.time() - start_ts
+            logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
+
             try:
                 data = r.json()
             except Exception:
@@ -315,7 +320,7 @@ def safe_request(url, params, retries=5):
                 send_failure_notification("❌ B站 Cookie 失效预警", "Cookie 验证失败，请重新获取并替换 bili_cookie.txt，否则程序无法正常获取关注流。")
                 return data
 
-            # 2. 【新增】：智能拦截高风险风控状态码，并拉响钉钉警报（含10分钟冷却，防止报警轰炸）
+            # 2. 智能拦截高风险风控状态码，并发送钉钉警报（含10分钟防刷冷却）
             if code in (-799, -352, -509, -412):
                 wait = base_delay * (2 ** i) + random.uniform(2.5, 6)
                 logging.warning(f"⚠️ 触发风控 {code}，自动避让等待 {wait:.1f}s")
@@ -432,8 +437,7 @@ def trigger_burst_mode():
         return
 
     burst_end_time = now + BURST_MODE_DURATION
-    last_burst_trigger_time = now
-    burst_chain_count = 1
+    last_burst_trigger_time = now; burst_chain_count = 1
     logging.info(f"🚀 进入智能爆发模式 {BURST_MODE_DURATION}s, chain={burst_chain_count}")
 
 def exit_burst_mode(reason=""):
@@ -479,7 +483,7 @@ def load_dynamic_state():
 def save_dynamic_state(state):
     try:
         feed = state.setdefault("feed", {})
-        feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
+        feed["last_ts_ids"] = list(feed.get("last_ts", []) or [])[:LAST_TS_IDS_LIMIT]
         feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
     except Exception:
@@ -521,7 +525,7 @@ def update_last_ts_state(feed_state, dyn_id, pub_ts):
     elif pub_ts == last_ts:
         if dyn_id not in last_ts_ids:
             last_ts_ids.append(dyn_id)
-            feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_IDS_LIMIT]
+            feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_LIMIT]
 
 def is_new_dynamic_candidate(feed_state, dyn_id, pub_ts, now_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
@@ -551,7 +555,7 @@ def is_allowed_dynamic(item):
     except Exception:
         return False
 
-# ================== 核心正文提取引擎 ==================
+# ================== 核心正文提取引擎（已修复无法获取图文的Bug） ==================
 def extract_dynamic_text(item):
     try:
         modules = item.get("modules") or {}
@@ -597,7 +601,7 @@ def extract_dynamic_text(item):
                 return f"【专栏】{title}\n{desc_text}"
             return f"【专栏】{title or desc_text}".strip()
 
-        # 4. 如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
+        # 4. 【核心修复】：如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
