@@ -483,11 +483,12 @@ def load_dynamic_state():
 def save_dynamic_state(state):
     try:
         feed = state.setdefault("feed", {})
-        feed["last_ts_ids"] = list(feed.get("last_ts", []) or [])[:LAST_TS_IDS_LIMIT]
+        # 【Bug 修复 1】：将错误的 last_ts 纠正为真实的列表数据 last_ts_ids，防止落盘崩溃
+        feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
         feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"保存 dynamic_state 失败: {repr(e)}")
 
 def init_seen_cache():
     return {"set": set(), "queue": deque()}
@@ -517,12 +518,12 @@ def is_recent_pushed(state, dyn_id):
 
 def update_last_ts_state(feed_state, dyn_id, pub_ts):
     last_ts = int(feed_state.get("last_ts", 0) or 0)
-    last_ts_ids = list(feed_state.get("last_ts_ids", []) or[])
-
     if pub_ts > last_ts:
         feed_state["last_ts"] = pub_ts
-        feed_state["last_ts_ids"] =[dyn_id]
+        feed_state["last_ts_ids"] = [dyn_id]
     elif pub_ts == last_ts:
+        # 【Bug 修复 2】：修复由于未定义局部变量 last_ts_ids 直接引用而导致的 NameError 作用域崩溃
+        last_ts_ids = list(feed_state.get("last_ts_ids", []) or [])
         if dyn_id not in last_ts_ids:
             last_ts_ids.append(dyn_id)
             feed_state["last_ts_ids"] = last_ts_ids[:LAST_TS_LIMIT]
@@ -601,7 +602,7 @@ def extract_dynamic_text(item):
                 return f"【专栏】{title}\n{desc_text}"
             return f"【专栏】{title or desc_text}".strip()
 
-        # 4. 【核心修复】：如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
+        # 4. 如果是全新 OPUS 图文动态，深度遍历其 Summary 摘要节点
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus", {}) or {}
             summary = opus.get("summary", {}) or {}
