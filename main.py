@@ -29,7 +29,7 @@ import notifier
 # ================= 核心配置 =================
 HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3706948578969654  # 将从这个 UID 的公开关注列表中获取监控目标
+SOURCE_UID = 3707011984264075  # 将从这个 UID 的公开关注列表中获取监控目标
 
 # 如果获取关注列表失败，将默认监控以下备用 UID
 FALLBACK_DYNAMIC_UIDS =[
