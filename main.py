@@ -1,7 +1,6 @@
 import sys
 import os
 import time
-import subprocess
 import random
 import logging
 import logging.handlers
@@ -35,7 +34,7 @@ HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3707011984264075  # 你的最新目标 UID
 
-FALLBACK_DYNAMIC_UIDS =[
+FALLBACK_DYNAMIC_UIDS = [
     "3546905852250875",
     "3546961271589219",
     "3546610447419885",
@@ -87,7 +86,7 @@ NO_UPDATE_INTERVAL_2_MAX = 4.5
 MAX_SEEN_DYNAMIC_IDS = 3000
 DYNAMIC_NEW_WINDOW = 3600     # 设为 3600 秒(1小时)，防止 B 站服务器自身延迟导致漏掉新动态
 FEED_FETCH_MAX_PAGES = 3
-FEED_INIT_PAGES = 2           # 加上这行，解决 NameError 报错！
+FEED_INIT_PAGES = 2           
 RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
 
@@ -170,6 +169,54 @@ def is_in_monitor_window(now_dt=None):
     start = RUN_START_HOUR * 60 + RUN_START_MINUTE
     end = RUN_END_HOUR * 60
     return start <= current < end
+
+# 自动生成设备浏览器指纹，完美绕过 B 站高频请求风控
+def activate_session_cookies():
+    """模拟首页访问获取设备指纹 (buvid3/b_nut)"""
+    try:
+        logging.info("⏳ 正在模拟设备指纹并向 B 站注册安全 Cookie...")
+        resp = REQ_SESSION.get("https://www.bilibili.com/", timeout=10)
+        resp.close()
+        
+        uuid_sec = str(uuid.uuid4())
+        time_sec = str(int(time.time() * 1000 % 1e5)).ljust(5, "0")
+        _uuid = f"{uuid_sec}{time_sec}infoc"
+        
+        REQ_SESSION.cookies.set("_uuid", _uuid, domain=".bilibili.com")
+        REQ_SESSION.cookies.set("CURRENT_FNVAL", "4048", domain=".bilibili.com")
+        REQ_SESSION.cookies.set("blackside_state", "1", domain=".bilibili.com")
+        logging.info("✅ 浏览器安全指纹及 buvid3 风控 Cookie 激活成功！")
+        return True
+    except Exception as e:
+        logging.warning(f"⚠️ 模拟首页指纹激活失败 (可能影响高频防封): {e}")
+        return False
+
+def load_cookies_into_session():
+    """从 bili_cookie.txt 读取凭证并注入会话"""
+    try:
+        if not os.path.exists("bili_cookie.txt"):
+            logging.error("❌ 未找到 bili_cookie.txt，关注流需要 Cookie 支持！")
+            return False
+        with open("bili_cookie.txt", "r", encoding="utf-8") as f:
+            cookie_str = f.read().strip()
+        
+        if not cookie_str:
+            logging.error("❌ bili_cookie.txt 内容为空！")
+            return False
+
+        # 解析并注入全局 Session
+        for item in cookie_str.split(";"):
+            item = item.strip()
+            if not item or "=" not in item:
+                continue
+            k, v = item.split("=", 1)
+            REQ_SESSION.cookies.set(k.strip(), v.strip(), domain=".bilibili.com")
+        
+        logging.info("✅ 账号登录 Cookie 载入成功！")
+        return True
+    except Exception as e:
+        logging.error(f"❌ 加载 Cookie 异常: {e}")
+        return False
 
 # 日志过滤器：拦截并隐藏钉钉 310000 报错
 class DingTalkFilter(logging.Filter):
@@ -418,7 +465,7 @@ def load_dynamic_state():
 def save_dynamic_state(state):
     try:
         feed = state.setdefault("feed", {})
-        feed["last_ts_ids"] = list(feed.get("last_ts_ids", []) or [])[:LAST_TS_IDS_LIMIT]
+        feed["last_ts_ids"] = list(feed.get("last_ts", []) or [])[:LAST_TS_IDS_LIMIT]
         feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids",[]) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
     except Exception:
