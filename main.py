@@ -4,6 +4,7 @@ import time
 import random
 import logging
 import logging.handlers
+import traceback
 import hashlib
 import urllib.parse
 import json
@@ -143,6 +144,7 @@ class MonitorState:
     last_new_dynamic_time: float = 0.0
     consecutive_no_update_rounds: int = 0
     last_state_save: float = field(default_factory=time.time)
+    last_checkin_date: str = ""  # 记录上一次发早安打卡的日期 (YYYY-MM-DD)
 
     def trigger_burst(self, duration: float = BURST_MODE_DURATION):
         now = time.time()
@@ -300,7 +302,7 @@ def init_logging():
     root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流防风控版 - 完整修复版)")
+    logging.info("B站监控系统启动 (关注流防风控版 - 完整整合版)")
     logging.info("=" * 60)
 
 
@@ -1044,16 +1046,6 @@ def start_monitoring():
     if STATE.last_new_dynamic_time == 0:
         STATE.last_new_dynamic_time = time.time()
 
-    # 当每天 09:20 刚进入监控窗口时，自动向钉钉发送一条打卡通知
-    if is_in_monitor_window(china_now):
-    if not has_sent_morning_checkin:  # 每日打卡标识
-        safe_enqueue_notify(
-            "☀️ B站监控系统打卡上班", 
-            [{"user": "系统雷达", "message": f"今天工作日打卡成功！当前已锁定 {len(target_uids)} 个目标 UP 主，开始高频隐形巡航！"}], 
-            "system"
-        )
-    has_sent_morning_checkin = True
-
     # 开启推送消费线程
     threading.Thread(target=notify_worker, daemon=True).start()
 
@@ -1078,6 +1070,16 @@ def start_monitoring():
                     last_hb = now
                 time.sleep(OFF_HOURS_SLEEP)
                 continue
+
+            # 每日 09:20 首次进入监控窗口时自动向钉钉发送打卡通知
+            today_str = china_now.strftime("%Y-%m-%d")
+            if STATE.last_checkin_date != today_str:
+                STATE.last_checkin_date = today_str
+                safe_enqueue_notify(
+                    "☀️ B站监控系统打卡上班",
+                    [{"user": "系统雷达", "message": f"今天({today_str})工作日打卡成功！当前已锁定 {len(target_uids)} 个目标 UP 主，开始隐形巡航！"}],
+                    "system"
+                )
 
             if now - last_d_check >= get_scan_interval():
                 try:
