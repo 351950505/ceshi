@@ -1,11 +1,9 @@
 import sys
 import os
 import time
-import subprocess
 import random
 import logging
 import logging.handlers
-import traceback
 import hashlib
 import urllib.parse
 import json
@@ -19,7 +17,7 @@ import uuid
 import shutil
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Set, Deque, Dict, List, Optional
+from typing import Optional
 
 # 兼容 CentOS 7 的 Python 3.6
 try:
@@ -35,7 +33,7 @@ import notifier
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3707011984264075  # 你的最新目标 UID
+SOURCE_UID = 3707011984264075
 
 FALLBACK_DYNAMIC_UIDS = [
     "3546905852250875",
@@ -131,7 +129,7 @@ notify_queue = queue.Queue(maxsize=1000)
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab = [46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
+mixinKeyEncTab = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
 
 
 # ================== 统一状态管理 ==================
@@ -169,7 +167,6 @@ class MonitorState:
         return time.time() < self.burst_end_time
 
     def is_morning_burst_window(self, now_dt: Optional[datetime.datetime] = None) -> bool:
-        """每天 9:20–10:20 强制高频"""
         if now_dt is None:
             try:
                 now_dt = datetime.datetime.now(ZoneInfo(RUN_TZ))
@@ -183,7 +180,6 @@ class MonitorState:
         return start <= current < end
 
 
-# 全局状态实例
 STATE = MonitorState()
 
 
@@ -219,7 +215,7 @@ def cut_text(text, max_len=800):
     text = normalize_text(text)
     if len(text) <= max_len:
         return text
-    return text[:max_len-3].rstrip() + "..."
+    return text[:max_len - 3].rstrip() + "..."
 
 
 def is_in_monitor_window(now_dt=None):
@@ -291,7 +287,7 @@ def init_logging():
     formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
     file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=10*1024*1024, backupCount=3, encoding="utf-8", delay=True
+        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
     file_handler.addFilter(ding_filter)
@@ -304,7 +300,7 @@ def init_logging():
     root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流防风控版 - 优化版)")
+    logging.info("B站监控系统启动 (关注流防风控版 - 完整修复版)")
     logging.info("=" * 60)
 
 
@@ -346,21 +342,22 @@ def notify_worker():
 
 
 def safe_request(url, params, retries=5):
+    """核心请求函数。Cookie 已决定退出时直接短路，不再发网络请求。"""
+    global IS_RUNNING
+    if not IS_RUNNING and STATE.consecutive_cookie_failures >= COOKIE_FAIL_EXIT_THRESHOLD:
+        return {"code": -101}
+
     base_delay = 3
     for i in range(retries):
-        start_ts = time.time()
         try:
-            logging.debug(f"[请求开始] url={url} try={i + 1}/{retries} params={params}")
             r = REQ_SESSION.get(url, params=params, timeout=12)
-            cost = time.time() - start_ts
-            logging.debug(f"[请求返回] url={url} try={i + 1}/{retries} status={r.status_code} cost={cost:.2f}s")
             try:
                 data = r.json()
             except Exception:
                 data = {"code": -500}
             code = data.get("code")
 
-            # Cookie 失效处理：连续达到阈值后停止监控
+            # Cookie 失效处理
             if code == -101:
                 STATE.consecutive_cookie_failures += 1
                 logging.error(f"❌ B站 Cookie 已失效！连续失败 {STATE.consecutive_cookie_failures}/{COOKIE_FAIL_EXIT_THRESHOLD}")
@@ -368,31 +365,27 @@ def safe_request(url, params, retries=5):
                     "❌ B站 Cookie 失效预警",
                     f"Cookie 验证失败（连续第 {STATE.consecutive_cookie_failures} 次）。\n"
                     f"请立即重新获取并覆盖 bili_cookie.txt。\n"
-                    f"达到 {COOKIE_FAIL_EXIT_THRESHOLD} 次后程序将自动停止，避免无效请求。"
+                    f"达到 {COOKIE_FAIL_EXIT_THRESHOLD} 次后程序将自动停止。"
                 )
                 if STATE.consecutive_cookie_failures >= COOKIE_FAIL_EXIT_THRESHOLD:
                     logging.critical("🛑 Cookie 连续失效达到阈值，停止监控，进入人工干预模式。")
-                    global IS_RUNNING
                     IS_RUNNING = False
                 return data
             else:
-                # 成功或其它错误时重置 Cookie 失败计数
                 if STATE.consecutive_cookie_failures > 0:
                     STATE.consecutive_cookie_failures = 0
 
-            # 风控状态码：立即强制刷新 WBI
+            # 风控状态码：强制刷新 WBI
             if code in (-799, -352, -509, -412):
                 wait = base_delay * (2 ** i) + random.uniform(2.5, 6)
                 logging.warning(f"⚠️ 触发风控 {code}，自动避让等待 {wait:.1f}s，并强制刷新 WBI")
-                # 强制刷新 WBI（忽略时间限制）
                 force_update_wbi_keys()
-                warning_msg = (
-                    f"服务器 IP 疑似被 B 站安全网关风控锁定。\n\n"
+                send_failure_notification(
+                    "🚨 B站风控安全预警",
+                    f"服务器 IP 疑似被 B 站安全网关风控锁定。\n"
                     f"- 异常状态码: **{code}**\n"
-                    f"- 自动避让延迟: **{wait:.1f} 秒**\n\n"
-                    f"**安全建议**：若此警报频繁出现，说明你的服务器 IP/账号已被重点标记。建议立刻检查并调低刷新频率，或者更换服务器 IP！"
+                    f"- 自动避让延迟: **{wait:.1f} 秒**"
                 )
-                send_failure_notification("🚨 B站风控安全预警", warning_msg)
                 time.sleep(wait)
                 continue
 
@@ -404,14 +397,11 @@ def safe_request(url, params, retries=5):
 
             return data
 
-        except Exception as e:
+        except Exception:
             time.sleep(base_delay * (2 ** i) + random.uniform(0.8, 2.5))
 
     logging.error(f"请求最终失败: {url}")
-    send_failure_notification(
-        "❌ B站 API 请求最终失败",
-        f"接口 {url} 连续重试 {retries} 次均宣告失败，网络可能发生中断，或者服务器 IP 已经被 B 站物理封锁。"
-    )
+    send_failure_notification("❌ B站 API 请求最终失败", f"接口 {url} 连续重试 {retries} 次均失败。")
     return {"code": -500}
 
 
@@ -436,9 +426,10 @@ def encWbi(params, img_key, sub_key):
 
 
 def force_update_wbi_keys():
-    """强制刷新 WBI（忽略时间限制），成功后才更新时间戳"""
+    """独立轻量刷新，避免与 safe_request 互相调用"""
     try:
-        data = safe_request("https://api.bilibili.com/x/web-interface/nav", None, retries=2)
+        r = REQ_SESSION.get("https://api.bilibili.com/x/web-interface/nav", timeout=8)
+        data = r.json()
         if data.get("code") in (0, -101):
             img = data.get("data", {}).get("wbi_img", {})
             img_url = img.get("img_url", "")
@@ -455,7 +446,6 @@ def force_update_wbi_keys():
 
 
 def update_wbi_keys():
-    """常规更新（6小时一次），成功后才更新时间戳"""
     if WBI_KEYS["img_key"] and time.time() - WBI_KEYS["last_update"] < 21600:
         return
     force_update_wbi_keys()
@@ -475,7 +465,6 @@ def wbi_request(url, params):
 # ================== 业务控制与状态流 ==================
 def get_scan_interval():
     now = time.time()
-    china_now = None
     try:
         china_now = datetime.datetime.now(ZoneInfo(RUN_TZ))
     except Exception:
@@ -538,10 +527,8 @@ def load_dynamic_state():
     if os.path.exists(DYNAMIC_STATE_FILE):
         try:
             with open(DYNAMIC_STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            return state
+                return json.load(f)
         except Exception:
-            # 尝试读取备份
             bak = DYNAMIC_STATE_FILE + ".bak"
             if os.path.exists(bak):
                 try:
@@ -765,6 +752,8 @@ def fetch_following_feed_retry(offset="", update_baseline="", retries=2):
         last = data
         if data.get("code") == 0:
             return data
+        if not IS_RUNNING:
+            return last or {"code": -101}
         time.sleep(random.uniform(0.8, 1.6))
     return last or {"code": -500}
 
@@ -782,7 +771,7 @@ def get_following_list(uid):
     following = []
     pn = 1
     ps = 50
-    while True:
+    while IS_RUNNING:
         data = safe_request("https://api.bilibili.com/x/relation/followings", {
             "vmid": uid, "pn": pn, "ps": ps, "order": "desc", "order_type": "attention"
         })
@@ -805,12 +794,16 @@ def get_following_list(uid):
 def init_feed_state(target_uids):
     state = load_dynamic_state()
     seen_dynamic_ids = init_seen_cache()
+    if not IS_RUNNING:
+        return seen_dynamic_ids, state
     try:
         max_ts = int(state.get("feed", {}).get("last_ts", 0) or 0)
         max_ts_ids = set(state.get("feed", {}).get("last_ts_ids", []) or [])
         offset = ""
         baseline = state.get("feed", {}).get("baseline", "")
         for page_idx in range(FEED_INIT_PAGES):
+            if not IS_RUNNING:
+                break
             data = fetch_following_feed_retry(offset=offset)
             if data.get("code") != 0:
                 logging.warning(f"关注流初始化第 {page_idx + 1} 页失败 code={data.get('code')}")
@@ -914,6 +907,8 @@ def process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
 
 
 def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
+    if not IS_RUNNING:
+        return False
     feed_state = state.setdefault("feed", {
         "last_ts": 0,
         "last_ts_ids": [],
@@ -937,13 +932,15 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
             STATE.consecutive_no_update_rounds += 1
             return False
         STATE.consecutive_no_update_rounds = 0
+
     has_new = False
     offset = ""
     page_count = 0
     candidate_baseline = baseline
     completed = True
     any_success_page = False
-    while page_count < FEED_FETCH_MAX_PAGES:
+
+    while page_count < FEED_FETCH_MAX_PAGES and IS_RUNNING:
         data = fetch_following_feed_retry(offset=offset)
         if data.get("code") != 0:
             STATE.consecutive_failures += 1
@@ -975,7 +972,8 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
         if direct_fallback or reached_old or not offset:
             break
         time.sleep(random.uniform(0.4, 0.8))
-    if not has_new and not direct_fallback:
+
+    if not has_new and not direct_fallback and IS_RUNNING:
         try:
             time.sleep(1.0)
             retry_data = fetch_following_feed_retry(offset="")
@@ -989,6 +987,7 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
                         has_new = True
         except Exception:
             pass
+
     if completed and any_success_page:
         if candidate_baseline:
             feed_state["baseline"] = candidate_baseline
@@ -1000,15 +999,33 @@ def start_monitoring():
     global IS_RUNNING
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
     last_hb = 0
     last_following_refresh = 0
     last_d_check = 0
 
+    # 1. 模拟设备指纹
     activate_session_cookies()
-    load_cookies_into_session()
+
+    # 2. 载入 Cookie
+    if not load_cookies_into_session():
+        logging.critical("❌ Cookie 文件不存在或为空，程序退出")
+        return
+
+    # 3. 更新 WBI
     update_wbi_keys()
 
+    # ★ 关键：Cookie 已失效则立刻退出，不再继续初始化
+    if not IS_RUNNING:
+        logging.critical("因 Cookie 失效，跳过后续初始化，程序退出")
+        return
+
+    # 4. 获取关注列表
     following_list = load_following_cache() or get_following_list(SOURCE_UID) or FALLBACK_DYNAMIC_UIDS[:]
+    if not IS_RUNNING:
+        logging.critical("因 Cookie 失效，跳过关注流初始化，程序退出")
+        return
+
     following_list = [str(uid) for uid in following_list]
     if str(SOURCE_UID) not in following_list:
         following_list.append(str(SOURCE_UID))
@@ -1017,19 +1034,31 @@ def start_monitoring():
     target_uids = set(following_list)
     logging.info(f"监控 {len(target_uids)} 个 UID（关注流模式）")
 
+    # 5. 初始化关注流状态
     seen_dynamic_ids, state = init_feed_state(target_uids)
+    if not IS_RUNNING:
+        save_dynamic_state(state)
+        logging.critical("因 Cookie 失效，初始化中止，程序退出")
+        return
+
     if STATE.last_new_dynamic_time == 0:
         STATE.last_new_dynamic_time = time.time()
 
+    # 开启推送消费线程
     threading.Thread(target=notify_worker, daemon=True).start()
 
     logging.info(f"✅ 系统初始化完成，开始在工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行监听")
-    logging.info(f"   每天 {MORNING_BURST_START_HOUR}:{MORNING_BURST_START_MINUTE:02d}-{MORNING_BURST_END_HOUR}:{MORNING_BURST_END_MINUTE:02d} 强制高频爆发（3~5秒）")
+    logging.info(f"   每天 {MORNING_BURST_START_HOUR}:{MORNING_BURST_START_MINUTE:02d}-"
+                 f"{MORNING_BURST_END_HOUR}:{MORNING_BURST_END_MINUTE:02d} 强制高频爆发（3~5秒）")
 
     while IS_RUNNING:
         try:
             now = time.time()
-            china_now = datetime.datetime.now(ZoneInfo(RUN_TZ))
+            try:
+                china_now = datetime.datetime.now(ZoneInfo(RUN_TZ))
+            except Exception:
+                china_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+
             if not is_in_monitor_window(china_now):
                 if now - last_hb >= HEARTBEAT_INTERVAL:
                     logging.info(
@@ -1053,15 +1082,13 @@ def start_monitoring():
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 try:
                     new_list = get_following_list(SOURCE_UID)
-                    if new_list:
+                    if new_list and IS_RUNNING:
                         new_list = [str(uid) for uid in new_list]
                         if str(SOURCE_UID) not in new_list:
                             new_list.append(str(SOURCE_UID))
                         old_set = set(following_list)
                         new_set = set(new_list)
-                        added = new_set - old_set
-                        removed = old_set - new_set
-                        if added or removed:
+                        if new_set != old_set:
                             following_list = new_list
                             target_uids = set(following_list)
                             save_following_cache(following_list)
