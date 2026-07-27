@@ -1052,7 +1052,7 @@ def start_monitoring():
             [{"user": "系统雷达", "message": f"今天工作日打卡成功！当前已锁定 {len(target_uids)} 个目标 UP 主，开始高频隐形巡航！"}], 
             "system"
         )
-        has_sent_morning_checkin = True
+    has_sent_morning_checkin = True
 
     # 开启推送消费线程
     threading.Thread(target=notify_worker, daemon=True).start()
