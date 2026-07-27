@@ -1044,6 +1044,16 @@ def start_monitoring():
     if STATE.last_new_dynamic_time == 0:
         STATE.last_new_dynamic_time = time.time()
 
+    # 当每天 09:20 刚进入监控窗口时，自动向钉钉发送一条打卡通知
+    if is_in_monitor_window(china_now):
+    if not has_sent_morning_checkin:  # 每日打卡标识
+        safe_enqueue_notify(
+            "☀️ B站监控系统打卡上班", 
+            [{"user": "系统雷达", "message": f"今天工作日打卡成功！当前已锁定 {len(target_uids)} 个目标 UP 主，开始高频隐形巡航！"}], 
+            "system"
+        )
+        has_sent_morning_checkin = True
+
     # 开启推送消费线程
     threading.Thread(target=notify_worker, daemon=True).start()
 
