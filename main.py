@@ -34,9 +34,9 @@ import notifier
 VIDEO_CHECK_INTERVAL = 21600
 HEARTBEAT_INTERVAL = 30
 FOLLOWING_REFRESH_INTERVAL = 3600
-SOURCE_UID = 3707011984264075
+SOURCE_UID = 3707011984264075  # 你的最新目标 UID
 
-FALLBACK_DYNAMIC_UIDS = [
+FALLBACK_DYNAMIC_UIDS =[
     "3546905852250875",
     "3546961271589219",
     "3546610447419885",
@@ -53,52 +53,43 @@ RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
 RUN_START_HOUR = 9
 RUN_START_MINUTE = 20
-RUN_END_HOUR = 16
+RUN_END_HOUR = 19       # 支持 19:00 前进行测试
 OFF_HOURS_SLEEP = 20
 
 # ===== 动态参数 / 智能爆发模式 =====
-STATE_SAVE_INTERVAL = 30
+STATE_SAVE_INTERVAL = 30     # 定时保存状态的间隔
 
-# 正常间隔（无更新时）
-NORMAL_INTERVAL_MIN = 8.0
-NORMAL_INTERVAL_MAX = 15.0
-
-# 每天 9:20–10:20 强制高频爆发
-MORNING_BURST_START_HOUR = 9
-MORNING_BURST_START_MINUTE = 20
-MORNING_BURST_END_HOUR = 10
-MORNING_BURST_END_MINUTE = 20
-MORNING_BURST_INTERVAL_MIN = 3.0
-MORNING_BURST_INTERVAL_MAX = 5.0
-
-# 智能爆发（检测到新动态后）
-BURST_MODE_DURATION = 90
-BURST_COOLDOWN = 30
+BURST_MODE_DURATION = 12
+BURST_COOLDOWN = 20
 BURST_MAX_CHAIN = 3
-BURST_INTERVAL_MIN = 3.0
-BURST_INTERVAL_MAX = 5.0
 
-IDLE_INTERVAL_MIN = 20.0
-IDLE_INTERVAL_MAX = 30.0
+BURST_INTERVAL_MIN = 1.4
+BURST_INTERVAL_MAX = 1.9
+
+NORMAL_INTERVAL_MIN = 1.9
+NORMAL_INTERVAL_MAX = 2.6
+
+IDLE_INTERVAL_MIN = 2.4
+IDLE_INTERVAL_MAX = 3.2
 IDLE_MODE_THRESHOLD = 300
 
 FAILURE_EXIT_BURST = 2
 FAILURE_SLOWDOWN_THRESHOLD = 3
-FAILURE_SLOW_INTERVAL_MIN = 12.0
-FAILURE_SLOW_INTERVAL_MAX = 20.0
+FAILURE_SLOW_INTERVAL_MIN = 3.5
+FAILURE_SLOW_INTERVAL_MAX = 5.0
 
 NO_UPDATE_SLOWDOWN_THRESHOLD_1 = 10
 NO_UPDATE_SLOWDOWN_THRESHOLD_2 = 30
-NO_UPDATE_INTERVAL_1_MIN = 12.0
-NO_UPDATE_INTERVAL_1_MAX = 18.0
-NO_UPDATE_INTERVAL_2_MIN = 20.0
-NO_UPDATE_INTERVAL_2_MAX = 30.0
+NO_UPDATE_INTERVAL_1_MIN = 2.6
+NO_UPDATE_INTERVAL_1_MAX = 3.4
+NO_UPDATE_INTERVAL_2_MIN = 3.2
+NO_UPDATE_INTERVAL_2_MAX = 4.5
 
 # 内存微调：针对 128MB 机器，将历史队列上限调至 2000 节省堆内存
 MAX_SEEN_DYNAMIC_IDS = 2000
-DYNAMIC_NEW_WINDOW = 3600
+DYNAMIC_NEW_WINDOW = 3600     # 设为 3600 秒(1小时)，防止 B 站服务器自身延迟导致漏掉新动态
 FEED_FETCH_MAX_PAGES = 3
-FEED_INIT_PAGES = 2
+FEED_INIT_PAGES = 2           
 RECENT_PUSHED_IDS_LIMIT = 1000
 LAST_TS_IDS_LIMIT = 100
 
@@ -131,7 +122,7 @@ notify_queue = queue.Queue(maxsize=100)
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-mixinKeyEncTab = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52]
+mixinKeyEncTab =[46,47,18,2,53,8,23,32,15,50,10,31,58,3,45,35,27,43,5,49,33,9,42,19,29,28,14,39,12,38,41,13,37,48,7,16,24,55,40,61,26,17,0,1,60,51,30,4,22,25,54,21,56,59,6,63,57,62,11,36,20,34,44,52]
 
 
 # ================== 统一状态管理 ==================
@@ -290,7 +281,6 @@ def init_logging():
     formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
 
-    # 128MB 机器日志轮转限制为最大 5MB，最多保留 2 个历史文件
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8", delay=True
     )
@@ -1079,8 +1069,8 @@ def start_monitoring():
             if STATE.last_checkin_date != today_str:
                 STATE.last_checkin_date = today_str
                 safe_enqueue_notify(
-                    "☀️ B站监控系统打卡上班",
-                    [{"user": "系统雷达", "message": f"今天({today_str})工作日打卡成功！当前已锁定 {len(target_uids)} 个目标 UP 主，开始隐形巡航！"}],
+                    "☀️ B站动态监控系统打卡上班",
+                    [{"user": "系统雷达", "message": f"今天({today_str})工作日打卡成功！B站动态监控已锁定 {len(target_uids)} 个目标 UP 主，开始隐形巡航！"}],
                     "system"
                 )
 
