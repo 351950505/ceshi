@@ -94,7 +94,8 @@ NO_UPDATE_INTERVAL_1_MAX = 18.0
 NO_UPDATE_INTERVAL_2_MIN = 20.0
 NO_UPDATE_INTERVAL_2_MAX = 30.0
 
-MAX_SEEN_DYNAMIC_IDS = 6000
+# 内存微调：由 6000 降为 2000，极致节省 128MB 服务器内存
+MAX_SEEN_DYNAMIC_IDS = 2000
 DYNAMIC_NEW_WINDOW = 3600
 FEED_FETCH_MAX_PAGES = 3
 FEED_INIT_PAGES = 2
@@ -112,9 +113,9 @@ ALLOW_FORWARD_DYNAMIC = True
 # ================= 全局运行标识 =================
 IS_RUNNING = True
 
-# 网络层
+# 网络层：连接池调至 2，适配小内存机器
 REQ_SESSION = requests.Session()
-_adapter = HTTPAdapter(pool_connections=15, pool_maxsize=15, max_retries=3)
+_adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=3)
 REQ_SESSION.mount('http://', _adapter)
 REQ_SESSION.mount('https://', _adapter)
 
@@ -126,7 +127,7 @@ REQ_SESSION.headers.update({
     "Connection": "keep-alive"
 })
 
-notify_queue = queue.Queue(maxsize=1000)
+notify_queue = queue.Queue(maxsize=100)
 _last_notify_time = {}
 
 WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
@@ -302,7 +303,7 @@ def init_logging():
     root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流防风控版 - 完整整合版)")
+    logging.info("B站监控系统启动 (关注流防风控 - 128M极限内存优化版)")
     logging.info("=" * 60)
 
 
