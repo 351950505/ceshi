@@ -20,7 +20,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-# 兼容 CentOS 7 的 Python 3.6
+# 兼容 CentOS 7 及低版本 Python
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -94,7 +94,7 @@ NO_UPDATE_INTERVAL_1_MAX = 18.0
 NO_UPDATE_INTERVAL_2_MIN = 20.0
 NO_UPDATE_INTERVAL_2_MAX = 30.0
 
-# 内存微调：由 6000 降为 2000，极致节省 128MB 服务器内存
+# 内存微调：针对 128MB 机器，将历史队列上限调至 2000 节省堆内存
 MAX_SEEN_DYNAMIC_IDS = 2000
 DYNAMIC_NEW_WINDOW = 3600
 FEED_FETCH_MAX_PAGES = 3
@@ -113,7 +113,7 @@ ALLOW_FORWARD_DYNAMIC = True
 # ================= 全局运行标识 =================
 IS_RUNNING = True
 
-# 网络层：连接池调至 2，适配小内存机器
+# 网络层：连接池设为 2，减少网络缓冲占用的物理内存
 REQ_SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=3)
 REQ_SESSION.mount('http://', _adapter)
@@ -289,8 +289,10 @@ def init_logging():
         root.handlers.clear()
     formatter = logging.Formatter("[BILI] %(asctime)s[%(levelname)s] %(message)s")
     ding_filter = DingTalkFilter()
+
+    # 128MB 机器日志轮转限制为最大 5MB，最多保留 2 个历史文件
     file_handler = logging.handlers.RotatingFileHandler(
-        LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8", delay=True
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8", delay=True
     )
     file_handler.setFormatter(formatter)
     file_handler.addFilter(ding_filter)
