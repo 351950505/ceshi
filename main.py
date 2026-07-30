@@ -1,11 +1,9 @@
 import sys
 import os
 import time
-import subprocess
 import random
 import logging
 import logging.handlers
-import traceback
 import hashlib
 import urllib.parse
 import json
@@ -21,7 +19,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
-# 兼容 CentOS 7 的 Python 3.6
+# 兼容 CentOS 7 / 老旧 Python
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -32,8 +30,8 @@ except ImportError:
 import notifier
 
 # ================= 核心配置 =================
-VIDEO_CHECK_INTERVAL = 21600
-HEARTBEAT_INTERVAL = 30
+HEARTBEAT_INTERVAL = 30                  # 监听时段内心跳间隔
+OFF_HOURS_HEARTBEAT_INTERVAL = 300       # 非监听时段心跳间隔（5分钟，大幅减少日志）
 FOLLOWING_REFRESH_INTERVAL = 3600
 SOURCE_UID = 3707011984264075
 
@@ -95,12 +93,12 @@ NO_UPDATE_INTERVAL_1_MAX = 18.0
 NO_UPDATE_INTERVAL_2_MIN = 20.0
 NO_UPDATE_INTERVAL_2_MAX = 30.0
 
-# 内存微调：针对 128MB 机器，将历史队列上限调至 2000 节省堆内存
+# 内存微调：针对 128MB 机器
 MAX_SEEN_DYNAMIC_IDS = 2000
 DYNAMIC_NEW_WINDOW = 3600
 FEED_FETCH_MAX_PAGES = 3
 FEED_INIT_PAGES = 2
-RECENT_PUSHED_IDS_LIMIT = 1000
+RECENT_PUSHED_IDS_LIMIT = 500
 LAST_TS_IDS_LIMIT = 100
 
 # Cookie 连续失效阈值后停止
@@ -334,7 +332,7 @@ def notify_worker():
             title = task.get("title")
             items = task.get("items")
             ntype = task.get("notify_type")
-            
+
             if ntype == "dynamic":
                 logging.info(f"[排队发送] 正在推送新动态: {items[0].get('link', '')}")
             elif ntype == "system":
@@ -556,7 +554,8 @@ def save_dynamic_state(state):
         feed["recent_pushed_ids"] = list(feed.get("recent_pushed_ids", []) or [])[:RECENT_PUSHED_IDS_LIMIT]
         atomic_write_json(DYNAMIC_STATE_FILE, state)
     except Exception as e:
-        logging.error(f"保存 dynamic_state 失败: {repr(e)}")
+        logging.error(f"保存 dynamic_state 失败: {repr(e)}"
+                      )
 
 
 def init_seen_cache():
@@ -1021,7 +1020,12 @@ def start_monitoring():
         logging.critical("❌ Cookie 文件不存在或为空，程序退出")
         return
 
-    # 3. 更新 WBI
+    # 3. 检查 webhook 配置
+    if not notifier.check_webhook_configured():
+        logging.critical("❌ webhook_config.txt 未配置或为空，无法推送，程序退出")
+        return
+
+    # 4. 更新 WBI
     update_wbi_keys()
 
     # ★ 关键：Cookie 已失效则立刻退出，不再继续初始化
@@ -1029,7 +1033,7 @@ def start_monitoring():
         logging.critical("因 Cookie 失效，跳过后续初始化，程序退出")
         return
 
-    # 4. 获取关注列表
+    # 5. 获取关注列表
     following_list = load_following_cache() or get_following_list(SOURCE_UID) or FALLBACK_DYNAMIC_UIDS[:]
     if not IS_RUNNING:
         logging.critical("因 Cookie 失效，跳过关注流初始化，程序退出")
@@ -1043,7 +1047,7 @@ def start_monitoring():
     target_uids = set(following_list)
     logging.info(f"监控 {len(target_uids)} 个 UID（关注流模式）")
 
-    # 5. 初始化关注流状态
+    # 6. 初始化关注流状态
     seen_dynamic_ids, state = init_feed_state(target_uids)
     if not IS_RUNNING:
         save_dynamic_state(state)
@@ -1069,7 +1073,8 @@ def start_monitoring():
                 china_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
 
             if not is_in_monitor_window(china_now):
-                if now - last_hb >= HEARTBEAT_INTERVAL:
+                # 非监听时段使用更长的心跳间隔，大幅减少日志
+                if now - last_hb >= OFF_HOURS_HEARTBEAT_INTERVAL:
                     logging.info(
                         f"⏸ 当前不在监听时段，中国时间={china_now.strftime('%Y-%m-%d %H:%M:%S')}，"
                         f"仅工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00 运行"
@@ -1083,7 +1088,7 @@ def start_monitoring():
             if STATE.last_checkin_date != today_str:
                 STATE.last_checkin_date = today_str
                 safe_enqueue_notify(
-                    "☀️ B站动态监控系统打卡上班（发布了新动态）",
+                    "☀️ B站动态监控系统打卡上班",
                     [{"user": "系统雷达", "message": f"今天({today_str})工作日打卡成功！B站动态监控已锁定 {len(target_uids)} 个目标 UP 主，开始隐形巡航！"}],
                     "system"
                 )
