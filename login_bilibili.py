@@ -2,12 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 B站扫码登录
-- 钉钉推送二维码（关键词：动态；在线 QR 图链，无第三方图床）
+- 钉钉推送在线二维码（关键词：动态；不保存 qrcode.png）
 - 只写入: DedeUserID; DedeUserID__ckMd5; SESSDATA
-- 没有 bili_cookie.txt 时扫码成功后自动创建
+- 无 bili_cookie.txt 时自动创建
 
-用法: python3 login_bilibili.py
-必须用【哔哩哔哩 App → 扫一扫】扫钉钉里的图。
+用法:
+  /opt/deploy.sh
+  cd /opt/bilibili-comment/ceshi && python3 login_bilibili.py
+  /opt/deploy.sh
 """
 
 import os
@@ -21,7 +23,6 @@ QR_POLL_API = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 
 COOKIE_FILE = "bili_cookie.txt"
 WEBHOOK_CONFIG_FILE = "webhook_config.txt"
-QR_IMAGE_FILE = "qrcode.png"
 POLL_INTERVAL = 2
 QR_TIMEOUT = 180
 
@@ -90,37 +91,13 @@ def push_image_picurl(pic_url):
         return False
 
 
-def build_qr_urls(login_url):
+def build_qr_url(login_url):
     encoded = urllib.parse.quote(login_url, safe="")
-    return [
-        "https://quickchart.io/qr?size=300&margin=2&text=" + encoded,
-        "https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=" + encoded,
-    ]
-
-
-def download_qr_png(login_url, save_path):
-    for api in build_qr_urls(login_url):
-        try:
-            r = requests.get(api, timeout=12)
-            if r.status_code == 200 and len(r.content) > 100:
-                with open(save_path, "wb") as f:
-                    f.write(r.content)
-                print("✅ 已保存", save_path, "大小", len(r.content))
-                return True
-        except Exception as e:
-            print("下载二维码失败:", e)
-    try:
-        import qrcode
-        qrcode.make(login_url).save(save_path)
-        print("✅ qrcode 库生成", save_path)
-        return True
-    except Exception as e:
-        print("本地生成失败:", e)
-    return False
+    return "https://quickchart.io/qr?size=300&margin=2&text=" + encoded
 
 
 def push_qr_to_dingtalk(login_url):
-    public_url = build_qr_urls(login_url)[0]
+    public_url = build_qr_url(login_url)
     print("二维码图链:", public_url)
 
     md = (
@@ -207,7 +184,6 @@ def collect_cookies_after_login(session, poll_resp):
 
 
 def save_cookie_map(cookie_map, filename=COOKIE_FILE):
-    """只写 3 个字段；文件不存在则创建，存在则覆盖"""
     picked = {}
     for k in NEEDED_COOKIE_KEYS:
         v = cookie_map.get(k)
@@ -221,7 +197,6 @@ def save_cookie_map(cookie_map, filename=COOKIE_FILE):
         return False
 
     cookie_str = "; ".join("%s=%s" % (k, picked[k]) for k in NEEDED_COOKIE_KEYS)
-
     with open(filename, "w", encoding="utf-8") as f:
         f.write(cookie_str)
 
@@ -276,7 +251,7 @@ def poll_and_save(qrcode_key):
 
 def main():
     print("=" * 50)
-    print(" B站扫码登录（DedeUserID / DedeUserID__ckMd5 / SESSDATA）")
+    print(" B站扫码登录（不保存 qrcode.png）")
     print("=" * 50)
 
     if not os.path.exists(COOKIE_FILE):
@@ -288,7 +263,7 @@ def main():
     if not qrcode_key:
         sys.exit(1)
 
-    download_qr_png(login_url, QR_IMAGE_FILE)
+    # 只推钉钉在线二维码，不写本地 qrcode.png
     push_qr_to_dingtalk(login_url)
 
     if not poll_and_save(qrcode_key):
