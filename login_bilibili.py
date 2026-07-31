@@ -2,9 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 B站扫码登录
-- 钉钉推送二维码（关键词：动态，使用在线 QR 图链，无第三方图床）
+- 钉钉推送二维码（关键词：动态；在线 QR 图链，无第三方图床）
 - 只写入: DedeUserID; DedeUserID__ckMd5; SESSDATA
+- 没有 bili_cookie.txt 时扫码成功后自动创建
+
 用法: python3 login_bilibili.py
+必须用【哔哩哔哩 App → 扫一扫】扫钉钉里的图。
 """
 
 import os
@@ -88,7 +91,6 @@ def push_image_picurl(pic_url):
 
 
 def build_qr_urls(login_url):
-    """仅用在线 QR 服务（不经过 litterbox/catbox）"""
     encoded = urllib.parse.quote(login_url, safe="")
     return [
         "https://quickchart.io/qr?size=300&margin=2&text=" + encoded,
@@ -117,8 +119,7 @@ def download_qr_png(login_url, save_path):
     return False
 
 
-def push_qr_to_dingtalk(login_url, png_path=None):
-    # 直接用在线 QR 链接推钉钉（你这边 quickchart 已验证可用）
+def push_qr_to_dingtalk(login_url):
     public_url = build_qr_urls(login_url)[0]
     print("二维码图链:", public_url)
 
@@ -168,7 +169,6 @@ def _merge_cookies(cookie_map, session, resp=None):
 
 
 def _safe_get(session, url, timeout=6):
-    """短超时，避免卡死"""
     try:
         print("  请求:", url[:90])
         r = session.get(url, timeout=timeout, allow_redirects=True)
@@ -182,12 +182,10 @@ def _safe_get(session, url, timeout=6):
 
 
 def collect_cookies_after_login(session, poll_resp):
-    """补全 Cookie；每步短超时，不阻塞过久"""
     cookie_map = {}
     _merge_cookies(cookie_map, session, poll_resp)
     print("轮询后已有键:", list(cookie_map.keys()))
 
-    # 1) crossDomain（最重要，但可能慢）
     try:
         data = poll_resp.json()
         jump = (data.get("data") or {}).get("url") or ""
@@ -199,7 +197,6 @@ def collect_cookies_after_login(session, poll_resp):
     except Exception as e:
         print("解析跳转失败:", e)
 
-    # 2) 主站 / nav（补域名 Cookie，失败也无所谓）
     _safe_get(session, "https://www.bilibili.com/", timeout=5)
     _merge_cookies(cookie_map, session)
     _safe_get(session, "https://api.bilibili.com/x/web-interface/nav", timeout=5)
@@ -210,6 +207,7 @@ def collect_cookies_after_login(session, poll_resp):
 
 
 def save_cookie_map(cookie_map, filename=COOKIE_FILE):
+    """只写 3 个字段；文件不存在则创建，存在则覆盖"""
     picked = {}
     for k in NEEDED_COOKIE_KEYS:
         v = cookie_map.get(k)
@@ -223,10 +221,11 @@ def save_cookie_map(cookie_map, filename=COOKIE_FILE):
         return False
 
     cookie_str = "; ".join("%s=%s" % (k, picked[k]) for k in NEEDED_COOKIE_KEYS)
+
     with open(filename, "w", encoding="utf-8") as f:
         f.write(cookie_str)
 
-    print("✅ 已写入", filename)
+    print("✅ 已写入/创建", os.path.abspath(filename))
     print(cookie_str[:100] + ("..." if len(cookie_str) > 100 else ""))
     return True
 
@@ -253,7 +252,7 @@ def poll_and_save(qrcode_key):
         code = d.get("code")
 
         if code == 0:
-            print("\n✅ 登录成功，提取 Cookie（最多约十几秒）…")
+            print("\n✅ 登录成功，提取 Cookie…")
             cookie_map = collect_cookies_after_login(session, resp)
             return save_cookie_map(cookie_map)
 
@@ -277,14 +276,18 @@ def poll_and_save(qrcode_key):
 
 def main():
     print("=" * 50)
-    print(" B站扫码登录（仅 3 字段 / 无图床）")
+    print(" B站扫码登录（DedeUserID / DedeUserID__ckMd5 / SESSDATA）")
     print("=" * 50)
+
+    if not os.path.exists(COOKIE_FILE):
+        print("未找到 bili_cookie.txt，扫码成功后将自动创建")
+    else:
+        print("将覆盖现有", COOKIE_FILE)
 
     login_url, qrcode_key = generate_qrcode()
     if not qrcode_key:
         sys.exit(1)
 
-    # 本地备份一份（可选）
     download_qr_png(login_url, QR_IMAGE_FILE)
     push_qr_to_dingtalk(login_url)
 
@@ -300,7 +303,7 @@ def main():
         "### 动态项目登录成功\n\n已写入 DedeUserID / DedeUserID__ckMd5 / SESSDATA\n\n"
         "请执行：`/opt/deploy.sh`",
     )
-    print("完成。请 /opt/deploy.sh")
+    print("完成。请执行: /opt/deploy.sh")
 
 
 if __name__ == "__main__":
