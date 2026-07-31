@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-B站扫码登录：本地保存 qrcode.png + 钉钉推送（关键词：动态）
+B站扫码登录：二维码以「公网图片链接」推到钉钉（关键词：动态）
+不依赖在服务器上打开本地图片。
 用法: python3 login_bilibili.py
-必须用【哔哩哔哩 App → 扫一扫】扫图片，不要用浏览器打开登录链接。
+必须用【哔哩哔哩 App → 扫一扫】扫钉钉里的图。
 """
 
 import os
 import sys
 import time
-import hashlib
-import base64
 import urllib.parse
 import requests
 
@@ -48,81 +47,116 @@ def get_webhook_url():
         return ""
 
 
-def push_dingtalk_text(title, text):
-    url = get_webhook_url()
-    if not url:
-        print("⚠️ 无 webhook，跳过文字推送")
-        return False
-    # 钉钉关键词「动态」：标题和正文都带上，避免被拦截
+def ensure_keyword(title, text):
     if "动态" not in title:
         title = "动态" + title
     if "动态" not in text:
         text = "动态\n\n" + text
+    return title, text
+
+
+def push_markdown(title, text):
+    url = get_webhook_url()
+    if not url:
+        print("⚠️ 无 webhook")
+        return False
+    title, text = ensure_keyword(title, text)
     payload = {"msgtype": "markdown", "markdown": {"title": title, "text": text}}
     try:
         data = requests.post(url, json=payload, timeout=10).json()
-        print("钉钉文字返回:", data)
+        print("钉钉 markdown 返回:", data)
         return data.get("errcode") == 0
     except Exception as e:
-        print("钉钉文字失败:", e)
+        print("钉钉 markdown 失败:", e)
         return False
 
 
-def push_dingtalk_image(png_path):
-    """钉钉自定义机器人图片消息：base64 + md5"""
+def push_image_picurl(pic_url):
+    """钉钉 image 类型：使用 picURL（不是 base64）"""
     url = get_webhook_url()
     if not url:
-        print("⚠️ 无 webhook，跳过图片推送")
         return False
-    with open(png_path, "rb") as f:
-        raw = f.read()
-    b64 = base64.b64encode(raw).decode("ascii")
-    md5 = hashlib.md5(raw).hexdigest()
-    payload = {"msgtype": "image", "image": {"base64": b64, "md5": md5}}
+    payload = {"msgtype": "image", "image": {"picURL": pic_url}}
     try:
-        data = requests.post(url, json=payload, timeout=15).json()
-        print("钉钉图片返回:", data)
-        if data.get("errcode") == 0:
-            print("✅ 二维码图片已发到钉钉")
-            return True
-        print("❌ 图片推送失败，请用本地 qrcode.png 扫码")
-        return False
+        data = requests.post(url, json=payload, timeout=10).json()
+        print("钉钉 picURL 图片返回:", data)
+        return data.get("errcode") == 0
     except Exception as e:
-        print("钉钉图片异常:", e)
+        print("钉钉 picURL 失败:", e)
         return False
+
+
+def build_qr_urls(login_url):
+    encoded = urllib.parse.quote(login_url, safe="")
+    return [
+        "https://quickchart.io/qr?size=300&margin=2&text=" + encoded,
+        "https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=" + encoded,
+    ]
 
 
 def download_qr_png(login_url, save_path):
-    """从多个公共接口下载二维码图，不依赖 qrcode/pillow"""
-    encoded = urllib.parse.quote(login_url, safe="")
-    candidates = [
-        "https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&data=" + encoded,
-        "https://quickchart.io/qr?size=300&text=" + encoded,
-    ]
-    for api in candidates:
+    for api in build_qr_urls(login_url):
         try:
             r = requests.get(api, timeout=15)
-            ctype = r.headers.get("content-type", "")
-            ok = r.status_code == 200 and (
-                "image" in ctype or r.content[:8].find(b"PNG") != -1 or r.content[:4] == b"\x89PNG"
-            )
-            if ok:
+            if r.status_code == 200 and len(r.content) > 100:
                 with open(save_path, "wb") as f:
                     f.write(r.content)
-                if os.path.getsize(save_path) > 100:
-                    print("✅ 已保存", save_path, "大小", os.path.getsize(save_path))
-                    return True
+                print("✅ 已保存", save_path, "大小", len(r.content))
+                return True
         except Exception as e:
-            print("下载二维码失败:", api[:50], e)
+            print("下载失败:", e)
     try:
         import qrcode
-        img = qrcode.make(login_url)
-        img.save(save_path)
-        print("✅ 用 qrcode 库生成", save_path)
+        qrcode.make(login_url).save(save_path)
+        print("✅ qrcode 库生成", save_path)
         return True
     except Exception as e:
         print("本地生成失败:", e)
     return False
+
+
+def upload_public_image(png_path):
+    """把本地 png 传到临时图床，得到钉钉可访问的 https 链接"""
+    uploaders = []
+
+    # 1) litterbox 1 小时
+    def _litterbox():
+        with open(png_path, "rb") as f:
+            r = requests.post(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": "1h"},
+                files={"fileToUpload": ("qrcode.png", f, "image/png")},
+                timeout=30,
+            )
+        t = (r.text or "").strip()
+        if r.status_code == 200 and t.startswith("http"):
+            return t
+        return None
+
+    # 2) catbox
+    def _catbox():
+        with open(png_path, "rb") as f:
+            r = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": ("qrcode.png", f, "image/png")},
+                timeout=30,
+            )
+        t = (r.text or "").strip()
+        if r.status_code == 200 and t.startswith("http"):
+            return t
+        return None
+
+    for name, fn in (("litterbox", _litterbox), ("catbox", _catbox)):
+        try:
+            u = fn()
+            if u:
+                print("✅ 图床(%s):" % name, u)
+                return u
+            print("图床(%s)失败:" % name, "无有效URL")
+        except Exception as e:
+            print("图床(%s)异常:" % name, e)
+    return None
 
 
 def generate_qrcode():
@@ -143,7 +177,7 @@ def poll_for_login_status(qrcode_key):
     session = requests.Session()
     session.headers.update(HEADERS)
     scanned = False
-    print("等待扫码（请用【哔哩哔哩App-扫一扫】扫 qrcode.png 或钉钉里的图）…")
+    print("等待扫码（哔哩哔哩 App → 扫一扫）…")
     start = time.time()
     while time.time() - start < QR_TIMEOUT:
         try:
@@ -190,10 +224,39 @@ def save_cookie_from_session(session, filename=COOKIE_FILE):
     return True
 
 
+def push_qr_to_dingtalk(login_url, png_path):
+    """优先：图床公网链接；其次：在线 QR 服务链接。用 markdown + picURL 双推。"""
+    public_url = upload_public_image(png_path)
+    if not public_url:
+        public_url = build_qr_urls(login_url)[0]
+        print("使用在线 QR 链接:", public_url)
+
+    # 方式1：markdown 内嵌完整图片（含关键词「动态」）
+    md = (
+        "### 动态项目登录\n\n"
+        "请在 **3 分钟内** 用 **哔哩哔哩 App → 扫一扫** 扫描下方二维码，并点确认。\n\n"
+        "![动态登录二维码](%s)\n\n"
+        "不要用微信/浏览器打开链接。\n"
+        "若图不显示，点此打开再扫：[%s](%s)"
+    ) % (public_url, public_url, public_url)
+
+    ok1 = push_markdown("动态项目登录", md)
+
+    # 方式2：image.picURL（兼容你遇到的 400802 接口）
+    ok2 = push_image_picurl(public_url)
+
+    if ok1 or ok2:
+        print("✅ 已向钉钉推送二维码图片链接")
+        return True
+
+    print("❌ 钉钉推送失败")
+    return False
+
+
 def main():
     print("=" * 50)
-    print(" B站扫码登录（钉钉关键词：动态）")
-    print(" 必须用哔哩哔哩 App 扫一扫，不要用浏览器打开链接")
+    print(" B站扫码登录（公网图片 → 钉钉）")
+    print(" 关键词：动态 | 请用哔哩哔哩 App 扫一扫")
     print("=" * 50)
 
     login_url, qrcode_key = generate_qrcode()
@@ -201,36 +264,22 @@ def main():
         sys.exit(1)
 
     if not download_qr_png(login_url, QR_IMAGE_FILE):
-        print("❌ 无法生成二维码图片，退出")
+        print("❌ 无法生成二维码，退出")
         sys.exit(1)
 
-    # 标题和正文都含「动态」，满足钉钉关键词
-    push_dingtalk_text(
-        "动态项目登录",
-        "### 动态项目登录\n\n"
-        "🔑 请扫码更新 Cookie\n\n"
-        "1. 看下一条**图片消息**里的二维码\n"
-        "2. 打开 **哔哩哔哩 App → 扫一扫**（不要用微信/浏览器）\n"
-        "3. 扫码后在手机上点确认\n\n"
-        "若没有图片：下载服务器 `qrcode.png` 用 B站扫\n"
-        "路径：`/opt/bilibili-comment/ceshi/qrcode.png`",
-    )
-    push_dingtalk_image(QR_IMAGE_FILE)
-
-    print("本地二维码文件:", os.path.abspath(QR_IMAGE_FILE))
-    print("若钉钉没图，请把该文件拷到手机后用 B站 App 扫")
+    push_qr_to_dingtalk(login_url, QR_IMAGE_FILE)
 
     session = poll_for_login_status(qrcode_key)
     if not session or not save_cookie_from_session(session):
-        push_dingtalk_text(
+        push_markdown(
             "动态项目登录失败",
             "### 动态项目登录未完成\n\n请重新执行：`python3 login_bilibili.py`",
         )
         sys.exit(1)
 
-    push_dingtalk_text(
+    push_markdown(
         "动态项目登录成功",
-        "### 动态项目登录成功\n\nCookie 已写入服务器。\n\n请执行：`/opt/deploy.sh` 重启监控",
+        "### 动态项目登录成功\n\nCookie 已写入。\n\n请执行：`/opt/deploy.sh` 重启监控",
     )
     print("完成。请 /opt/deploy.sh 重启监控")
 
