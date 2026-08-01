@@ -56,9 +56,11 @@ OFF_HOURS_SLEEP = 20
 
 STATE_SAVE_INTERVAL = 30
 
+# 正常间隔（无更新时）
 NORMAL_INTERVAL_MIN = 20.0
 NORMAL_INTERVAL_MAX = 40.0
 
+# 早高峰 9:20–10:20
 MORNING_BURST_START_HOUR = 9
 MORNING_BURST_START_MINUTE = 20
 MORNING_BURST_END_HOUR = 10
@@ -66,7 +68,8 @@ MORNING_BURST_END_MINUTE = 20
 MORNING_BURST_INTERVAL_MIN = 8.0
 MORNING_BURST_INTERVAL_MAX = 15.0
 
-BURST_MODE_DURATION = 90
+# 智能爆发（发现新动态后）— 保守
+BURST_MODE_DURATION = 60
 BURST_COOLDOWN = 30
 BURST_MAX_CHAIN = 2
 BURST_INTERVAL_MIN = 10.0
@@ -105,8 +108,8 @@ IS_RUNNING = True
 
 REQ_SESSION = requests.Session()
 _adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=3)
-REQ_SESSION.mount('http://', _adapter)
-REQ_SESSION.mount('https://', _adapter)
+REQ_SESSION.mount("http://", _adapter)
+REQ_SESSION.mount("https://", _adapter)
 
 REQ_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -146,7 +149,9 @@ class MonitorState:
             if now < self.burst_end_time and self.burst_chain_count < BURST_MAX_CHAIN:
                 self.burst_end_time = max(self.burst_end_time, now + duration)
                 self.burst_chain_count += 1
-                logging.info(f"🚀 爆发续期，chain={self.burst_chain_count}, until={int(self.burst_end_time)}")
+                logging.info(
+                    f"🚀 爆发续期，chain={self.burst_chain_count}, until={int(self.burst_end_time)}"
+                )
             return
         self.burst_end_time = now + duration
         self.last_burst_trigger_time = now
@@ -295,7 +300,7 @@ def init_logging():
     root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 60)
-    logging.info("B站监控系统启动 (关注流防风控 - 128M极限内存优化版)")
+    logging.info("B站监控系统启动 (关注流防风控 - 保守间隔版)")
     logging.info("=" * 60)
 
 
@@ -430,7 +435,7 @@ def safe_request(url, params, retries=5):
 
 
 def getMixinKey(orig):
-    return ''.join([orig[i] for i in mixinKeyEncTab])[:32]
+    return "".join([orig[i] for i in mixinKeyEncTab])[:32]
 
 
 def encWbi(params, img_key, sub_key):
@@ -716,7 +721,10 @@ def format_dynamic_message(item):
                 text = f"{text}\n\n原动态： https://t.bilibili.com/{orig_id}"
     if not text:
         text = "（该动态无可提取正文）"
-    time_str = datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S") if pub_ts > 0 else "未知时间"
+    time_str = (
+        datetime.datetime.fromtimestamp(pub_ts).strftime("%Y-%m-%d %H:%M:%S")
+        if pub_ts > 0 else "未知时间"
+    )
     cover = ""
     try:
         modules = item.get("modules", {}) or {}
@@ -727,7 +735,10 @@ def format_dynamic_message(item):
         elif major.get("type") == "MAJOR_TYPE_ARCHIVE":
             cover = major.get("archive", {}).get("cover", "")
         elif major.get("type") == "MAJOR_TYPE_OPUS":
-            cover = major.get("opus", {}).get("pics", [{}])[0].get("url", "") or major.get("opus", {}).get("cover", "")
+            cover = (
+                major.get("opus", {}).get("pics", [{}])[0].get("url", "")
+                or major.get("opus", {}).get("cover", "")
+            )
     except Exception:
         cover = ""
     return {
@@ -774,7 +785,9 @@ def check_feed_update(update_baseline):
         "update_baseline": update_baseline or "0",
         "web_location": "333.1365"
     }
-    return safe_request("https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params)
+    return safe_request(
+        "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all/update", params
+    )
 
 
 def get_following_list(uid):
@@ -964,8 +977,7 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
             )
             if first_page_baseline:
                 candidate_baseline = first_page_baseline
-        page_has_new = process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts)
-        if page_has_new:
+        if process_feed_items(items, target_uids, seen_dynamic_ids, state, now_ts):
             has_new = True
         reached_old = False
         if old_baseline:
@@ -985,11 +997,10 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
             retry_data = fetch_following_feed_retry(offset="")
             if retry_data.get("code") == 0:
                 retry_items = (retry_data.get("data", {}) or {}).get("items") or []
-                if retry_items:
-                    if process_feed_items(
-                        retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
-                    ):
-                        has_new = True
+                if retry_items and process_feed_items(
+                    retry_items, target_uids, seen_dynamic_ids, state, int(time.time())
+                ):
+                    has_new = True
         except Exception:
             pass
 
@@ -1006,8 +1017,7 @@ def probe_cookie_alive():
     try:
         r = REQ_SESSION.get("https://api.bilibili.com/x/web-interface/nav", timeout=8)
         data = r.json()
-        code = data.get("code")
-        if code == -101:
+        if data.get("code") == -101:
             STATE.consecutive_cookie_failures += 1
             logging.error(
                 "❌ Cookie 探活失败 %s/%s",
@@ -1062,7 +1072,11 @@ def start_monitoring():
         return
 
     # 启动时强制拉关注列表，缓存仅作备用
-    following_list = get_following_list(SOURCE_UID) or load_following_cache() or FALLBACK_DYNAMIC_UIDS[:]
+    following_list = (
+        get_following_list(SOURCE_UID)
+        or load_following_cache()
+        or FALLBACK_DYNAMIC_UIDS[:]
+    )
     if not IS_RUNNING:
         logging.critical("因 Cookie 失效，跳过关注流初始化，程序退出")
         return
@@ -1092,7 +1106,8 @@ def start_monitoring():
     )
     logging.info(
         f"   每天 {MORNING_BURST_START_HOUR}:{MORNING_BURST_START_MINUTE:02d}-"
-        f"{MORNING_BURST_END_HOUR}:{MORNING_BURST_END_MINUTE:02d} 强制高频爆发（3~5秒）"
+        f"{MORNING_BURST_END_HOUR}:{MORNING_BURST_END_MINUTE:02d} "
+        f"强制高频（{MORNING_BURST_INTERVAL_MIN}~{MORNING_BURST_INTERVAL_MAX}秒）"
     )
 
     while IS_RUNNING:
@@ -1128,7 +1143,6 @@ def start_monitoring():
                     "system"
                 )
 
-            # 定时 Cookie 探活
             if now - last_cookie_probe >= COOKIE_PROBE_INTERVAL:
                 last_cookie_probe = now
                 probe_cookie_alive()
