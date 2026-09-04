@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-B站扫码登录
-- 钉钉推送在线二维码（关键词：动态；不保存 qrcode.png）
-- 只写入: DedeUserID; DedeUserID__ckMd5; SESSDATA
-- 无 bili_cookie.txt 时自动创建
-
-用法:
-  /opt/deploy.sh
-  cd /opt/bilibili-comment/ceshi && python3 login_bilibili.py
-  /opt/deploy.sh
+B站扫码登录（优化版）
+- 钉钉推送在线二维码
+- 只写入必要 Cookie 字段
+- 扫码成功后迅速保存，减少不必要请求
 """
 
 import os
@@ -131,7 +126,8 @@ def generate_qrcode():
         return None, None
 
 
-def _merge_cookies(cookie_map, session, resp=None):
+def merge_cookies(cookie_map, session, resp=None):
+    """合并响应和会话中的 Cookie"""
     try:
         cookie_map.update(session.cookies.get_dict())
     except Exception:
@@ -145,45 +141,13 @@ def _merge_cookies(cookie_map, session, resp=None):
     return cookie_map
 
 
-def _safe_get(session, url, timeout=6):
-    try:
-        print("  请求:", url[:90])
-        r = session.get(url, timeout=timeout, allow_redirects=True)
-        print("  完成 status=", r.status_code)
-        return r
-    except requests.Timeout:
-        print("  超时跳过:", url[:60])
-    except Exception as e:
-        print("  失败跳过:", e)
-    return None
-
-
-def collect_cookies_after_login(session, poll_resp):
-    cookie_map = {}
-    _merge_cookies(cookie_map, session, poll_resp)
-    print("轮询后已有键:", list(cookie_map.keys()))
-
-    try:
-        data = poll_resp.json()
-        jump = (data.get("data") or {}).get("url") or ""
-        if jump.startswith("http"):
-            print("跟随登录跳转…")
-            r2 = _safe_get(session, jump, timeout=8)
-            _merge_cookies(cookie_map, session, r2)
-            print("跳转后键:", list(cookie_map.keys()))
-    except Exception as e:
-        print("解析跳转失败:", e)
-
-    _safe_get(session, "https://www.bilibili.com/", timeout=5)
-    _merge_cookies(cookie_map, session)
-    _safe_get(session, "https://api.bilibili.com/x/web-interface/nav", timeout=5)
-    _merge_cookies(cookie_map, session)
-
-    print("最终键:", list(cookie_map.keys()))
-    return cookie_map
+def has_needed_cookies(cookie_map):
+    """检查必要字段是否齐全"""
+    return all(k in cookie_map and str(cookie_map[k]).strip() for k in NEEDED_COOKIE_KEYS)
 
 
 def save_cookie_map(cookie_map, filename=COOKIE_FILE):
+    """保存 Cookie 到文件"""
     picked = {}
     for k in NEEDED_COOKIE_KEYS:
         v = cookie_map.get(k)
@@ -193,16 +157,41 @@ def save_cookie_map(cookie_map, filename=COOKIE_FILE):
     missing = [k for k in NEEDED_COOKIE_KEYS if k not in picked]
     if missing:
         print("❌ 缺少字段:", ", ".join(missing))
-        print("当前键:", list(cookie_map.keys()))
+        print("当前可用键:", list(cookie_map.keys()))
         return False
 
     cookie_str = "; ".join("%s=%s" % (k, picked[k]) for k in NEEDED_COOKIE_KEYS)
     with open(filename, "w", encoding="utf-8") as f:
         f.write(cookie_str)
-
-    print("✅ 已写入/创建", os.path.abspath(filename))
+    print("✅ 已写入", os.path.abspath(filename))
     print(cookie_str[:100] + ("..." if len(cookie_str) > 100 else ""))
     return True
+
+
+def quick_fetch_jump_cookies(session, poll_resp):
+    """从扫码成功响应中提取 Cookie，若必要字段缺失则访问跳转 URL 补充"""
+    cookie_map = {}
+    merge_cookies(cookie_map, session, poll_resp)
+    print("轮询响应后 Cookie 键:", list(cookie_map.keys()))
+
+    # 如果必要字段已齐全，直接返回
+    if has_needed_cookies(cookie_map):
+        print("✅ 必要 Cookie 已从轮询响应中获取")
+        return cookie_map
+
+    # 尝试从 data.url 跳转获取
+    try:
+        data = poll_resp.json()
+        jump = (data.get("data") or {}).get("url") or ""
+        if jump.startswith("http"):
+            print("缺少必要字段，跟随跳转链接…")
+            r = session.get(jump, timeout=5, allow_redirects=True)
+            merge_cookies(cookie_map, session, r)
+            print("跳转后 Cookie 键:", list(cookie_map.keys()))
+    except Exception as e:
+        print("跳转获取失败:", e)
+
+    return cookie_map
 
 
 def poll_and_save(qrcode_key):
@@ -227,9 +216,14 @@ def poll_and_save(qrcode_key):
         code = d.get("code")
 
         if code == 0:
-            print("\n✅ 登录成功，提取 Cookie…")
-            cookie_map = collect_cookies_after_login(session, resp)
-            return save_cookie_map(cookie_map)
+            print("\n✅ 登录成功，快速提取 Cookie…")
+            # 优化点：不再进行多余请求，直接从响应和跳转中获取
+            cookie_map = quick_fetch_jump_cookies(session, resp)
+            if has_needed_cookies(cookie_map):
+                return save_cookie_map(cookie_map)
+            else:
+                print("❌ 仍然缺少必要 Cookie 字段")
+                return False
 
         if code == 86090:
             if not scanned:
@@ -251,7 +245,7 @@ def poll_and_save(qrcode_key):
 
 def main():
     print("=" * 50)
-    print(" B站扫码登录（不保存 qrcode.png）")
+    print(" B站扫码登录（优化版，快速保存 Cookie）")
     print("=" * 50)
 
     if not os.path.exists(COOKIE_FILE):
@@ -263,7 +257,6 @@ def main():
     if not qrcode_key:
         sys.exit(1)
 
-    # 只推钉钉在线二维码，不写本地 qrcode.png
     push_qr_to_dingtalk(login_url)
 
     if not poll_and_save(qrcode_key):
