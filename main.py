@@ -57,8 +57,8 @@ OFF_HOURS_SLEEP = 20
 
 # ===== 动态扫描 =====
 # 主关注流只负责“快速发现”，不要靠提高频率解决漏报。
-NORMAL_INTERVAL_MIN = 12.0
-NORMAL_INTERVAL_MAX = 20.0
+NORMAL_INTERVAL_MIN = 20.0
+NORMAL_INTERVAL_MAX = 35.0
 FEED_FETCH_BASE_PAGES = 1      # 没有更新时至少检查第一页
 FEED_FETCH_MAX_PAGES = 6       # 检测到更新时最多翻 6 页
 FEED_INIT_PAGES = 3
