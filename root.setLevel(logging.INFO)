@@ -73,7 +73,7 @@ DYNAMIC_NEW_WINDOW = 6 * 3600             # 延迟/补漏最多追溯 6 小时
 NEW_UID_BOOTSTRAP_WINDOW = 30 * 60        # 新加入监控的 UID 首次只追 30 分钟
 
 # ===== 状态与内存 =====
-STATE_SAVE_INTERVAL = 60
+STATE_SAVE_INTERVAL = 300   # 5分钟保存一次，降低磁盘写频率
 MAX_SEEN_DYNAMIC_IDS = 2000
 UID_STATE_SEEN_LIMIT = 120
 RECENT_PUSHED_IDS_LIMIT = 1500
@@ -246,7 +246,7 @@ def init_logging():
         stream_handler.setFormatter(formatter)
         stream_handler.addFilter(ding_filter)
         root.addHandler(stream_handler)
-    root.setLevel(logging.INFO)
+    root.setLevel(logging.WARNING)
     root.propagate = False
     logging.info("=" * 60)
     logging.info("B站动态监控系统启动（可靠防漏 + UID独立补漏 + 低请求风控版）")
@@ -1293,7 +1293,7 @@ def start_monitoring():
             if now - STATE.last_state_save >= STATE_SAVE_INTERVAL:
                 save_dynamic_state(state)
                 STATE.last_state_save = now
-            time.sleep(0.5)
+            time.sleep(1.0)
 
         except Exception as e:
             if IS_RUNNING:
