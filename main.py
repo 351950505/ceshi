@@ -69,6 +69,7 @@ UID_STALE_GLOBAL_THRESHOLD = 15 * 60      # 15 分钟没被主流看到，进入
 UID_DIRECT_CHECK_INTERVAL = 5 * 60        # 同一 UID 两次独立检查至少间隔 5 分钟
 UID_DIRECT_CHECK_BATCH = 2                # 每轮最多检查 2 个 UID，控制请求量
 UID_DIRECT_MAX_PAGES = 3                  # 单 UID 最多翻 3 页
+UID_REPAIR_INTERVAL = 180                 # ← 新增：UID 补漏整体间隔 3 分钟，大幅降低 CPU
 DYNAMIC_NEW_WINDOW = 6 * 3600             # 延迟/补漏最多追溯 6 小时
 NEW_UID_BOOTSTRAP_WINDOW = 30 * 60        # 新加入监控的 UID 首次只追 30 分钟
 
@@ -1132,14 +1133,7 @@ def scan_following_feed(target_uids, seen_dynamic_ids, state, now_ts):
         feed_state["baseline"] = first_page_baseline
         feed_state["offset"] = offset
 
-    # 独立 UID 补漏是完整性的保险通道。
-    if IS_RUNNING:
-        try:
-            if repair_stale_uids(target_uids, state, now_ts):
-                has_new = True
-        except Exception as e:
-            logging.warning(f"UID补漏总流程异常: {repr(e)}")
-
+    # 注意：这里已移除 repair_stale_uids 调用，改为主循环独立间隔执行，降低 CPU
     return has_new
 
 def start_monitoring():
@@ -1150,6 +1144,7 @@ def start_monitoring():
     last_hb = 0
     last_following_refresh = 0
     last_d_check = 0
+    last_uid_repair = 0          # ← 新增：UID 补漏独立计时
 
     activate_session_cookies()
     if not load_cookies_into_session():
@@ -1190,7 +1185,8 @@ def start_monitoring():
     STATE.last_new_dynamic_time = time.time()
     logging.info(
         f"✅ 系统初始化完成：工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00；"
-        f"关注列表1小时刷新；心跳1小时一次；主流{NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s随机扫描；UID补漏启用"
+        f"关注列表1小时刷新；心跳1小时一次；主流{NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s随机扫描；"
+        f"UID补漏每{UID_REPAIR_INTERVAL}s一次"
     )
 
     while IS_RUNNING:
@@ -1261,6 +1257,15 @@ def start_monitoring():
                     logging.error(f"关注流扫描异常: {repr(e)}")
                 last_d_check = now
 
+            # ← 新增：UID 独立补漏，独立间隔执行，避免每轮扫描都全量计算
+            if now - last_uid_repair >= UID_REPAIR_INTERVAL:
+                try:
+                    if repair_stale_uids(target_uids, state, int(now)):
+                        mark_state_dirty(state)
+                except Exception as e:
+                    logging.warning(f"UID补漏总流程异常: {repr(e)}")
+                last_uid_repair = now
+
             # 关注列表严格每小时刷新；失败绝不覆盖旧列表。
             if now - last_following_refresh >= FOLLOWING_REFRESH_INTERVAL:
                 try:
@@ -1293,7 +1298,7 @@ def start_monitoring():
             if now - STATE.last_state_save >= STATE_SAVE_INTERVAL:
                 save_dynamic_state(state)
                 STATE.last_state_save = now
-            time.sleep(1.0)
+            time.sleep(2.0)          # ← 从 1.0 改为 2.0，降低 CPU
 
         except Exception as e:
             if IS_RUNNING:
