@@ -246,7 +246,7 @@ def init_logging():
         stream_handler.setFormatter(formatter)
         stream_handler.addFilter(ding_filter)
         root.addHandler(stream_handler)
-    root.setLevel(logging.WARNING)
+    root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 60)
     logging.info("B站动态监控系统启动（可靠防漏 + UID独立补漏 + 低请求风控版）")
