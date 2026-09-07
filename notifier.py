@@ -8,6 +8,7 @@ WEBHOOK_CONFIG_FILE = "webhook_config.txt"
 REQUEST_TIMEOUT = 10
 MAX_MARKDOWN_LENGTH = 3500
 MAX_ITEM_BLOCK_LENGTH = 1200   # 单条动态的 markdown 块最大长度
+MAX_IMAGES_PER_ITEM = 9
 
 _session = requests.Session()
 _session.headers.update({
@@ -98,18 +99,9 @@ def normalize_link(link):
     return ""
 
 def optimize_cover_url(url, width=480, height=300):
-    """对 B 站图片 URL 添加压缩参数，减小推送体积"""
-    if not url:
-        return ""
-    url = clean_text(url)
-    if not url.startswith(("http://", "https://")):
-        return ""
-    # 仅处理常见的 B 站图床域名，避免误伤其他外链
-    if any(domain in url for domain in ("hdslb.com", "biliimg.com", "bilibili.com")):
-        # 若已包含 @ 参数则不重复添加
-        if "@" not in url.split("/")[-1]:
-            return f"{url}@{width}w_{height}h_1c.webp"
-    return url
+    """保留 B 站原始图片 URL，避免 CDN 的 @裁剪参数导致钉钉裂图。"""
+    return normalize_link(url)
+
 
 def post_dingtalk(webhook_url, payload, retries=2):
     if not webhook_url:
@@ -162,7 +154,7 @@ def post_dingtalk(webhook_url, payload, retries=2):
                         f"钉钉消息被安全拦截 (310000)，请检查关键词/IP 白名单配置！"
                         f"title={msgtitle}, errmsg={errmsg}, url={_mask_url(webhook_url)}"
                     )
-                return True  # 不再重试，避免无限循环
+                return False  # 不算成功；交给 main.py 的 outbox 延迟重试，避免消息丢失
 
             logging.error(
                 f"钉钉 webhook 发送失败: type={msgtype}, title={msgtitle}, "
@@ -195,7 +187,17 @@ def build_dynamic_markdown(items):
         message = item.get("message", "")
         pub_time = clean_text(item.get("time", ""))
         link = normalize_link(item.get("link", ""))
-        cover = optimize_cover_url(item.get("cover", ""))
+        images = item.get("images") or item.get("covers") or []
+        if not isinstance(images, list):
+            images = []
+        if not images and item.get("cover"):
+            images = [item.get("cover")]
+        clean_images = []
+        for img in images:
+            img = optimize_cover_url(img)
+            if img and img not in clean_images:
+                clean_images.append(img)
+        clean_images = clean_images[:MAX_IMAGES_PER_ITEM]
 
         # 构建单条动态的 markdown 片段
         item_lines = []
@@ -207,9 +209,14 @@ def build_dynamic_markdown(items):
         item_lines.append(quoted)
         item_lines.append("")
 
-        if cover and cover.startswith(("http://", "https://")):
-            item_lines.append(f"![动态封面]({cover})")
+        for img in clean_images:
+            if img.startswith(("http://", "https://")):
+                item_lines.append(f"![动态图片]({img})")
+        if clean_images:
             item_lines.append("")
+            if len(images) > len(clean_images):
+                item_lines.append(f"（共 {len(images)} 张图片，仅显示前 {len(clean_images)} 张）")
+                item_lines.append("")
 
         if link:
             item_lines.append(f"[查看原动态]({link})")
