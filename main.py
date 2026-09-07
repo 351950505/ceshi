@@ -70,6 +70,9 @@ DEEP_SCAN_INTERVAL = 300
 DEEP_SCAN_MAX_PAGES = 20
 DEEP_SCAN_STOP_STABLE_PAGES = 2
 
+# 当发现新动态时，二次整体刷新最多检查更多页面，仍然不拆 UID
+VERIFY_MAX_PAGES = 6
+
 # 延迟动态保护窗口
 DYNAMIC_NEW_WINDOW = 6 * 3600
 RECENT_DISCOVERY_WINDOW = 15 * 60
@@ -450,6 +453,7 @@ def default_state():
             "deep_scans": 0,
             "items_seen": 0,
             "new_found": 0,
+            "primary_found": 0,
             "verify_rounds": 0,
             "verify_recovered": 0,
             "deep_recovered": 0,
@@ -534,6 +538,7 @@ def reset_daily_stats(state, date_str):
             "deep_scans": 0,
             "items_seen": 0,
             "new_found": 0,
+            "primary_found": 0,
             "verify_rounds": 0,
             "verify_recovered": 0,
             "deep_recovered": 0,
@@ -875,6 +880,8 @@ def safe_enqueue_notify(title, items, notify_type="dynamic", dyn_id="", uid="", 
             outbox[dyn_id] = task
             PENDING_PUSH_IDS.add(dyn_id)
             mark_state_dirty(ACTIVE_STATE)
+            # 关键可靠性：先落盘，再进内存队列。进程此刻崩溃也能从 outbox 恢复。
+            save_dynamic_state(ACTIVE_STATE)
         try:
             notify_queue.put_nowait(task)
             return True
@@ -882,6 +889,8 @@ def safe_enqueue_notify(title, items, notify_type="dynamic", dyn_id="", uid="", 
             with STATE_LOCK:
                 ACTIVE_STATE.get("feed", {}).get("outbox", {}).pop(dyn_id, None)
                 PENDING_PUSH_IDS.discard(dyn_id)
+                mark_state_dirty(ACTIVE_STATE)
+                save_dynamic_state(ACTIVE_STATE)
             return False
 
     task = {
@@ -1130,7 +1139,6 @@ def update_uid_stats_after_enqueue(state, task, discovery_mode):
     uid = str(task.get("uid") or "")
     dyn_id = str(task.get("dyn_id") or "")
     stat = get_uid_stat(state, uid)
-    remember_uid_id(stat, dyn_id)
     stat["daily_new"] = int(stat.get("daily_new", 0)) + 1
     first_seen = int(task.get("first_seen", 0) or 0)
     pub_ts = int(task.get("pub_ts", 0) or 0)
@@ -1139,6 +1147,8 @@ def update_uid_stats_after_enqueue(state, task, discovery_mode):
 
     daily = state.setdefault("daily", {})
     daily["new_found"] = int(daily.get("new_found", 0)) + 1
+    if discovery_mode == "primary":
+        daily["primary_found"] = int(daily.get("primary_found", 0)) + 1
     if delay >= 30:
         daily["delayed_found"] = int(daily.get("delayed_found", 0)) + 1
         stat["daily_delayed"] = int(stat.get("daily_delayed", 0)) + 1
@@ -1311,6 +1321,7 @@ def format_health_report(state, target_uids, china_dt):
         f"深度刷新：{daily.get('deep_scans', 0)} 次",
         f"读取动态：{daily.get('items_seen', 0)} 条",
         f"新动态：{daily.get('new_found', 0)} 条",
+        f"首次刷新发现：{daily.get('primary_found', 0)} 条",
         f"二次确认追回：{daily.get('verify_recovered', 0)} 条",
         f"深扫追回：{daily.get('deep_recovered', 0)} 条",
         f"延迟动态：{daily.get('delayed_found', 0)} 条",
@@ -1550,7 +1561,7 @@ def start_monitoring():
                         state.setdefault("daily", {})["verify_rounds"] = int(state.setdefault("daily", {}).get("verify_rounds", 0)) + 1
                         time.sleep(random.uniform(VERIFY_DELAY_MIN, VERIFY_DELAY_MAX))
                         full_refresh(
-                            target_uids, state, mode="verify", max_pages=3, stop_at_snapshot=True
+                            target_uids, state, mode="verify", max_pages=VERIFY_MAX_PAGES, stop_at_snapshot=True
                         )
 
                     # 每5分钟整体深扫一次，直到已知 snapshot 边界或最大页数
