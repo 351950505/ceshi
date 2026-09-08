@@ -16,7 +16,6 @@ import signal
 import uuid
 import shutil
 from dataclasses import dataclass, field
-from collections import deque
 
 try:
     from zoneinfo import ZoneInfo
@@ -540,13 +539,22 @@ def load_dynamic_state():
     feed["last_snapshot_ids"] = _sanitize_id_list(feed.get("last_snapshot_ids"), RECENT_SNAPSHOT_LIMIT)
     feed["recent_pushed_ids"] = _sanitize_id_list(feed.get("recent_pushed_ids"), RECENT_PUSHED_IDS_LIMIT)
     feed["discovered"] = _sanitize_discovered(feed.get("discovered"))
+    before_outbox = len(feed.get("outbox") or {})
+    feed["outbox"] = _sanitize_outbox(feed.get("outbox"))
     after_snap = len(feed["last_snapshot_ids"])
     after_pushed = len(feed["recent_pushed_ids"])
     after_disc = len(feed["discovered"])
-    if before_snap != after_snap or before_pushed != after_pushed or before_disc != after_disc:
+    after_outbox = len(feed["outbox"])
+    if (
+        before_snap != after_snap
+        or before_pushed != after_pushed
+        or before_disc != after_disc
+        or before_outbox != after_outbox
+    ):
         logging.warning(
             f"🧹 状态自动修复: snapshot {before_snap}→{after_snap}, "
-            f"pushed {before_pushed}→{after_pushed}, discovered {before_disc}→{after_disc}"
+            f"pushed {before_pushed}→{after_pushed}, discovered {before_disc}→{after_disc}, "
+            f"outbox {before_outbox}→{after_outbox}"
         )
         state.setdefault("_meta", {})["dirty"] = True
 
@@ -571,10 +579,7 @@ def save_dynamic_state(state):
         now = time.time()
         feed["push_retry_after"] = {k: v for k, v in retry.items() if float(v or 0) > now}
 
-        outbox = feed.get("outbox", {}) or {}
-        if len(outbox) > OUTBOX_MAX:
-            ordered = sorted(outbox.items(), key=lambda kv: float((kv[1] or {}).get("created_at", 0) or 0))
-            feed["outbox"] = dict(ordered[-OUTBOX_MAX:])
+        feed["outbox"] = _sanitize_outbox(feed.get("outbox"))
 
         for uid, info in list(state.get("uid_stats", {}).items()):
             if isinstance(info, dict):
@@ -892,10 +897,6 @@ def remember_uid_id(uid_stat, dyn_id):
     uid_stat["seen_ids"] = ids[:500]
 
 
-def uid_seen(uid_stat, dyn_id):
-    return str(dyn_id) in set(uid_stat.get("seen_ids", []) or [])
-
-
 # =========================================================
 # Outbox / Webhook
 # =========================================================
@@ -908,8 +909,14 @@ def add_recent_pushed(state, dyn_id):
     feed["recent_pushed_ids"] = ids[:RECENT_PUSHED_IDS_LIMIT]
 
 
-def is_recent_pushed(state, dyn_id):
-    return str(dyn_id) in set(state.setdefault("feed", {}).get("recent_pushed_ids", []) or [])
+def get_recent_pushed_set(state):
+    return set(state.setdefault("feed", {}).get("recent_pushed_ids", []) or [])
+
+
+def is_recent_pushed(state, dyn_id, pushed_set=None):
+    if pushed_set is not None:
+        return str(dyn_id) in pushed_set
+    return str(dyn_id) in get_recent_pushed_set(state)
 
 
 def safe_enqueue_notify(title, items, notify_type="dynamic", dyn_id="", uid="", pub_ts=0, first_seen=0, discovery_mode="primary"):
@@ -974,26 +981,73 @@ def safe_enqueue_notify(title, items, notify_type="dynamic", dyn_id="", uid="", 
         return False
 
 
+def _sanitize_outbox(raw):
+    """启动时清洗 outbox：非法结构删除、缺字段补齐、过期失败任务淘汰。"""
+    if not isinstance(raw, dict):
+        return {}
+    now = time.time()
+    cleaned = {}
+    max_age = 7 * 24 * 3600  # 超过 7 天的待发送直接丢弃
+    for k, v in raw.items():
+        dyn_id = str(k).strip()
+        if not dyn_id or not isinstance(v, dict):
+            continue
+        try:
+            created = float(v.get("created_at", 0) or 0)
+            attempt = int(v.get("attempt", 0) or 0)
+            next_attempt = float(v.get("next_attempt", 0) or 0)
+            pub_ts = int(v.get("pub_ts", 0) or 0)
+            first_seen = int(v.get("first_seen", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if created and (now - created) > max_age:
+            continue
+        if attempt > 50:  # 重试过多视为死信
+            continue
+        task = dict(v)
+        task["dyn_id"] = dyn_id
+        task["uid"] = str(task.get("uid") or "")
+        task["notify_type"] = str(task.get("notify_type") or "dynamic")
+        task["title"] = str(task.get("title") or "")
+        task["items"] = task.get("items") if isinstance(task.get("items"), list) else []
+        task["pub_ts"] = pub_ts
+        task["first_seen"] = first_seen or int(created or now)
+        task["created_at"] = created or now
+        task["attempt"] = attempt
+        task["next_attempt"] = next_attempt
+        task["discovery_mode"] = str(task.get("discovery_mode") or "")
+        cleaned[dyn_id] = task
+        if len(cleaned) >= OUTBOX_MAX:
+            break
+    return cleaned
+
+
 def restore_outbox_to_queue(state):
-    outbox = state.setdefault("feed", {}).setdefault("outbox", {})
+    feed = state.setdefault("feed", {})
+    feed["outbox"] = _sanitize_outbox(feed.get("outbox"))
+    outbox = feed["outbox"]
     now = time.time()
     for dyn_id, task in list(outbox.items()):
-        if not isinstance(task, dict):
-            outbox.pop(dyn_id, None)
-            continue
         next_attempt = float(task.get("next_attempt", 0) or 0)
-        if next_attempt <= now:
+        if next_attempt > now:
+            continue
+        try:
+            notify_queue.put_nowait(task)
             PENDING_PUSH_IDS.add(str(dyn_id))
-            try:
-                notify_queue.put_nowait(task)
-            except queue.Full:
-                break
+        except queue.Full:
+            # put 失败绝不能占着 PENDING，否则会永久卡死
+            PENDING_PUSH_IDS.discard(str(dyn_id))
+            logging.warning(f"⚠️ 启动恢复 outbox 时队列已满，剩余 {len(outbox)} 条待后续 requeue")
+            break
 
 
 def mark_sent(state, task):
     dyn_id = str(task.get("dyn_id") or "")
     uid = str(task.get("uid") or "")
-    pub_ts = int(task.get("pub_ts") or 0)
+    try:
+        pub_ts = int(task.get("pub_ts") or 0)
+    except (TypeError, ValueError):
+        pub_ts = 0
     if not dyn_id:
         return
     feed = state.setdefault("feed", {})
@@ -1003,12 +1057,27 @@ def mark_sent(state, task):
     feed.setdefault("push_retry_after", {}).pop(dyn_id, None)
     PENDING_PUSH_IDS.discard(dyn_id)
 
+    # 补写 discovered，保证与 recent_pushed 一致
+    discovered = feed.setdefault("discovered", {})
+    if dyn_id not in discovered:
+        discovered[dyn_id] = {
+            "first_seen": int(task.get("first_seen") or time.time()),
+            "pub_ts": pub_ts,
+            "uid": uid,
+            "refresh_seq": STATE.refresh_seq,
+            "discovery_mode": str(task.get("discovery_mode") or "sent"),
+        }
+
     stat = get_uid_stat(state, uid)
     remember_uid_id(stat, dyn_id)
     stat["total_seen"] += 1
-    stat["last_pub_ts"] = max(int(stat.get("last_pub_ts", 0)), pub_ts)
-    first_seen = int(task.get("first_seen") or 0)
-    if first_seen and pub_ts:
+    if pub_ts > 0:
+        stat["last_pub_ts"] = max(int(stat.get("last_pub_ts", 0)), pub_ts)
+    try:
+        first_seen = int(task.get("first_seen") or 0)
+    except (TypeError, ValueError):
+        first_seen = 0
+    if first_seen and pub_ts > 0:
         delay = max(0, first_seen - pub_ts)
         stat["max_delay_today"] = max(int(stat.get("max_delay_today", 0)), delay)
 
@@ -1085,7 +1154,11 @@ def requeue_due_outbox(state):
         if not isinstance(task, dict):
             outbox.pop(dyn_id, None)
             continue
-        if float(task.get("next_attempt", 0) or 0) > now:
+        try:
+            next_attempt = float(task.get("next_attempt", 0) or 0)
+        except (TypeError, ValueError):
+            next_attempt = 0
+        if next_attempt > now:
             continue
         if dyn_id in PENDING_PUSH_IDS:
             continue
@@ -1093,6 +1166,7 @@ def requeue_due_outbox(state):
             notify_queue.put_nowait(task)
             PENDING_PUSH_IDS.add(str(dyn_id))
         except queue.Full:
+            PENDING_PUSH_IDS.discard(str(dyn_id))
             break
 
 
@@ -1106,7 +1180,7 @@ FEED_FEATURES = (
 )
 
 
-def fetch_following_feed(offset=""):
+def fetch_following_feed(offset="", update_baseline=""):
     """关注动态完整流，接近 App 关注页下拉刷新。"""
     params = {
         "type": "all",
@@ -1117,11 +1191,13 @@ def fetch_following_feed(offset=""):
     }
     if offset:
         params["offset"] = offset
+    if update_baseline:
+        params["update_baseline"] = update_baseline
     return wbi_request(FEED_URL, params)
 
 
-def fetch_feed_page(offset=""):
-    data = fetch_following_feed(offset)
+def fetch_feed_page(offset="", update_baseline=""):
+    data = fetch_following_feed(offset, update_baseline=update_baseline)
     if data.get("code") != 0:
         logging.warning(
             f"❌ feed/all 失败 code={data.get('code')} msg={data.get('message')}"
@@ -1130,7 +1206,7 @@ def fetch_feed_page(offset=""):
     return data.get("data") or {}
 
 
-def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
+def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, pushed_set=None):
     """只比较动态 ID / 首次发现时间；增加最近时间强制保护 + FILTER DEBUG。
     不再用全局 pub_ts 游标吃掉迟到动态。
     """
@@ -1140,6 +1216,8 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
     daily = state.setdefault("daily", {})
     first_seen_map = state.setdefault("feed", {}).setdefault("discovered", {})
     outbox = state.setdefault("feed", {}).setdefault("outbox", {})
+    if pushed_set is None:
+        pushed_set = get_recent_pushed_set(state)
 
     for item in items:
         if not isinstance(item, dict):
@@ -1160,7 +1238,6 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
         stat["last_global_seen"] = now_ts
         if pub_ts:
             stat["last_pub_ts"] = max(int(stat.get("last_pub_ts", 0)), pub_ts)
-        mark_state_dirty(state)
 
         if not is_allowed_dynamic(item):
             logging.debug(
@@ -1169,13 +1246,33 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
             )
             continue
 
+        # pub_ts 无效时不能当成 now，否则 age=0 会误入强制新窗口
         if pub_ts <= 0:
-            pub_ts = now_ts
+            logging.debug(
+                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
+                f"reason=missing_pub_ts mode={discovery_mode}"
+            )
+            # 无发布时间：仅当从未见过时进入候选，且不走 force 窗口
+            if is_recent_pushed(state, dyn_id, pushed_set):
+                remember_uid_id(stat, dyn_id)
+                continue
+            if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
+                remember_uid_id(stat, dyn_id)
+                continue
+            if first_seen_map.get(dyn_id):
+                continue
+            logging.info(
+                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
+                f"reason=new_id_no_pub_ts mode={discovery_mode}"
+            )
+            candidates.append((0, dyn_id, uid, item, now_ts))
+            continue
+
         age = now_ts - pub_ts
         in_force_window = age <= RECENT_FORCE_NEW_WINDOW
 
-        # 1) 已真正发送成功的：永远跳过（即使在 force 窗口也不重复推）
-        if is_recent_pushed(state, dyn_id):
+        # 1) 已真正发送成功的：永远跳过
+        if is_recent_pushed(state, dyn_id, pushed_set):
             remember_uid_id(stat, dyn_id)
             logging.debug(
                 f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
@@ -1183,7 +1280,7 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
             )
             continue
 
-        # 2) 已在 outbox / PENDING：交给重试，不重复入队
+        # 2) 已在 outbox / PENDING：交给重试
         if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
             remember_uid_id(stat, dyn_id)
             logging.debug(
@@ -1192,11 +1289,10 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
             )
             continue
 
-        # 3) 已登记 discovered：正常跳过；但若处于强制保护窗口，允许“污染恢复”
+        # 3) 已登记 discovered：正常跳过；强制窗口内允许污染恢复
         entry = first_seen_map.get(dyn_id)
         if entry:
             if in_force_window:
-                # 状态可能被污染（discovered 里有但从未真正发送），强制重新进入候选
                 logging.warning(
                     f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
                     f"age={age}s reason=force_new_despite_discovered mode={discovery_mode}"
@@ -1208,7 +1304,7 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
                 )
                 continue
 
-        # 4) 超出历史保护窗口的旧动态：丢弃
+        # 4) 超出历史保护窗口
         if age > DYNAMIC_NEW_WINDOW:
             logging.debug(
                 f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
@@ -1216,13 +1312,11 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode):
             )
             continue
 
-        # 进入候选 —— 关键诊断日志用 INFO
         reason = "new_time_window" if in_force_window else "new_id"
         logging.info(
             f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
             f"age={age}s reason={reason} mode={discovery_mode}"
         )
-        # 先进入候选；只有成功写入 Outbox 后才登记 discovered，避免入队失败导致永久跳过。
         candidates.append((pub_ts, dyn_id, uid, item, now_ts))
 
     daily["items_seen"] = int(daily.get("items_seen", 0)) + len(page_ids)
@@ -1331,8 +1425,11 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     reached_old = False
     first_baseline = ""
     pages_done = 0
-    # primary 至少扫 3 页，避免顶部 ID 未变就过早 stop
-    min_pages_before_stop = 1 if mode == "deep" else 3
+    # primary 至少 3 页；deep 至少 5 页，避免过早 stop 漏补
+    min_pages_before_stop = 5 if mode == "deep" else 3
+    pushed_set = get_recent_pushed_set(state)
+    # 首页带上已知 baseline，便于 update_num 反映增量
+    known_baseline = str(state.setdefault("feed", {}).get("baseline") or "")
 
     logging.info(f"🔄 [{mode}] 关注流整体刷新开始 seq={refresh_seq}")
 
@@ -1340,7 +1437,8 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         if not IS_RUNNING:
             completed = False
             break
-        data = fetch_feed_page(offset)
+        page_baseline = known_baseline if page_idx == 0 and known_baseline else ""
+        data = fetch_feed_page(offset, update_baseline=page_baseline)
         if data is None:
             completed = False
             state.setdefault("daily", {})["api_fail"] = int(state.setdefault("daily", {}).get("api_fail", 0)) + 1
@@ -1362,14 +1460,14 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
             first_baseline = str(data.get("update_baseline") or items[0].get("id_str") or "")
 
         candidates, page_ids = process_feed_items(
-            items, target_uids, state, refresh_seq, mode
+            items, target_uids, state, refresh_seq, mode, pushed_set=pushed_set
         )
         for c in candidates:
             logging.info(f"[FEED DEBUG] found dyn_id={c[1]} uid={c[2]} mode={mode}")
         all_new.extend(candidates)
         all_ids.extend(page_ids)
 
-        # 稳定页判断：本页绝大多数 ID 已在 snapshot 中
+        # 稳定页：本页绝大多数 ID 已在 snapshot
         old_count = sum(1 for x in page_ids if x in old_snapshot)
         if page_ids and old_count >= max(1, int(len(page_ids) * 0.6)):
             stable_pages += 1
@@ -1383,8 +1481,6 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         has_more = bool(data.get("has_more"))
         if not next_offset or not has_more:
             break
-        # 不因为单个旧动态停止。关注流中旧动态和新动态可能交错。
-        # 只有连续稳定页 + 已满足最少页数，才认为追到历史边界。
         if (
             stop_at_snapshot
             and pages_done >= min_pages_before_stop
@@ -1395,29 +1491,30 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         if page_idx + 1 < max_pages:
             time.sleep(random.uniform(0.4, 0.8))
 
-    # 去重，先入队再更新 snapshot
     unique = {}
     for c in all_new:
         unique[c[1]] = c
     has_new = enqueue_candidates(list(unique.values()), state, mode)
 
-    # snapshot 只在“至少一页成功”后更新；失败不覆盖旧快照
     if completed and pages_done > 0:
         feed = state.setdefault("feed", {})
         feed["last_refresh_time"] = time.time()
         feed["last_success_refresh"] = time.time()
         if first_baseline:
             feed["baseline"] = first_baseline
-        # snapshot 保留最近一批完整本轮顶部动态，防止只用 pub_ts 判断
-        new_snapshot = list(dict.fromkeys(all_ids))[:RECENT_SNAPSHOT_LIMIT]
-        feed["last_snapshot_ids"] = new_snapshot
+        # 始终「本轮 ID 在前 + 旧 snapshot 去重拼接」，避免 max_pages 截断丢掉历史边界
+        new_ids = list(dict.fromkeys(all_ids))
+        old_ids = feed.get("last_snapshot_ids") or []
+        merged = new_ids + [x for x in old_ids if x not in set(new_ids)]
+        feed["last_snapshot_ids"] = merged[:RECENT_SNAPSHOT_LIMIT]
         history = feed.setdefault("recent_snapshot_history", [])
         history.append({
             "seq": refresh_seq,
             "time": int(time.time()),
             "mode": mode,
             "count": len(all_ids),
-            "ids": new_snapshot[:100],
+            "reached_old": reached_old,
+            "ids": list(feed["last_snapshot_ids"])[:100],
         })
         history[:] = history[-20:]
         mark_state_dirty(state)
@@ -1504,40 +1601,76 @@ def initialize_state(target_uids):
     reset_daily_stats(state, now_cn().strftime("%Y-%m-%d"))
     feed = state.setdefault("feed", {})
 
-    # 兼容旧版本：如果旧状态只有 recent_pushed_ids / last_ts，不把它继续当作唯一新旧判断依据。
     feed.setdefault("last_snapshot_ids", [])
     feed.setdefault("recent_snapshot_history", [])
     feed.setdefault("discovered", {})
+    feed.setdefault("recent_pushed_ids", [])
 
-    # 启动时做一次“基线建立”，只采集，不把现有历史全部推送
-    logging.info("🧭 正在建立 App 关注流启动基线...")
-    data = fetch_feed_page("")
-    if data is not None:
+    # 启动基线：多扫几页，把已有动态登记为 known，绝不推送历史
+    logging.info("🧭 正在建立 feed/all 启动基线（只登记不推送）...")
+    all_ids = []
+    offset = ""
+    baseline_pages = 3
+    now_ts = int(time.time())
+    discovered = feed.setdefault("discovered", {})
+    pages_ok = 0
+
+    for page_idx in range(baseline_pages):
+        data = fetch_feed_page(offset)
+        if data is None:
+            break
         items = data.get("items") or []
-        ids = [str(x.get("id_str")) for x in items if isinstance(x, dict) and x.get("id_str")]
-        feed["baseline"] = str(data.get("update_baseline") or (ids[0] if ids else feed.get("baseline", "")))
-        feed["last_snapshot_ids"] = ids[:RECENT_SNAPSHOT_LIMIT]
-        # 启动时只建立已知 ID 索引，不推送旧动态
+        if not items:
+            break
+        pages_ok += 1
+        if page_idx == 0:
+            feed["baseline"] = str(
+                data.get("update_baseline") or items[0].get("id_str") or feed.get("baseline", "")
+            )
         for item in items:
             if not isinstance(item, dict):
-                continue
-            author = item.get("modules", {}).get("module_author", {}) or {}
-            uid = str(author.get("mid", ""))
-            if uid not in target_uids:
                 continue
             dyn_id = str(item.get("id_str") or "")
             if not dyn_id:
                 continue
+            all_ids.append(dyn_id)
+            author = item.get("modules", {}).get("module_author", {}) or {}
+            uid = str(author.get("mid", ""))
+            pub_ts = int(author.get("pub_ts", 0) or 0)
+            if uid not in target_uids:
+                continue
+            # 只写 discovered，不写 recent_pushed（从未真正推送过）
+            if dyn_id not in discovered:
+                discovered[dyn_id] = {
+                    "first_seen": now_ts,
+                    "pub_ts": pub_ts if pub_ts > 0 else 0,
+                    "uid": uid,
+                    "refresh_seq": 0,
+                    "discovery_mode": "baseline",
+                }
             stat = get_uid_stat(state, uid, author.get("name", uid))
             remember_uid_id(stat, dyn_id)
-            stat["last_global_seen"] = int(time.time())
-            pub_ts = int(author.get("pub_ts", 0) or 0)
-            stat["last_pub_ts"] = max(int(stat.get("last_pub_ts", 0)), pub_ts)
+            stat["last_global_seen"] = now_ts
+            if pub_ts > 0:
+                stat["last_pub_ts"] = max(int(stat.get("last_pub_ts", 0)), pub_ts)
+
+        next_offset = str(data.get("offset") or "")
+        if not next_offset or not data.get("has_more"):
+            break
+        offset = next_offset
+        time.sleep(random.uniform(0.3, 0.6))
+
+    if pages_ok > 0:
+        feed["last_snapshot_ids"] = list(dict.fromkeys(all_ids))[:RECENT_SNAPSHOT_LIMIT]
+        trim_discovered(state)
         mark_state_dirty(state)
         save_dynamic_state(state)
-        logging.info(f"✅ 启动基线建立完成，首页动态={len(items)}")
+        logging.info(
+            f"✅ 启动基线完成 pages={pages_ok} items={len(all_ids)} "
+            f"discovered={len(discovered)}（仅登记，未标记为已推送）"
+        )
     else:
-        logging.warning("⚠️ 启动基线获取失败，将依赖缓存继续启动")
+        logging.warning("⚠️ 启动基线获取失败，将依赖已有状态继续启动")
     return state
 
 
@@ -1614,6 +1747,7 @@ def start_monitoring():
     last_scan = 0.0
     last_following_refresh = time.time()
     last_heartbeat = 0.0
+    next_interval = random_main_interval()  # 固定本轮间隔，不在循环里反复重抽
     STATE.last_deep_scan = 0.0
     STATE.last_new_dynamic_time = time.time()
 
@@ -1635,7 +1769,7 @@ def start_monitoring():
                 feed = state.setdefault("feed", {})
                 outbox = feed.setdefault("outbox", {})
                 logging.info(
-                    f"💓 心跳 | UID={len(target_uids)} | 主刷新={NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s "
+                    f"💓 心跳 | UID={len(target_uids)} | 下轮间隔={next_interval:.1f}s "
                     f"| 最近成功刷新={ts_to_str(feed.get('last_success_refresh', 0))} "
                     f"| Outbox={len(outbox)} | 连续失败={STATE.consecutive_failures} "
                     f"| CookieFail={STATE.consecutive_cookie_failures}"
@@ -1672,10 +1806,8 @@ def start_monitoring():
                     "system"
                 )
 
-            interval = random_main_interval()
-            if now - last_scan >= interval:
+            if now - last_scan >= next_interval:
                 try:
-                    STATE.consecutive_failures = 0
                     has_new, _, _ = full_refresh(
                         target_uids, state, mode="primary", max_pages=5, stop_at_snapshot=True
                     )
@@ -1688,7 +1820,7 @@ def start_monitoring():
                             target_uids, state, mode="verify", max_pages=VERIFY_MAX_PAGES, stop_at_snapshot=True
                         )
 
-                    # 每5分钟整体深扫一次，直到已知 snapshot 边界或最大页数
+                    # 每5分钟整体深扫一次
                     if now - STATE.last_deep_scan >= DEEP_SCAN_INTERVAL and IS_RUNNING:
                         state.setdefault("daily", {})["deep_scans"] = int(state.setdefault("daily", {}).get("deep_scans", 0)) + 1
                         STATE.last_deep_scan = now
@@ -1698,10 +1830,19 @@ def start_monitoring():
                             max_pages=DEEP_SCAN_MAX_PAGES,
                             stop_at_snapshot=True,
                         )
-                    last_scan = now
+                    # 成功：清零失败计数，再抽下一轮间隔
+                    STATE.consecutive_failures = 0
+                    last_scan = time.time()
+                    next_interval = random_main_interval()
                 except Exception as e:
                     STATE.consecutive_failures += 1
-                    logging.error(f"❌ 关注流扫描异常: {repr(e)}", exc_info=True)
+                    last_scan = time.time()
+                    next_interval = random_main_interval()  # 失败时会因 consecutive_failures>=2 拉长
+                    logging.error(
+                        f"❌ 关注流扫描异常: {repr(e)}，连续失败={STATE.consecutive_failures}，"
+                        f"下轮间隔={next_interval:.1f}s",
+                        exc_info=True,
+                    )
 
             if now - STATE.last_state_save >= STATE_SAVE_INTERVAL or state.get("_meta", {}).get("dirty"):
                 save_dynamic_state(state)
