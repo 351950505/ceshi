@@ -1218,7 +1218,7 @@ def enqueue_candidates(candidates, state, discovery_mode):
     return has_new
 
 
-def full_refresh(target_uids, state, mode="primary", max_pages=1, stop_at_snapshot=True):
+def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapshot=True):
     """一次完整的关注流刷新。成功返回后，才允许更新 baseline / snapshot。"""
     STATE.refresh_seq += 1
     refresh_seq = STATE.refresh_seq
@@ -1229,7 +1229,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=1, stop_at_snapsh
     offset = ""
     completed = True
     stable_pages = 0
-    old_snapshot = set(state.setdefault("feed", {}).get("last_snapshot_ids", []) or [])
+    old_snapshot = set(dict.fromkeys(state.setdefault("feed", {}).get("last_snapshot_ids", []) or []))
     reached_old = False
     first_baseline = ""
     pages_done = 0
@@ -1249,6 +1249,11 @@ def full_refresh(target_uids, state, mode="primary", max_pages=1, stop_at_snapsh
 
         pages_done += 1
         items = data.get("items") or []
+        logging.info(
+            f"[NAV DEBUG] page={page_idx + 1} count={len(items)} "
+            f"first={items[0].get('id_str') if items else '-'} "
+            f"last={items[-1].get('id_str') if items else '-'}"
+        )
         if not items:
             break
         if page_idx == 0:
@@ -1273,7 +1278,9 @@ def full_refresh(target_uids, state, mode="primary", max_pages=1, stop_at_snapsh
         has_more = bool(data.get("has_more"))
         if not next_offset or not has_more:
             break
-        if stop_at_snapshot and (reached_old or stable_pages >= DEEP_SCAN_STOP_STABLE_PAGES):
+        # 不因为单个旧动态停止。关注流中旧动态和新动态可能交错。
+        # 只有连续稳定页才认为已经追到历史边界。
+        if stop_at_snapshot and stable_pages >= DEEP_SCAN_STOP_STABLE_PAGES:
             break
         offset = next_offset
         if page_idx + 1 < max_pages:
@@ -1561,7 +1568,7 @@ def start_monitoring():
                 try:
                     STATE.consecutive_failures = 0
                     has_new, _, _ = full_refresh(
-                        target_uids, state, mode="primary", max_pages=1, stop_at_snapshot=True
+                        target_uids, state, mode="primary", max_pages=5, stop_at_snapshot=True
                     )
 
                     # 发现新动态后做一次整体二次确认，不拆 UID
