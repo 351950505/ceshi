@@ -62,7 +62,7 @@ OFF_HOURS_SLEEP = 20
 NORMAL_INTERVAL_MIN = 20.0
 NORMAL_INTERVAL_MAX = 35.0
 
-# 发现新动态后，追加一次“整体刷新确认”，仍然是 feed/nav
+# 发现新动态后，追加一次“整体刷新确认”（同一关注流接口）
 VERIFY_DELAY_MIN = 1.5
 VERIFY_DELAY_MAX = 3.0
 
@@ -1115,17 +1115,28 @@ def requeue_due_outbox(state):
 # =========================================================
 # 关注流 API
 # =========================================================
-FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/nav"
-NAV_MODE = True
+# 注意：feed/nav 是导航栏精简流，顶部容易卡旧动态；
+# App「关注」完整流对应 feed/all。
+FEED_URL = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/all"
+FEED_URL_FALLBACK = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/nav"
+NAV_MODE = False
 NAV_FAIL_COUNT = 0
 NAV_FAIL_LIMIT = 2
+# 与网页/App 关注流常用 features 对齐，避免模块缺失
+FEED_FEATURES = (
+    "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,"
+    "onlyfansAssetsV2,forwardListHidden,ugcDelete,onlyfansQaCard,commentsNewVersion,htmlNewStyle"
+)
 
 
 def fetch_following_feed(offset="", update_baseline=""):
-    """App导航栏动态流主接口实验版"""
+    """关注动态完整流（feed/all），更接近 App 关注页下拉刷新。"""
     params = {
-        "web_location": "333.1365",
+        "type": "all",
         "timezone_offset": "-480",
+        "platform": "web",
+        "web_location": "333.1365",
+        "features": FEED_FEATURES,
     }
     if offset:
         params["offset"] = offset
@@ -1135,13 +1146,30 @@ def fetch_following_feed(offset="", update_baseline=""):
 
 
 def fetch_feed_page(offset=""):
-    global NAV_FAIL_COUNT
+    global NAV_FAIL_COUNT, NAV_MODE
     data = fetch_following_feed(offset)
     if data.get("code") != 0:
         NAV_FAIL_COUNT += 1
-        logging.warning(f"❌ feed/nav失败 count={NAV_FAIL_COUNT} code={data.get('code')}")
+        logging.warning(
+            f"❌ feed/all失败 count={NAV_FAIL_COUNT} code={data.get('code')} msg={data.get('message')}"
+        )
+        # 连续失败时短暂回退 nav，避免完全断流（仍优先 all）
+        if NAV_FAIL_COUNT >= NAV_FAIL_LIMIT:
+            logging.warning("⚠️ feed/all 连续失败，本页尝试 feed/nav 回退")
+            params = {
+                "web_location": "333.1365",
+                "timezone_offset": "-480",
+            }
+            if offset:
+                params["offset"] = offset
+            data = wbi_request(FEED_URL_FALLBACK, params)
+            if data.get("code") == 0:
+                NAV_MODE = True
+                NAV_FAIL_COUNT = 0
+                return data.get("data") or {}
         return None
     NAV_FAIL_COUNT = 0
+    NAV_MODE = False
     return data.get("data") or {}
 
 
@@ -1346,8 +1374,10 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     reached_old = False
     first_baseline = ""
     pages_done = 0
+    # primary 至少扫 3 页，避免顶部 ID 未变就过早 stop
+    min_pages_before_stop = 1 if mode == "deep" else 3
 
-    logging.info(f"🔄 [{mode}] 关注流整体刷新开始 seq={refresh_seq}")
+    logging.info(f"🔄 [{mode}] 关注流整体刷新开始 seq={refresh_seq} endpoint={'nav' if NAV_MODE else 'all'}")
 
     for page_idx in range(max_pages):
         if not IS_RUNNING:
@@ -1357,16 +1387,18 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         if data is None:
             completed = False
             state.setdefault("daily", {})["api_fail"] = int(state.setdefault("daily", {}).get("api_fail", 0)) + 1
-            logging.warning(f"❌ [{mode}] feed/nav 第{page_idx + 1}页失败，保留旧边界")
+            logging.warning(f"❌ [{mode}] feed 第{page_idx + 1}页失败，保留旧边界")
             break
 
         pages_done += 1
         items = data.get("items") or []
-        first_id = items[0].get("id_str") if items else "-"
-        last_id = items[-1].get("id_str") if items else "-"
+        first_id = str(items[0].get("id_str") if items else "-")
+        last_id = str(items[-1].get("id_str") if items else "-")
+        update_num = data.get("update_num")
         logging.info(
             f"[NAV DEBUG] page={page_idx + 1} count={len(items)} "
-            f"first={first_id} last={last_id}"
+            f"first={first_id} last={last_id} update_num={update_num} "
+            f"endpoint={'nav' if NAV_MODE else 'all'}"
         )
         if not items:
             break
@@ -1381,8 +1413,9 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         all_new.extend(candidates)
         all_ids.extend(page_ids)
 
+        # 稳定页判断：本页绝大多数 ID 已在 snapshot 中
         old_count = sum(1 for x in page_ids if x in old_snapshot)
-        if old_count >= max(1, min(3, len(page_ids))):
+        if page_ids and old_count >= max(1, int(len(page_ids) * 0.6)):
             stable_pages += 1
         else:
             stable_pages = 0
@@ -1395,8 +1428,12 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         if not next_offset or not has_more:
             break
         # 不因为单个旧动态停止。关注流中旧动态和新动态可能交错。
-        # 只有连续稳定页才认为已经追到历史边界。
-        if stop_at_snapshot and stable_pages >= DEEP_SCAN_STOP_STABLE_PAGES:
+        # 只有连续稳定页 + 已满足最少页数，才认为追到历史边界。
+        if (
+            stop_at_snapshot
+            and pages_done >= min_pages_before_stop
+            and stable_pages >= DEEP_SCAN_STOP_STABLE_PAGES
+        ):
             break
         offset = next_offset
         if page_idx + 1 < max_pages:
@@ -1626,7 +1663,7 @@ def start_monitoring():
 
     logging.info(
         f"✅ 启动完成：工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00；"
-        f"整体关注流刷新(feed/nav) {NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s；"
+        f"整体关注流刷新(feed/all) {NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s；"
         f"二次确认 {VERIFY_DELAY_MIN:g}~{VERIFY_DELAY_MAX:g}s；"
         f"深扫每{DEEP_SCAN_INTERVAL}s；关注列表/心跳均1小时"
     )
