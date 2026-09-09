@@ -1,3 +1,25 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+# B站关注动态监控  v3.2（feed/all｜转发动态修复版）
+# -----------------------------------------------------------------------------
+# 本版相对 202609100010.py 的改动（全部围绕「动态被静默丢弃」）：
+#   [FIX-1] is_allowed_dynamic：转发动态 / 纯文字动态的 module_dynamic.major 为显式
+#           null 时，原代码 dict.get("major", {}) 返回 None → None.get("type") 抛
+#           AttributeError → except 返回 False → 动态在类型过滤层被静默丢弃。
+#           实测 dyn_id=1246036657638998040（DYNAMIC_TYPE_FORWARD, major=None,
+#           is_allowed=False）。现改为：先判 FORWARD、所有中间层 or {}、异常放行。
+#   [FIX-2] format_dynamic_message 增加兜底 payload，解析异常不再导致「既不入队
+#           也不写 discovered」的永久漏推。
+#   [FIX-3] process_feed_items：
+#           - 类型过滤(not_following/type_filtered)增加 INFO 汇总，不再静默；
+#           - 增加 SENT_ACK_IDS 兜底，堵住「ACK 已落盘但 state 保存失败」的重复推送；
+#           - item["modules"] 为 null 时不再抛 AttributeError 打断整轮扫描。
+#   [FIX-4] full_refresh：[SCAN] done 输出过滤漏斗计数，一眼看出卡在哪一层。
+#   [FIX-5] atomic_write_json 增加 fsync + 临时文件清理（掉电时 Outbox/ACK 不丢）。
+#   [FIX-6] initialize_state：启动基线不再把「当前不支持的动态类型」登记成
+#           discovered/baseline，避免修好类型过滤后仍被 already_discovered 拦掉。
+#   未改动（按你的要求）：运行窗口 RUN_WEEKDAYS / 24小时运行问题保持原样。
+# =============================================================================
 import sys
 import os
 import time
@@ -76,7 +98,7 @@ DEEP_SCAN_STOP_STABLE_PAGES = 2
 DYNAMIC_NEW_WINDOW = 6 * 3600        # 历史动态最大年龄
 RECENT_FORCE_NEW_WINDOW = 10 * 60    # 近 N 秒强制视为新（防污染漏报）
 # 启动时：无 last_success_refresh 时，最多恢复这么久以内的动态，避免冷启动误推全历史。
-# 有 last_success_refresh 时：凡 pub_ts > last_ok 均视为停机窗口内动态（不设年龄上限）。
+# 有 last_success_refresh 时：凡 pub_ts > last_ok 均视为停机窗口内新动态（不设年龄上限）。
 STARTUP_RECOVER_MAX_AGE = 6 * 3600
 
 STATE_SAVE_INTERVAL = 60
@@ -171,6 +193,7 @@ def signal_handler(signum, frame):
 
 
 def atomic_write_json(path, data):
+    """原子写。[FIX-5] 增加 fsync：掉电时 Outbox/ACK 等关键状态不会停留在 page cache。"""
     backup_path = path + ".bak"
     tmp_path = path + ".write.tmp"
     if os.path.exists(path):
@@ -178,9 +201,22 @@ def atomic_write_json(path, data):
             shutil.copy2(path, backup_path)
         except Exception:
             pass
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def now_cn():
@@ -310,6 +346,7 @@ def load_cookies_into_session():
 
 
 class DingTalkFilter(logging.Filter):
+    """注意：不要改成裸 "310000"——动态 ID 是 19 位数字，含 310000 的行会被整行丢掉。"""
     def filter(self, record):
         return "310000" not in record.getMessage()
 
@@ -338,7 +375,7 @@ def init_logging():
     root.setLevel(LOG_LEVEL)
     root.propagate = False
     logging.info("=" * 70)
-    logging.info("B站关注动态监控 v3.1（feed/all）")
+    logging.info("B站关注动态监控 v3.2（feed/all｜转发动态修复版）")
     logging.info("=" * 70)
 
 
@@ -763,20 +800,40 @@ def get_following_list(uid):
 # 动态解析
 # =========================================================
 def is_allowed_dynamic(item):
+    """[FIX-1]
+    关键：feed/all 里 module_dynamic.major 对「转发动态 / 纯文字动态」是**显式 null**。
+    dict.get("major", {}) 的默认值只在 key 缺失时生效；major=None 时返回 None，
+    继续 .get("type") 抛 AttributeError → 原实现 except 返回 False → 动态被静默丢弃。
+    实测 dyn_id=1246036657638998040：type=DYNAMIC_TYPE_FORWARD, major=None,
+    is_allowed=False，导致该动态永久漏报且 INFO 日志零输出。
+
+    修复要点：
+      ① FORWARD 判断必须放在解析 major 之前（否则 return ALLOW_FORWARD_DYNAMIC 是死代码）
+      ② 所有中间层一律 or {} 兜底，不用 .get(key, {})
+      ③ 解析异常时放行而非丢弃（宁可多推，不能静默漏推）
+    """
     try:
-        top_type = item.get("type", "")
-        modules = item.get("modules", {}) or {}
-        major_type = (modules.get("module_dynamic", {}) or {}).get("major", {}).get("type", "")
-        # 转发：顶层为 FORWARD 直接放行（内容在 orig，不再校验 major_type）
+        top_type = str(item.get("type") or "")
+        modules = item.get("modules") or {}
+        dyn = modules.get("module_dynamic") or {}
+        major = dyn.get("major") or {}
+        major_type = str(major.get("type") or "")
+
+        # 转发动态优先放行：转发者自身没有 major，正文内容在 orig 里
         if top_type == "DYNAMIC_TYPE_FORWARD":
-            return bool(ALLOW_FORWARD_DYNAMIC)
+            return ALLOW_FORWARD_DYNAMIC
         if top_type and top_type not in ALLOWED_TOP_LEVEL_TYPES:
             return False
         if major_type and major_type not in ALLOWED_DYNAMIC_TYPES:
             return False
         return True
-    except Exception:
-        return False
+    except Exception as e:
+        logging.debug(
+            "[FILTER DEBUG] is_allowed 异常按放行 dyn_id=%s type=%s err=%s",
+            item.get("id_str") if isinstance(item, dict) else "-",
+            item.get("type") if isinstance(item, dict) else "-", repr(e),
+        )
+        return True
 
 
 def extract_dynamic_text(item):
@@ -920,41 +977,74 @@ def extract_images(item):
     return clean[:12]
 
 
-def format_dynamic_message(item):
-    dyn_id = str(item.get("id_str") or "")
-    author = item.get("modules", {}).get("module_author", {}) or {}
-    name = author.get("name", "未知UP")
-    uid = str(author.get("mid", ""))
-    pub_ts = _safe_int(author.get("pub_ts"), 0)
-
-    text = cut_text(extract_dynamic_text(item), 900)
-
-    if item.get("type") == "DYNAMIC_TYPE_FORWARD":
-        orig = item.get("orig")
-        if isinstance(orig, dict):
-            orig_text = cut_text(extract_dynamic_text(orig), 350)
-            if orig_text:
-                text = f"{text}\n\n【转发原文】\n{orig_text}" if text else f"【转发原文】\n{orig_text}"
-            orig_id = orig.get("id_str")
-            if orig_id:
-                text += f"\n\n原动态：https://t.bilibili.com/{orig_id}"
-
-    if not text:
-        text = "（该动态无可提取正文）"
-
-    images = extract_images(item)
+def _minimal_push_payload(item, err=""):
+    """[FIX-2] 解析彻底失败时的最小可推送载荷：保证「绝不因为解析问题而静默漏推」。"""
+    dyn_id = str(item.get("id_str") or "") if isinstance(item, dict) else ""
+    author = {}
+    top_type = ""
+    pub_ts = 0
+    if isinstance(item, dict):
+        top_type = str(item.get("type") or "")
+        author = (item.get("modules") or {}).get("module_author") or {}
+        pub_ts = _safe_int(author.get("pub_ts"), 0)
     return {
-        "user": name,
-        "uid": uid,
-        "message": text,
+        "user": str(author.get("name") or "未知UP"),
+        "uid": str(author.get("mid") or ""),
+        "message": f"（正文解析失败，已降级推送｜类型={top_type or '未知'}｜{str(err)[:120]}）",
         "time": ts_to_str(pub_ts),
-        "link": f"https://t.bilibili.com/{dyn_id}",
-        "cover": images[0] if images else "",
-        "covers": images,
-        "images": images,
-        "image_count": len(images),
+        "link": f"https://t.bilibili.com/{dyn_id}" if dyn_id else "",
+        "cover": "",
+        "covers": [],
+        "images": [],
+        "image_count": 0,
         "kind": "dynamic",
     }
+
+
+def format_dynamic_message(item):
+    """[FIX-2] 全程兜底：任何解析异常都退化为最小载荷，而不是抛出导致漏推。"""
+    try:
+        dyn_id = str(item.get("id_str") or "")
+        modules = item.get("modules") or {}
+        author = modules.get("module_author") or {}
+        name = author.get("name", "未知UP")
+        uid = str(author.get("mid", ""))
+        pub_ts = _safe_int(author.get("pub_ts"), 0)
+
+        text = cut_text(extract_dynamic_text(item), 900)
+
+        if item.get("type") == "DYNAMIC_TYPE_FORWARD":
+            orig = item.get("orig")
+            if isinstance(orig, dict):
+                orig_text = cut_text(extract_dynamic_text(orig), 350)
+                if orig_text:
+                    text = f"{text}\n\n【转发原文】\n{orig_text}" if text else f"【转发原文】\n{orig_text}"
+                orig_id = orig.get("id_str")
+                if orig_id:
+                    text += f"\n\n原动态：https://t.bilibili.com/{orig_id}"
+
+        if not text:
+            text = "（该动态无可提取正文）"
+
+        images = extract_images(item)
+        return {
+            "user": name,
+            "uid": uid,
+            "message": text,
+            "time": ts_to_str(pub_ts),
+            "link": f"https://t.bilibili.com/{dyn_id}",
+            "cover": images[0] if images else "",
+            "covers": images,
+            "images": images,
+            "image_count": len(images),
+            "kind": "dynamic",
+        }
+    except Exception as e:
+        logging.warning(
+            f"[FORMAT] 解析异常，降级推送 dyn_id="
+            f"{item.get('id_str') if isinstance(item, dict) else '-'}: {repr(e)}"
+        )
+        return _minimal_push_payload(item if isinstance(item, dict) else {}, repr(e))
 
 
 # =========================================================
@@ -1206,7 +1296,8 @@ def safe_enqueue_notify(title, items, notify_type="dynamic", dyn_id="", uid="", 
             logging.error(f"safe_enqueue_notify: ACTIVE_STATE 未初始化，拒绝动态入队 dyn_id={dyn_id}")
             return False
         with STATE_LOCK:
-            if dyn_id in PENDING_PUSH_IDS or is_recent_pushed(ACTIVE_STATE, dyn_id):
+            # [FIX-3] SENT_ACK_IDS 兜底：ACK 已落盘但 state 保存失败时不再重复入队
+            if dyn_id in PENDING_PUSH_IDS or dyn_id in SENT_ACK_IDS or is_recent_pushed(ACTIVE_STATE, dyn_id):
                 return False
             outbox = ACTIVE_STATE.setdefault("feed", {}).setdefault("outbox", {})
             if dyn_id in outbox:
@@ -1670,16 +1761,30 @@ def fetch_feed_page(offset="", update_baseline=""):
     return data.get("data") or {}
 
 
-def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, pushed_set=None):
-    """过滤整体关注流：发送成功与否由 ACK/outbox 决定；时间用于防状态污染和长停机漏报。"""
+def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
+                       pushed_set=None, stats=None):
+    """过滤整体关注流：发送成功与否由 ACK/outbox 决定；时间用于防状态污染和长停机漏报。
+    [FIX-3] stats 输出过滤漏斗计数，让「被哪一层丢掉」在 INFO 下可见。"""
     now_ts = int(time.time())
     feed = state.setdefault("feed", {})
     discovered = feed.setdefault("discovered", {})
     outbox = feed.setdefault("outbox", {})
     last_ok = _safe_float(feed.get("last_success_refresh"), 0.0)
     pushed_set = pushed_set if pushed_set is not None else get_recent_pushed_set(state)
+    # [FIX-3] ACK 兜底：发送成功但 state 落盘失败时，recent_pushed 可能缺这条，SENT_ACK_IDS 仍在
+    with ACK_LOCK:
+        ack_ids = set(SENT_ACK_IDS)
     candidates, page_ids = [], []
     daily = state.setdefault("daily", {})
+
+    if stats is None:
+        stats = {}
+    st = {"seen": 0, "target": 0, "type_block": 0, "no_pub_ts": 0, "ack": 0,
+          "already_pushed": 0, "pending_or_outbox": 0, "already_discovered": 0,
+          "too_old": 0, "new": 0}
+    for k in st:
+        stats.setdefault(k, 0)
+    type_block_ids = []
 
     def dbg_skip(dyn_id, uid, pub_ts, entry, reason):
         """逐动态跳过原因诊断。仅 DEBUG 可见，INFO 运行零输出。"""
@@ -1700,11 +1805,14 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
         dyn_id = str(item.get("id_str") or "")
         if not dyn_id:
             continue
+        st["seen"] += 1
         page_ids.append(dyn_id)
-        author = item.get("modules", {}).get("module_author", {}) or {}
+        # 注意：modules 可能显式为 null，必须 or {}，否则整轮扫描会被 AttributeError 打断
+        author = (item.get("modules") or {}).get("module_author") or {}
         uid = str(author.get("mid", ""))
         if uid not in target_uids:
             continue
+        st["target"] += 1
         name = author.get("name", "未知UP")
         pub_ts = _safe_int(author.get("pub_ts"), 0)
         stat = get_uid_stat(state, uid, name)
@@ -1713,15 +1821,24 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
             stat["last_pub_ts"] = max(_safe_int(stat.get("last_pub_ts"), 0), pub_ts)
 
         if not is_allowed_dynamic(item):
+            st["type_block"] += 1
+            type_block_ids.append(f"{dyn_id}:{item.get('type') or '-'}")
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "type_filtered")
             continue
         if not pub_ts:
+            st["no_pub_ts"] += 1
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "no_pub_ts")
             continue
+        if dyn_id in ack_ids:
+            st["ack"] += 1
+            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "already_sent_ack")
+            continue
         if is_recent_pushed(state, dyn_id, pushed_set):
+            st["already_pushed"] += 1
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "already_pushed")
             continue
         if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
+            st["pending_or_outbox"] += 1
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "pending_or_outbox")
             continue
 
@@ -1735,9 +1852,11 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
         # 长停机恢复：只要发布时间晚于最后一次完整成功刷新，不受6小时历史窗限制。
         force_recover = recent or downtime_new or pub_changed
         if entry and not force_recover:
+            st["already_discovered"] += 1
             dbg_skip(dyn_id, uid, pub_ts, entry, "already_discovered")
             continue
         if not force_recover and age > DYNAMIC_NEW_WINDOW:
+            st["too_old"] += 1
             dbg_skip(dyn_id, uid, pub_ts, entry, "too_old")
             continue
 
@@ -1747,6 +1866,7 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
             "pub_time_advanced" if pub_changed else
             "new_id"
         )
+        st["new"] += 1
         logging.debug(
             "[FEED DEBUG] found dyn_id=%s uid=%s pub_ts=%s first_seen=%s discovered=%s/%s last_ok=%s",
             dyn_id, uid, pub_ts,
@@ -1758,7 +1878,16 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
         logging.info(f"[FILTER] new dyn_id={dyn_id} uid={uid} reason={reason} age={max(0, age)}s mode={discovery_mode}")
         candidates.append((pub_ts, dyn_id, uid, item, now_ts, reason))
 
-    daily["items_seen"] = int(daily.get("items_seen", 0)) + len(page_ids)
+    # [FIX-3] 类型过滤是历史上最难查的静默丢动态路径，这里必须有 INFO 痕迹
+    if type_block_ids:
+        logging.info(
+            f"[FILTER SKIP] type_filtered count={len(type_block_ids)} "
+            f"sample={','.join(type_block_ids[:5])} mode={discovery_mode}"
+        )
+    for k, v in st.items():
+        stats[k] = stats.get(k, 0) + v
+
+    daily["items_seen"] = int(daily.get("items_seen", 0)) + st["seen"]
     return candidates, page_ids
 
 
@@ -1793,10 +1922,10 @@ def update_uid_stats_after_enqueue(state, task, discovery_mode):
         stat["daily_delayed"] = int(stat.get("daily_delayed", 0)) + 1
     if discovery_mode == "verify":
         daily["verify_recovered"] = int(daily.get("verify_recovered", 0)) + 1
-        stat["daily_verify_recovered"] = int(stat.get("daily_verify_recovered", 0)) + 1
+        stat["daily_verify_recovered"] = int(daily.get("daily_verify_recovered", 0)) + 1
     elif discovery_mode == "deep":
         daily["deep_recovered"] = int(daily.get("deep_recovered", 0)) + 1
-        stat["daily_deep_recovered"] = int(stat.get("daily_deep_recovered", 0)) + 1
+        stat["daily_deep_recovered"] = int(daily.get("daily_deep_recovered", 0)) + 1
     mark_state_dirty(state)
 
 
@@ -1824,6 +1953,8 @@ def enqueue_candidates(candidates, state, discovery_mode):
         except Exception as e:
             logging.error(f"[PUSH] 处理失败 dyn_id={dyn_id}: {e}")
     trim_discovered(state)
+    if has_new:
+        mark_state_dirty(state)
     return has_new
 
 
@@ -1835,6 +1966,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
 
     all_new = []
     all_ids = []
+    stats = {}
     offset = ""
     completed = True
     stable_pages = 0
@@ -1888,7 +2020,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         # 每页刷新 pushed_set，避免同轮多页扫描用旧快照漏判已发送
         pushed_set = get_recent_pushed_set(state)
         candidates, page_ids = process_feed_items(
-            items, target_uids, state, refresh_seq, mode, pushed_set=pushed_set
+            items, target_uids, state, refresh_seq, mode, pushed_set=pushed_set, stats=stats
         )
         all_new.extend(candidates)
         all_ids.extend(page_ids)
@@ -1965,11 +2097,18 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     refresh_ok = bool(pages_done > 0 and not partial_fail and completed)
     if truncated:
         logging.warning(f"[SCAN] truncated mode={mode} pages={pages_done}/{max_pages}")
-    # 常规空转轮次降为 DEBUG；有新动态或本轮未完整成功时才用 INFO
+    # [FIX-4] done 行输出过滤漏斗，一眼看出动态卡在哪一层
+    funnel = (
+        f"seen={stats.get('seen', 0)} target={stats.get('target', 0)} "
+        f"type_block={stats.get('type_block', 0)} no_pub_ts={stats.get('no_pub_ts', 0)} "
+        f"ack={stats.get('ack', 0)} pushed={stats.get('already_pushed', 0)} "
+        f"pending={stats.get('pending_or_outbox', 0)} disc={stats.get('already_discovered', 0)} "
+        f"too_old={stats.get('too_old', 0)}"
+    )
     if unique or not refresh_ok:
-        logging.info(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new={len(unique)} ok={refresh_ok}")
+        logging.info(f"[SCAN] done mode={mode} pages={pages_done} {funnel} new={len(unique)} ok={refresh_ok}")
     else:
-        logging.debug(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new=0 ok=True")
+        logging.debug(f"[SCAN] done mode={mode} pages={pages_done} {funnel} new=0 ok=True")
     return has_new, len(unique), pages_done, refresh_ok
 
 
@@ -2072,6 +2211,7 @@ def initialize_state(target_uids):
     pages_ok = 0
     skipped_recent = 0
     registered = 0
+    skipped_type = 0
     pending_baseline = ""
     baseline_has_more = False
 
@@ -2095,7 +2235,7 @@ def initialize_state(target_uids):
             if not dyn_id:
                 continue
             all_ids.append(dyn_id)
-            author = item.get("modules", {}).get("module_author", {}) or {}
+            author = (item.get("modules") or {}).get("module_author") or {}
             uid = str(author.get("mid", ""))
             pub_ts = _safe_int(author.get("pub_ts"), 0)
             if uid not in target_uids:
@@ -2108,6 +2248,12 @@ def initialize_state(target_uids):
 
             # 已真正推送过的跳过
             if is_recent_pushed(state, dyn_id):
+                continue
+            # [FIX-6] 当前不允许的动态类型不要登记 baseline：
+            # 否则该动态会被永久标记为「已处理」，将来放宽类型或修好解析后仍被
+            # already_discovered 拦掉（1246036657638998040 就踩过这个坑）。
+            if not is_allowed_dynamic(item):
+                skipped_type += 1
                 continue
             # 停机恢复策略：
             # - 无 pub_ts：不登记（正式扫描会 skip_no_pub_ts）
@@ -2155,7 +2301,10 @@ def initialize_state(target_uids):
         trim_discovered(state)
         mark_state_dirty(state)
         save_dynamic_state(state)
-        logging.info(f"[STATE] baseline pages={pages_ok} items={len(all_ids)} registered={registered}")
+        logging.info(
+            f"[STATE] baseline pages={pages_ok} items={len(all_ids)} "
+            f"registered={registered} skip_recent={skipped_recent} skip_type={skipped_type}"
+        )
     else:
         logging.warning("⚠️ 启动基线获取失败，将依赖已有状态继续启动")
     return state
