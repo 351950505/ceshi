@@ -767,8 +767,9 @@ def is_allowed_dynamic(item):
         top_type = item.get("type", "")
         modules = item.get("modules", {}) or {}
         major_type = (modules.get("module_dynamic", {}) or {}).get("major", {}).get("type", "")
+        # 转发：顶层为 FORWARD 直接放行（内容在 orig，不再校验 major_type）
         if top_type == "DYNAMIC_TYPE_FORWARD":
-            return ALLOW_FORWARD_DYNAMIC
+            return bool(ALLOW_FORWARD_DYNAMIC)
         if top_type and top_type not in ALLOWED_TOP_LEVEL_TYPES:
             return False
         if major_type and major_type not in ALLOWED_DYNAMIC_TYPES:
