@@ -277,7 +277,7 @@ def activate_session_cookies():
         REQ_SESSION.cookies.set("_uuid", _uuid, domain=".bilibili.com")
         REQ_SESSION.cookies.set("CURRENT_FNVAL", "4048", domain=".bilibili.com")
         REQ_SESSION.cookies.set("blackside_state", "1", domain=".bilibili.com")
-        logging.info("✅ B站首页会话 Cookie 激活完成")
+        logging.debug("B站首页会话 Cookie 激活完成")
         return True
     except Exception as e:
         logging.warning(f"⚠️ 首页会话激活失败: {e}")
@@ -299,7 +299,7 @@ def load_cookies_into_session():
                 continue
             k, v = item.split("=", 1)
             REQ_SESSION.cookies.set(k.strip(), v.strip(), domain=".bilibili.com")
-        logging.info("✅ 登录 Cookie 已加载")
+        logging.info("[AUTH] cookie loaded")
         return True
     except Exception as e:
         logging.error(f"❌ 加载 Cookie 异常: {e}")
@@ -332,7 +332,7 @@ def init_logging():
     root.setLevel(logging.INFO)
     root.propagate = False
     logging.info("=" * 70)
-    logging.info("B站关注动态监控启动（feed/all）")
+    logging.info("B站关注动态监控 v3.1（feed/all）")
     logging.info("=" * 70)
 
 
@@ -351,7 +351,7 @@ def force_update_wbi_keys():
         WBI_KEYS["img_key"] = img_url.rsplit("/", 1)[1].split(".")[0]
         WBI_KEYS["sub_key"] = sub_url.rsplit("/", 1)[1].split(".")[0]
         WBI_KEYS["last_update"] = time.time()
-        logging.info("✅ WBI 密钥刷新成功")
+        logging.info("[WBI] keys refreshed")
         return True
     except Exception as e:
         logging.warning(f"WBI 刷新失败: {e}")
@@ -470,7 +470,7 @@ def wbi_request(url, params):
 # =========================================================
 def default_state():
     return {
-        "version": 5,
+        "version": 6,
         "feed": {
             "baseline": "",
             "last_snapshot_ids": [],
@@ -536,6 +536,7 @@ def _sanitize_discovered(raw):
                 "uid": "",
                 "refresh_seq": 0,
                 "discovery_mode": "",
+                "status": "baseline",
             }
             continue
         cleaned[dyn_id] = {
@@ -544,7 +545,10 @@ def _sanitize_discovered(raw):
             "uid": str(v.get("uid", "") or ""),
             "refresh_seq": _safe_int(v.get("refresh_seq"), 0),
             "discovery_mode": str(v.get("discovery_mode", "") or ""),
+            "status": str(v.get("status", "baseline") or "baseline"),
         }
+        if cleaned[dyn_id]["status"] not in {"baseline", "queued", "retry", "sent"}:
+            cleaned[dyn_id]["status"] = "baseline"
     if len(cleaned) > SEEN_DYNAMIC_LIMIT:
         items = sorted(
             cleaned.items(),
@@ -624,6 +628,9 @@ def load_dynamic_state():
             f"outbox {before_outbox}→{after_outbox}"
         )
         state.setdefault("_meta", {})["dirty"] = True
+
+    # v6: discovered 明确记录状态；旧状态仅补 baseline，不改变历史推送语义。
+    state["version"] = 6
 
     for uid, info in list(state.get("uid_stats", {}).items()):
         if not isinstance(info, dict):
@@ -721,36 +728,29 @@ def save_following_cache(uids):
 def get_following_list(uid):
     result = []
     ps = 50
-    max_pages = 100
+    # 安全上限20：拿到超过20个目标即可拒绝覆盖，避免无意义翻100页。
+    max_pages = max(1, (MAX_MONITOR_UIDS // ps) + 1)
     for pn in range(1, max_pages + 1):
         data = safe_request("https://api.bilibili.com/x/relation/followings", {
-            "vmid": uid,
-            "pn": pn,
-            "ps": ps,
-            "order": "desc",
-            "order_type": "attention",
+            "vmid": uid, "pn": pn, "ps": ps,
+            "order": "desc", "order_type": "attention",
         })
         if data.get("code") != 0:
-            logging.warning(f"关注列表第 {pn} 页失败 code={data.get('code')}，放弃本次覆盖")
+            logging.warning(f"关注列表刷新失败 page={pn} code={data.get('code')}")
             return None
         items = (data.get("data") or {}).get("list") or []
         for item in items:
             if isinstance(item, dict) and item.get("mid") is not None:
                 result.append(str(item["mid"]))
+        result = list(dict.fromkeys(result))
+        if len(result) > MAX_MONITOR_UIDS:
+            notify_system_once("⚠️ 关注列表超限", f"检测到超过 {MAX_MONITOR_UIDS} 个关注目标，保留旧列表。")
+            return None
         if len(items) < ps:
             break
-        time.sleep(random.uniform(0.5, 1.0))
-    result = list(dict.fromkeys(result))
-    if not result:
-        return None
-    if len(result) > MAX_MONITOR_UIDS:
-        logging.error(f"❌ 关注列表实际为 {len(result)} 个，超过 MAX_MONITOR_UIDS={MAX_MONITOR_UIDS}，本次拒绝覆盖")
-        notify_system_once(
-            "⚠️ 关注列表异常",
-            f"检测到 {len(result)} 个关注目标，超过安全上限 {MAX_MONITOR_UIDS}，已保留旧列表。"
-        )
-        return None
-    return result
+        if pn < max_pages:
+            time.sleep(random.uniform(0.4, 0.8))
+    return result or None
 
 
 # =========================================================
@@ -1049,7 +1049,7 @@ def _maybe_trim_ack_file_locked():
         os.replace(tmp, SENT_ACK_FILE)
         kept = _parse_ack_lines(data.decode("utf-8", errors="ignore").splitlines())
         _reset_ack_ids_locked(kept)
-        logging.info(f"🧹 运行中裁剪 sent_ack，从 {size}B 压到 {len(data)}B ids={len(SENT_ACK_IDS)}")
+        logging.info(f"[ACK] trim ids={len(SENT_ACK_IDS)}")
     except Exception as e:
         logging.warning(f"运行中裁剪 sent_ack 失败: {e}")
 
@@ -1130,7 +1130,7 @@ def _read_sent_ack_tail(limit=RECENT_PUSHED_IDS_LIMIT, do_trim=False):
                         for line in tail_lines:
                             wf.write(line.rstrip() + "\n")
                     os.replace(tmp, path)
-                    logging.info(f"🧹 sent_ack 已裁剪，保留最近 {len(tail_lines)} 行")
+                    logging.info(f"[ACK] startup trim rows={len(tail_lines)}")
                 except Exception as e:
                     logging.warning(f"sent_ack 裁剪失败: {e}")
             return _parse_ack_lines(lines[-limit:])
@@ -1416,10 +1416,10 @@ def restore_outbox_to_queue(state):
             PENDING_PUSH_IDS.add(str(dyn_id))
         except queue.Full:
             PENDING_PUSH_IDS.discard(str(dyn_id))
-            logging.warning(f"⚠️ 启动恢复 outbox 时队列已满，剩余待后续 requeue")
+            logging.warning("[OUTBOX] queue full; remaining tasks will retry")
             break
     if dropped:
-        logging.info(f"🧹 启动时丢弃已发送 outbox {dropped} 条（防重复推送）")
+        logging.info(f"[OUTBOX] dropped_sent={dropped}")
         mark_state_dirty(state)
 
 
@@ -1439,14 +1439,16 @@ def mark_sent(state, task):
 
     # 补写 discovered，保证与 recent_pushed 一致
     discovered = feed.setdefault("discovered", {})
-    if dyn_id not in discovered:
-        discovered[dyn_id] = {
-            "first_seen": int(task.get("first_seen") or time.time()),
-            "pub_ts": pub_ts,
-            "uid": uid,
-            "refresh_seq": STATE.refresh_seq,
-            "discovery_mode": str(task.get("discovery_mode") or "sent"),
-        }
+    entry = discovered.setdefault(dyn_id, {
+        "first_seen": int(task.get("first_seen") or time.time()),
+        "pub_ts": pub_ts,
+        "uid": uid,
+        "refresh_seq": STATE.refresh_seq,
+        "discovery_mode": str(task.get("discovery_mode") or "sent"),
+    })
+    entry["status"] = "sent"
+    entry["pub_ts"] = pub_ts or _safe_int(entry.get("pub_ts"), 0)
+    entry["uid"] = uid or str(entry.get("uid") or "")
 
     stat = get_uid_stat(state, uid)
     remember_uid_id(stat, dyn_id)
@@ -1476,6 +1478,9 @@ def schedule_retry(state, task):
     delay += random.uniform(0, min(30, delay * 0.15))
     task["next_attempt"] = time.time() + delay
     state.setdefault("feed", {}).setdefault("outbox", {})[dyn_id] = task
+    entry = state.setdefault("feed", {}).setdefault("discovered", {}).get(dyn_id)
+    if isinstance(entry, dict):
+        entry["status"] = "retry"
     state.setdefault("feed", {}).setdefault("push_retry_after", {})[dyn_id] = task["next_attempt"]
     state.setdefault("daily", {})["webhook_fail"] = int(state.setdefault("daily", {}).get("webhook_fail", 0)) + 1
     PENDING_PUSH_IDS.discard(dyn_id)
@@ -1551,11 +1556,7 @@ def notify_worker():
                                 logging.critical(
                                     f"ack+state 失败后 outbox 落盘仍失败 dyn_id={dyn_id}: {repr(se2)}"
                                 )
-                logging.info(
-                    f"[发送成功] type={ntype} dyn_id={dyn_id or '-'} "
-                    f"ack_ok={ack_ok if ntype=='dynamic' else '-'} "
-                    f"state_ok={state_ok if ntype=='dynamic' else '-'}"
-                )
+                logging.info(f"[PUSH] sent dyn_id={dyn_id or '-'}")
             else:
                 # 发送失败：先 schedule_retry（只改内存），再单独 save，避免 save 异常触发外层二次 schedule_retry
                 retried = False
@@ -1565,15 +1566,15 @@ def notify_worker():
                             schedule_retry(ACTIVE_STATE, task)
                             retried = True
                     except Exception as se:
-                        logging.error(f"schedule_retry 失败: {repr(se)}")
+                        logging.error(f"[OUTBOX] retry_schedule_failed: {repr(se)}")
                         PENDING_PUSH_IDS.discard(dyn_id)
                     if retried:
                         try:
                             with STATE_LOCK:
                                 save_dynamic_state(ACTIVE_STATE)
                         except Exception as se:
-                            logging.error(f"发送失败后状态保存异常 dyn_id={dyn_id}: {repr(se)}")
-                logging.warning(f"[发送失败] dyn_id={dyn_id or '-'}")
+                            logging.error(f"[OUTBOX] save_after_fail dyn_id={dyn_id}: {repr(se)}")
+                logging.warning(f"[PUSH] failed dyn_id={dyn_id or '-'}")
         except Exception as e:
             logging.error(f"推送线程异常: {repr(e)}")
             # 只有「未确认发送成功」且尚未 schedule_retry 时才重试
@@ -1592,9 +1593,9 @@ def notify_worker():
                         with STATE_LOCK:
                             save_dynamic_state(ACTIVE_STATE)
                     except Exception as se:
-                        logging.error(f"异常路径状态保存失败: {repr(se)}")
+                        logging.error(f"[OUTBOX] exception_save_failed: {repr(se)}")
                 except Exception as se:
-                    logging.error(f"schedule_retry 失败: {repr(se)}")
+                    logging.error(f"[OUTBOX] retry_schedule_failed: {repr(se)}")
                     PENDING_PUSH_IDS.discard(dyn)
         finally:
             notify_queue.task_done()
@@ -1663,17 +1664,15 @@ def fetch_feed_page(offset="", update_baseline=""):
 
 
 def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, pushed_set=None):
-    """只比较动态 ID / 首次发现时间；增加最近时间强制保护 + FILTER DEBUG。
-    不再用全局 pub_ts 游标吃掉迟到动态。
-    """
+    """过滤整体关注流：发送成功与否由 ACK/outbox 决定；时间用于防状态污染和长停机漏报。"""
     now_ts = int(time.time())
-    candidates = []
-    page_ids = []
+    feed = state.setdefault("feed", {})
+    discovered = feed.setdefault("discovered", {})
+    outbox = feed.setdefault("outbox", {})
+    last_ok = _safe_float(feed.get("last_success_refresh"), 0.0)
+    pushed_set = pushed_set if pushed_set is not None else get_recent_pushed_set(state)
+    candidates, page_ids = [], []
     daily = state.setdefault("daily", {})
-    first_seen_map = state.setdefault("feed", {}).setdefault("discovered", {})
-    outbox = state.setdefault("feed", {}).setdefault("outbox", {})
-    if pushed_set is None:
-        pushed_set = get_recent_pushed_set(state)
 
     for item in items:
         if not isinstance(item, dict):
@@ -1682,105 +1681,46 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
         if not dyn_id:
             continue
         page_ids.append(dyn_id)
-
         author = item.get("modules", {}).get("module_author", {}) or {}
         uid = str(author.get("mid", ""))
-        name = author.get("name", "未知UP")
-        pub_ts = _safe_int(author.get("pub_ts"), 0)
         if uid not in target_uids:
             continue
-
+        name = author.get("name", "未知UP")
+        pub_ts = _safe_int(author.get("pub_ts"), 0)
         stat = get_uid_stat(state, uid, name)
         stat["last_global_seen"] = now_ts
-        if pub_ts > 0:
+        if pub_ts:
             stat["last_pub_ts"] = max(_safe_int(stat.get("last_pub_ts"), 0), pub_ts)
 
         if not is_allowed_dynamic(item):
-            logging.info(
-                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                f"reason=type_not_allowed mode={discovery_mode}"
-            )
             continue
-
-        # pub_ts 无效时不能当成 now，否则 age=0 会误入强制新窗口
-        if pub_ts <= 0:
-            if is_recent_pushed(state, dyn_id, pushed_set):
-                remember_uid_id(stat, dyn_id)
-                logging.info(
-                    f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
-                    f"reason=already_pushed mode={discovery_mode}"
-                )
-                continue
-            if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
-                remember_uid_id(stat, dyn_id)
-                logging.info(
-                    f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
-                    f"reason=in_outbox_or_pending mode={discovery_mode}"
-                )
-                continue
-            if first_seen_map.get(dyn_id):
-                logging.info(
-                    f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
-                    f"reason=already_discovered mode={discovery_mode}"
-                )
-                continue
-            # 无发布时间：不推送，避免无法做时间窗口判断的脏数据
-            logging.info(
-                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub=invalid "
-                f"reason=skip_no_pub_ts mode={discovery_mode}"
-            )
+        if not pub_ts:
+            continue
+        if is_recent_pushed(state, dyn_id, pushed_set) or dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
             continue
 
         age = now_ts - pub_ts
-        in_force_window = age <= RECENT_FORCE_NEW_WINDOW
+        recent = age <= RECENT_FORCE_NEW_WINDOW
+        downtime_new = last_ok > 0 and pub_ts > last_ok
+        entry = discovered.get(dyn_id)
+        entry_pub = _safe_int((entry or {}).get("pub_ts"), 0) if isinstance(entry, dict) else 0
+        pub_changed = bool(entry_pub and pub_ts > entry_pub)
 
-        # 1) 已真正发送成功的：永远跳过
-        if is_recent_pushed(state, dyn_id, pushed_set):
-            remember_uid_id(stat, dyn_id)
-            logging.info(
-                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                f"age={age}s reason=already_pushed mode={discovery_mode}"
-            )
+        # 长停机恢复：只要发布时间晚于最后一次完整成功刷新，不受6小时历史窗限制。
+        force_recover = recent or downtime_new or pub_changed
+        if entry and not force_recover:
+            continue
+        if not force_recover and age > DYNAMIC_NEW_WINDOW:
             continue
 
-        # 2) 已在 outbox / PENDING：交给重试
-        if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
-            remember_uid_id(stat, dyn_id)
-            logging.info(
-                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                f"age={age}s reason=in_outbox_or_pending mode={discovery_mode}"
-            )
-            continue
-
-        # 3) 已登记 discovered：正常跳过；强制窗口内允许污染恢复
-        entry = first_seen_map.get(dyn_id)
-        if entry:
-            if in_force_window:
-                logging.warning(
-                    f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                    f"age={age}s reason=force_new_despite_discovered mode={discovery_mode}"
-                )
-            else:
-                logging.info(
-                    f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                    f"age={age}s reason=already_discovered mode={discovery_mode}"
-                )
-                continue
-
-        # 4) 超出历史保护窗口
-        if age > DYNAMIC_NEW_WINDOW:
-            logging.info(
-                f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-                f"age={age}s reason=too_old mode={discovery_mode}"
-            )
-            continue
-
-        reason = "new_time_window" if in_force_window else "new_id"
-        logging.info(
-            f"[FILTER DEBUG] dyn_id={dyn_id} uid={uid} pub={ts_to_str(pub_ts)} "
-            f"age={age}s reason={reason} mode={discovery_mode}"
+        reason = (
+            "recent_force" if recent else
+            "downtime_recovery" if downtime_new else
+            "pub_time_advanced" if pub_changed else
+            "new_id"
         )
-        candidates.append((pub_ts, dyn_id, uid, item, now_ts))
+        logging.info(f"[FILTER] new dyn_id={dyn_id} uid={uid} reason={reason} age={max(0, age)}s mode={discovery_mode}")
+        candidates.append((pub_ts, dyn_id, uid, item, now_ts, reason))
 
     daily["items_seen"] = int(daily.get("items_seen", 0)) + len(page_ids)
     return candidates, page_ids
@@ -1827,48 +1767,26 @@ def update_uid_stats_after_enqueue(state, task, discovery_mode):
 def enqueue_candidates(candidates, state, discovery_mode):
     candidates.sort(key=lambda x: (x[0], x[1]))
     has_new = False
-    for pub_ts, dyn_id, uid, item, first_seen in candidates:
+    discovered = state.setdefault("feed", {}).setdefault("discovered", {})
+    for pub_ts, dyn_id, uid, item, first_seen, reason in candidates:
         try:
             push_data = format_dynamic_message(item)
             task_title = f"{push_data.get('user', '未知UP')} 发布了新动态"
-            ok = safe_enqueue_notify(
-                task_title,
-                [push_data],
-                "dynamic",
-                dyn_id=dyn_id,
-                uid=uid,
-                pub_ts=pub_ts,
-                first_seen=first_seen,
-                discovery_mode=discovery_mode,
-            )
-            if ok:
-                state.setdefault("feed", {}).setdefault("discovered", {})[dyn_id] = {
-                    "first_seen": first_seen,
-                    "pub_ts": pub_ts,
-                    "uid": uid,
-                    "refresh_seq": STATE.refresh_seq,
-                    "discovery_mode": discovery_mode,
-                }
-                update_uid_stats_after_enqueue(state, {
-                    "uid": uid,
-                    "dyn_id": dyn_id,
-                    "pub_ts": pub_ts,
-                    "first_seen": first_seen,
-                }, discovery_mode)
-                logging.info(
-                    f"🚨 [{discovery_mode}] 发现动态 seq={STATE.refresh_seq} uid={uid} "
-                    f"dyn_id={dyn_id} pub={ts_to_str(pub_ts)} delay={max(0, first_seen-pub_ts)}s "
-                    f"images={push_data.get('image_count', 0)}"
-                )
-                if discovery_mode != "primary":
-                    logging.warning(
-                        f"🚨 漏报诊断：{discovery_mode} 才发现 uid={uid} dyn_id={dyn_id}"
-                    )
-                has_new = True
-            else:
-                logging.warning(f"[入队失败] dyn_id={dyn_id}")
+            if not safe_enqueue_notify(task_title, [push_data], "dynamic", dyn_id, uid, pub_ts, first_seen, discovery_mode):
+                logging.warning(f"[PUSH] enqueue_failed dyn_id={dyn_id}")
+                continue
+            discovered[dyn_id] = {
+                "first_seen": first_seen, "pub_ts": pub_ts, "uid": uid,
+                "refresh_seq": STATE.refresh_seq, "discovery_mode": discovery_mode,
+                "status": "queued",
+            }
+            update_uid_stats_after_enqueue(state, {"uid": uid, "dyn_id": dyn_id, "pub_ts": pub_ts, "first_seen": first_seen}, discovery_mode)
+            delay = max(0, first_seen - pub_ts)
+            tag = "追回" if discovery_mode != "primary" else "发现"
+            logging.info(f"[PUSH] {tag} uid={uid} dyn_id={dyn_id} delay={delay}s reason={reason}")
+            has_new = True
         except Exception as e:
-            logging.error(f"动态处理异常 dyn_id={dyn_id}: {repr(e)}")
+            logging.error(f"[PUSH] 处理失败 dyn_id={dyn_id}: {e}")
     trim_discovered(state)
     return has_new
 
@@ -1898,7 +1816,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     stopped_at_snapshot = False
     hit_page_limit = False
 
-    logging.info(f"🔄 [{mode}] 关注流整体刷新开始 seq={refresh_seq}")
+    logging.info(f"[SCAN] start mode={mode} seq={refresh_seq}")
 
     for page_idx in range(max_pages):
         if not IS_RUNNING:
@@ -1923,11 +1841,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         items = data.get("items") or []
         first_id = str(items[0].get("id_str") if items else "-")
         last_id = str(items[-1].get("id_str") if items else "-")
-        update_num = data.get("update_num")
-        logging.info(
-            f"[FEED DEBUG] page={page_idx + 1} count={len(items)} "
-            f"first={first_id} last={last_id} update_num={update_num}"
-        )
+        logging.info(f"[FEED] page={page_idx + 1} count={len(items)} first={first_id} last={last_id}")
         if not items:
             has_more = False
             next_offset = ""
@@ -1940,8 +1854,6 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         candidates, page_ids = process_feed_items(
             items, target_uids, state, refresh_seq, mode, pushed_set=pushed_set
         )
-        for c in candidates:
-            logging.info(f"[FEED DEBUG] found dyn_id={c[1]} uid={c[2]} mode={mode}")
         all_new.extend(candidates)
         all_ids.extend(page_ids)
 
@@ -2010,27 +1922,14 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
             })
             history[:] = history[-20:]
         else:
-            logging.warning(
-                f"[{mode}] 未完整成功，跳过更新 snapshot/baseline/last_success_refresh "
-                f"pages={pages_done}/{max_pages} partial_fail={partial_fail} "
-                f"completed={completed} hit_page_limit={hit_page_limit} "
-                f"reached_old={reached_old} truncated={truncated}"
-            )
+            logging.warning(f"[SCAN] boundary_kept mode={mode} pages={pages_done}/{max_pages} partial={partial_fail} truncated={truncated}")
         mark_state_dirty(state)
 
     # API 本轮可用：不因「页数上限」触发退避（否则 primary=5 且 has_more 会永远失败）
     refresh_ok = bool(pages_done > 0 and not partial_fail and completed)
     if truncated:
-        logging.warning(
-            f"[{mode}] 达到 max_pages={max_pages} 仍 has_more，分页未完成；"
-            f"已入队候选仍发送，但不更新完整成功边界"
-        )
-    logging.info(
-        f"🔄 [{mode}] 刷新结束 seq={refresh_seq} pages={pages_done} "
-        f"items={len(all_ids)} new={len(unique)} reached_old={reached_old} "
-        f"ok={refresh_ok} partial_fail={partial_fail} hit_page_limit={hit_page_limit} "
-        f"truncated={truncated}"
-    )
+        logging.warning(f"[SCAN] truncated mode={mode} pages={pages_done}/{max_pages}")
+    logging.info(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new={len(unique)} ok={refresh_ok}")
     return has_new, len(unique), pages_done, refresh_ok
 
 
@@ -2124,7 +2023,7 @@ def initialize_state(target_uids):
     # - 更新 snapshot / baseline
     # - 仅把「超出强制新窗口」的动态写入 discovered（避免静默吃掉停机窗口内的新动态）
     # - 强制窗口内的动态不写 discovered，交给正常扫描推送
-    logging.info("🧭 正在建立 feed/all 启动基线（保护近窗新动态）...")
+    logging.info("[STATE] building startup baseline")
     all_ids = []
     offset = ""
     baseline_pages = 3
@@ -2192,6 +2091,7 @@ def initialize_state(target_uids):
                     "uid": uid,
                     "refresh_seq": 0,
                     "discovery_mode": "baseline",
+                    "status": "baseline",
                 }
                 registered += 1
 
@@ -2215,11 +2115,7 @@ def initialize_state(target_uids):
         trim_discovered(state)
         mark_state_dirty(state)
         save_dynamic_state(state)
-        logging.info(
-            f"✅ 启动基线完成 pages={pages_ok} items={len(all_ids)} "
-            f"registered={registered} recent_kept={skipped_recent} "
-            f"has_more={baseline_has_more}"
-        )
+        logging.info(f"[STATE] baseline pages={pages_ok} items={len(all_ids)} registered={registered}")
     else:
         logging.warning("⚠️ 启动基线获取失败，将依赖已有状态继续启动")
     return state
@@ -2248,11 +2144,8 @@ def refresh_following_if_due(state, following_list, last_refresh_time):
     save_following_cache(following_list)
     for uid in new_set:
         get_uid_stat(state, uid)
-    logging.info(
-        f"🔄 关注列表每小时刷新完成 {len(old_set)} → {len(new_set)} UID"
-        if old_set != new_set else
-        f"🔄 关注列表每小时检查完成，UID={len(new_set)} 无变化"
-    )
+    if old_set != new_set:
+        logging.info(f"[FOLLOWING] changed {len(old_set)}→{len(new_set)}")
     mark_state_dirty(state)
     return following_list, now
 
@@ -2277,7 +2170,7 @@ def initial_following_list():
         live.append(str(SOURCE_UID))
         live = list(dict.fromkeys(live))
     save_following_cache(live)
-    logging.info(f"关注列表加载完成：{len(live)} UID，来源={source}")
+    logging.info(f"[FOLLOWING] loaded uid={len(live)} source={source}")
     return live
 
 
@@ -2328,12 +2221,7 @@ def start_monitoring():
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 feed = state.setdefault("feed", {})
                 outbox = feed.setdefault("outbox", {})
-                logging.info(
-                    f"💓 心跳 | UID={len(target_uids)} | 下轮间隔={next_interval:.1f}s "
-                    f"| 最近成功刷新={ts_to_str(feed.get('last_success_refresh', 0))} "
-                    f"| Outbox={len(outbox)} | 连续失败={STATE.consecutive_failures} "
-                    f"| CookieFail={STATE.consecutive_cookie_failures}"
-                )
+                logging.info(f"[HEARTBEAT] uid={len(target_uids)} outbox={len(outbox)} failures={STATE.consecutive_failures}")
                 last_heartbeat = now
 
             # 每小时刷新关注列表
@@ -2407,20 +2295,13 @@ def start_monitoring():
                         STATE.consecutive_failures = 0
                     else:
                         STATE.consecutive_failures += 1
-                        logging.warning(
-                            f"⚠️ primary 刷新未完整成功 pages={pages_done} ok={refresh_ok}，"
-                            f"连续失败={STATE.consecutive_failures}"
-                        )
+                        logging.warning(f"[SCAN] primary_incomplete pages={pages_done} failures={STATE.consecutive_failures}")
                     next_interval = random_main_interval()
                 except Exception as e:
                     STATE.consecutive_failures += 1
                     last_scan = time.time()
                     next_interval = random_main_interval()
-                    logging.error(
-                        f"❌ 关注流扫描异常: {repr(e)}，连续失败={STATE.consecutive_failures}，"
-                        f"下轮间隔={next_interval:.1f}s",
-                        exc_info=True,
-                    )
+                    logging.error(f"[SCAN] exception={repr(e)} failures={STATE.consecutive_failures}")
 
             if now - STATE.last_state_save >= STATE_SAVE_INTERVAL or state.get("_meta", {}).get("dirty"):
                 save_dynamic_state(state)
@@ -2430,13 +2311,13 @@ def start_monitoring():
 
         except Exception as e:
             if IS_RUNNING:
-                logging.error(f"❌ 主循环异常: {repr(e)}", exc_info=True)
+                logging.error(f"[LOOP] exception={repr(e)}")
                 time.sleep(8)
             else:
                 break
 
     save_dynamic_state(state)
-    logging.info("💾 状态已安全保存，程序退出。")
+    logging.info("[EXIT] state saved")
 
 
 if __name__ == "__main__":
