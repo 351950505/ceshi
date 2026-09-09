@@ -49,6 +49,9 @@ DEAD_LETTER_FILE = "outbox_dead.jsonl"  # outbox 淘汰/超限死信
 SENT_ACK_MAX_BYTES = 256 * 1024       # 运行中超限裁剪，适配 128MB 磁盘
 DEAD_LETTER_MAX_BYTES = 256 * 1024
 
+# 日志级别：INFO=只记录关键事件（默认）；排查漏报/验收时临时改为 logging.DEBUG
+LOG_LEVEL = logging.INFO
+
 # 运行窗口（Asia/Shanghai）
 RUN_TZ = "Asia/Shanghai"
 RUN_WEEKDAYS = {0, 1, 2, 3, 4}
@@ -329,7 +332,10 @@ def init_logging():
         stream.setFormatter(formatter)
         stream.addFilter(filt)
         root.addHandler(stream)
-    root.setLevel(logging.INFO)
+    # 第三方库日志静音，避免 LOG_LEVEL=DEBUG 时被 urllib3 连接日志刷屏
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    root.setLevel(LOG_LEVEL)
     root.propagate = False
     logging.info("=" * 70)
     logging.info("B站关注动态监控 v3.1（feed/all）")
@@ -1674,6 +1680,19 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
     candidates, page_ids = [], []
     daily = state.setdefault("daily", {})
 
+    def dbg_skip(dyn_id, uid, pub_ts, entry, reason):
+        """逐动态跳过原因诊断。仅 DEBUG 可见，INFO 运行零输出。"""
+        info = entry if isinstance(entry, dict) else {}
+        age = (now_ts - pub_ts) if pub_ts > 0 else -1
+        logging.debug(
+            "[FILTER SKIP] dyn_id=%s uid=%s pub_ts=%s age=%ss first_seen=%s "
+            "discovered=%s/%s reason=%s mode=%s last_ok=%s",
+            dyn_id, uid or "-", pub_ts or "-", age,
+            _safe_int(info.get("first_seen"), 0),
+            "yes" if entry else "no", str(info.get("status", "-")),
+            reason, discovery_mode, int(last_ok),
+        )
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -1693,10 +1712,16 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
             stat["last_pub_ts"] = max(_safe_int(stat.get("last_pub_ts"), 0), pub_ts)
 
         if not is_allowed_dynamic(item):
+            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "type_filtered")
             continue
         if not pub_ts:
+            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "no_pub_ts")
             continue
-        if is_recent_pushed(state, dyn_id, pushed_set) or dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
+        if is_recent_pushed(state, dyn_id, pushed_set):
+            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "already_pushed")
+            continue
+        if dyn_id in PENDING_PUSH_IDS or dyn_id in outbox:
+            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "pending_or_outbox")
             continue
 
         age = now_ts - pub_ts
@@ -1709,8 +1734,10 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
         # 长停机恢复：只要发布时间晚于最后一次完整成功刷新，不受6小时历史窗限制。
         force_recover = recent or downtime_new or pub_changed
         if entry and not force_recover:
+            dbg_skip(dyn_id, uid, pub_ts, entry, "already_discovered")
             continue
         if not force_recover and age > DYNAMIC_NEW_WINDOW:
+            dbg_skip(dyn_id, uid, pub_ts, entry, "too_old")
             continue
 
         reason = (
@@ -1718,6 +1745,14 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode, p
             "downtime_recovery" if downtime_new else
             "pub_time_advanced" if pub_changed else
             "new_id"
+        )
+        logging.debug(
+            "[FEED DEBUG] found dyn_id=%s uid=%s pub_ts=%s first_seen=%s discovered=%s/%s last_ok=%s",
+            dyn_id, uid, pub_ts,
+            _safe_int((entry or {}).get("first_seen"), 0) if isinstance(entry, dict) else 0,
+            "yes" if entry else "no",
+            str((entry or {}).get("status", "-")) if isinstance(entry, dict) else "-",
+            int(last_ok),
         )
         logging.info(f"[FILTER] new dyn_id={dyn_id} uid={uid} reason={reason} age={max(0, age)}s mode={discovery_mode}")
         candidates.append((pub_ts, dyn_id, uid, item, now_ts, reason))
@@ -1816,7 +1851,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     stopped_at_snapshot = False
     hit_page_limit = False
 
-    logging.info(f"[SCAN] start mode={mode} seq={refresh_seq}")
+    logging.debug(f"[SCAN] start mode={mode} seq={refresh_seq}")
 
     for page_idx in range(max_pages):
         if not IS_RUNNING:
@@ -1841,7 +1876,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         items = data.get("items") or []
         first_id = str(items[0].get("id_str") if items else "-")
         last_id = str(items[-1].get("id_str") if items else "-")
-        logging.info(f"[FEED] page={page_idx + 1} count={len(items)} first={first_id} last={last_id}")
+        logging.debug(f"[FEED DEBUG] page={page_idx + 1} count={len(items)} first={first_id} last={last_id}")
         if not items:
             has_more = False
             next_offset = ""
@@ -1929,7 +1964,11 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     refresh_ok = bool(pages_done > 0 and not partial_fail and completed)
     if truncated:
         logging.warning(f"[SCAN] truncated mode={mode} pages={pages_done}/{max_pages}")
-    logging.info(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new={len(unique)} ok={refresh_ok}")
+    # 常规空转轮次降为 DEBUG；有新动态或本轮未完整成功时才用 INFO
+    if unique or not refresh_ok:
+        logging.info(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new={len(unique)} ok={refresh_ok}")
+    else:
+        logging.debug(f"[SCAN] done mode={mode} pages={pages_done} items={len(all_ids)} new=0 ok=True")
     return has_new, len(unique), pages_done, refresh_ok
 
 
@@ -2206,7 +2245,7 @@ def start_monitoring():
 
     logging.info(
         f"✅ 启动完成：工作日 {RUN_START_HOUR}:{RUN_START_MINUTE:02d}-{RUN_END_HOUR}:00；"
-        f"整体关注流刷新(feed/all) {NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s；"
+        f"整体关注流刷新 {NORMAL_INTERVAL_MIN:g}~{NORMAL_INTERVAL_MAX:g}s；"
         f"二次确认 {VERIFY_DELAY_MIN:g}~{VERIFY_DELAY_MAX:g}s；"
         f"深扫每{DEEP_SCAN_INTERVAL}s；关注列表/心跳均1小时"
     )
@@ -2221,7 +2260,14 @@ def start_monitoring():
             if now - last_heartbeat >= HEARTBEAT_INTERVAL:
                 feed = state.setdefault("feed", {})
                 outbox = feed.setdefault("outbox", {})
-                logging.info(f"[HEARTBEAT] uid={len(target_uids)} outbox={len(outbox)} failures={STATE.consecutive_failures}")
+                daily = state.setdefault("daily", {})
+                last_ok = _safe_int(feed.get("last_success_refresh"), 0)
+                ok_age = f"{int(now - last_ok)}s前" if last_ok else "从未"
+                logging.info(
+                    f"[HEARTBEAT] uid={len(target_uids)} outbox={len(outbox)} "
+                    f"failures={STATE.consecutive_failures} refreshes={daily.get('refreshes', 0)} "
+                    f"deep={daily.get('deep_scans', 0)} new={daily.get('new_found', 0)} last_ok={ok_age}"
+                )
                 last_heartbeat = now
 
             # 每小时刷新关注列表
@@ -2281,7 +2327,7 @@ def start_monitoring():
                             state.setdefault("daily", {}).get("deep_scans", 0)
                         ) + 1
                         STATE.last_deep_scan = now
-                        logging.info("🔎 开始5分钟整体关注流深扫")
+                        logging.debug("🔎 开始5分钟整体关注流深扫")
                         full_refresh(
                             target_uids, state, mode="deep",
                             max_pages=DEEP_SCAN_MAX_PAGES,
