@@ -10,7 +10,7 @@
 #           is_allowed=False）。现改为：先判 FORWARD、所有中间层 or {}、异常放行。
 #   [FIX-2] format_dynamic_message 增加兜底 payload，解析异常不再导致「既不入队
 #           也不写 discovered」的永久漏推。
-#   [FIX-3] process_feed_items：
+#   [FIX-3] process_feed_items： 
 #           - 类型过滤(not_following/type_filtered)增加 INFO 汇总，不再静默；
 #           - 增加 SENT_ACK_IDS 兜底，堵住「ACK 已落盘但 state 保存失败」的重复推送；
 #           - item["modules"] 为 null 时不再抛 AttributeError 打断整轮扫描。
