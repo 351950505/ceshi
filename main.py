@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# B站关注动态监控  v3.2（feed/all｜转发动态修复版）
+# B站关注动态监控  v3.2.1（feed/all｜动态格式最终兜底版）
 # -----------------------------------------------------------------------------
-# 本版相对 202609100010.py 的改动（全部围绕「动态被静默丢弃」）：
+# 本版相对 v3.2 的改动（全部围绕「动态被静默丢弃」）：
 #   [FIX-1] is_allowed_dynamic：转发动态 / 纯文字动态的 module_dynamic.major 为显式
 #           null 时，原代码 dict.get("major", {}) 返回 None → None.get("type") 抛
 #           AttributeError → except 返回 False → 动态在类型过滤层被静默丢弃。
@@ -18,6 +18,8 @@
 #   [FIX-5] atomic_write_json 增加 fsync + 临时文件清理（掉电时 Outbox/ACK 不丢）。
 #   [FIX-6] initialize_state：启动基线不再把「当前不支持的动态类型」登记成
 #           discovered/baseline，避免修好类型过滤后仍被 already_discovered 拦掉。
+#   [FIX-7] 动态格式最终兜底：未知 top-level / major 类型不再直接过滤；pub_ts 缺失时使用发现时间继续处理，
+#           解析失败仍走最小 payload，保证至少推送动态直达链接。
 #   未改动（按你的要求）：运行窗口 RUN_WEEKDAYS / 24小时运行问题保持原样。
 # =============================================================================
 import sys
@@ -800,17 +802,10 @@ def get_following_list(uid):
 # 动态解析
 # =========================================================
 def is_allowed_dynamic(item):
-    """[FIX-1]
-    关键：feed/all 里 module_dynamic.major 对「转发动态 / 纯文字动态」是**显式 null**。
-    dict.get("major", {}) 的默认值只在 key 缺失时生效；major=None 时返回 None，
-    继续 .get("type") 抛 AttributeError → 原实现 except 返回 False → 动态被静默丢弃。
-    实测 dyn_id=1246036657638998040：type=DYNAMIC_TYPE_FORWARD, major=None,
-    is_allowed=False，导致该动态永久漏报且 INFO 日志零输出。
+    """动态类型采用“保守放行”策略：已知明确支持类型直接通过，未知格式不静默丢弃。
 
-    修复要点：
-      ① FORWARD 判断必须放在解析 major 之前（否则 return ALLOW_FORWARD_DYNAMIC 是死代码）
-      ② 所有中间层一律 or {} 兜底，不用 .get(key, {})
-      ③ 解析异常时放行而非丢弃（宁可多推，不能静默漏推）
+    原因：feed/all 的动态结构会变化，曾出现 major=None 导致类型判断异常而静默漏报。
+    当前原则是“解析不了也要推链接”，避免新类型再次形成静默漏报。
     """
     try:
         top_type = str(item.get("type") or "")
@@ -819,17 +814,28 @@ def is_allowed_dynamic(item):
         major = dyn.get("major") or {}
         major_type = str(major.get("type") or "")
 
-        # 转发动态优先放行：转发者自身没有 major，正文内容在 orig 里
         if top_type == "DYNAMIC_TYPE_FORWARD":
             return ALLOW_FORWARD_DYNAMIC
+
+        # 已知类型照常放行。未知 top-level / major 类型也放行，交给正文解析兜底。
         if top_type and top_type not in ALLOWED_TOP_LEVEL_TYPES:
-            return False
+            logging.debug(
+                "[FORMAT] unknown top_type=%s dyn_id=%s -> allow",
+                top_type, item.get("id_str", "-")
+            )
+            return True
+
         if major_type and major_type not in ALLOWED_DYNAMIC_TYPES:
-            return False
+            logging.debug(
+                "[FORMAT] unknown major_type=%s dyn_id=%s -> allow",
+                major_type, item.get("id_str", "-")
+            )
+            return True
+
         return True
     except Exception as e:
         logging.debug(
-            "[FILTER DEBUG] is_allowed 异常按放行 dyn_id=%s type=%s err=%s",
+            "[FORMAT] type-check exception dyn_id=%s type=%s -> allow: %s",
             item.get("id_str") if isinstance(item, dict) else "-",
             item.get("type") if isinstance(item, dict) else "-", repr(e),
         )
@@ -1010,6 +1016,8 @@ def format_dynamic_message(item):
         name = author.get("name", "未知UP")
         uid = str(author.get("mid", ""))
         pub_ts = _safe_int(author.get("pub_ts"), 0)
+        if pub_ts <= 0:
+            pub_ts = int(time.time())
 
         text = cut_text(extract_dynamic_text(item), 900)
 
@@ -1825,10 +1833,16 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
             type_block_ids.append(f"{dyn_id}:{item.get('type') or '-'}")
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "type_filtered")
             continue
+        # [FIX-7] 没有 pub_ts 也不能静默丢弃：使用本次发现时间作为临时事件时间。
+        # 这样动态仍会进入 outbox，并在消息里至少带上动态直达链接。
+        time_fallback = False
         if not pub_ts:
             st["no_pub_ts"] += 1
-            dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "no_pub_ts")
-            continue
+            time_fallback = True
+            pub_ts = now_ts
+            logging.warning(
+                f"[TIME_FALLBACK] dyn_id={dyn_id} uid={uid} pub_ts缺失，使用发现时间继续处理"
+            )
         if dyn_id in ack_ids:
             st["ack"] += 1
             dbg_skip(dyn_id, uid, pub_ts, discovered.get(dyn_id), "already_sent_ack")
@@ -1861,6 +1875,7 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
             continue
 
         reason = (
+            "time_fallback" if time_fallback else
             "recent_force" if recent else
             "downtime_recovery" if downtime_new else
             "pub_time_advanced" if pub_changed else
@@ -2103,7 +2118,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         f"type_block={stats.get('type_block', 0)} no_pub_ts={stats.get('no_pub_ts', 0)} "
         f"ack={stats.get('ack', 0)} pushed={stats.get('already_pushed', 0)} "
         f"pending={stats.get('pending_or_outbox', 0)} disc={stats.get('already_discovered', 0)} "
-        f"too_old={stats.get('too_old', 0)}"
+        f"too_old={stats.get('too_old', 0)} time_fallback={stats.get('no_pub_ts', 0)}"
     )
     if unique or not refresh_ok:
         logging.info(f"[SCAN] done mode={mode} pages={pages_done} {funnel} new={len(unique)} ok={refresh_ok}")
