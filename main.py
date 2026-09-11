@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# B站关注动态监控  v3.3.0（feed/all｜低漏报可靠优化版）
+# B站关注动态监控  v3.2.2（feed/all｜动态格式最终兜底版｜推送仅一张主图）
 # -----------------------------------------------------------------------------
-# 本版相对 v3.2.1 的改动（保持架构不变，重点降低漏报/误图/重复）：
+# 本版相对 v3.2.1 的改动：
+#   [FIX-8] 推送只显示一张主图：extract_images / 载荷 covers、images 均限 1 张，
+#           避免图文/转发把整组图塞进 Webhook（消息过大、内存、通道刷屏）。
+# -----------------------------------------------------------------------------
+# 本版相对 v3.2 的改动（全部围绕「动态被静默丢弃」）：
 #   [FIX-1] is_allowed_dynamic：转发动态 / 纯文字动态的 module_dynamic.major 为显式
 #           null 时，原代码 dict.get("major", {}) 返回 None → None.get("type") 抛
 #           AttributeError → except 返回 False → 动态在类型过滤层被静默丢弃。
@@ -32,6 +36,7 @@ import hashlib
 import urllib.parse
 import json
 import requests
+from requests.adapters import HTTPAdapter
 import datetime
 import threading
 import queue
@@ -107,18 +112,19 @@ RECENT_SNAPSHOT_LIMIT = 400
 SEEN_DYNAMIC_LIMIT = 12000
 RECENT_PUSHED_IDS_LIMIT = 12000
 OUTBOX_MAX = 500
-OUTBOX_EXPIRE_SECONDS = 14 * 24 * 3600
-OUTBOX_MAX_ATTEMPTS = 80
 
 NOTIFY_QUEUE_MAXSIZE = 100
 NOTIFY_SEND_DELAY = 2.0
 NOTIFY_RETRY_BASE = 60
 NOTIFY_RETRY_MAX = 1800
 
+# Webhook 只带一张主图（封面/首图），避免图文动态把整组图全部发出。
+MAX_PUSH_IMAGES = 1
+
 REQUEST_TIMEOUT = 12
 REQUEST_RETRIES = 3
 WBI_REFRESH_INTERVAL = 21600
-WBI_
+
 HEALTH_REPORT_HOUR = 15
 HEALTH_REPORT_MINUTE = 30
 
@@ -147,24 +153,21 @@ SENT_ACK_IDS = set()  # 运行期 ACK 内存镜像，有上限
 SENT_ACK_ORDER = []   # 与 SENT_ACK_IDS 配套，用于淘汰最旧
 
 
-_last_notify_time = {}
-WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
-
-# 项目基准：不使用 requests.Session()。
-# 每次请求都使用 requests.get，并显式传 Cookie/Header，避免长连接/连接池在
-# Alpine 长时间运行后出现连接复用异常，同时保留与当前 Cookie 行为一致的能力。
-REQUEST_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-        "Chrome/120.0.0.0 Mobile Safari/537.36"
-    ),
+REQ_SESSION = requests.Session()
+_adapter = HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0)
+REQ_SESSION.mount("http://", _adapter)
+REQ_SESSION.mount("https://", _adapter)
+REQ_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+                  "Chrome/120.0.0.0 Mobile Safari/537.36",
     "Referer": "https://www.bilibili.com/",
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Connection": "close",
-}
-COOKIE_JAR = {}
+    "Connection": "keep-alive",
+})
 
+_last_notify_time = {}
+WBI_KEYS = {"img_key": "", "sub_key": "", "last_update": 0}
 mixinKeyEncTab = [
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
@@ -313,83 +316,83 @@ def random_main_interval():
 # Cookie / Logging / WBI
 # =========================================================
 def activate_session_cookies():
-    """生成少量非认证 Cookie，作为普通 requests.get 的显式 Cookie。"""
     try:
+        resp = REQ_SESSION.get("https://www.bilibili.com/", timeout=10)
+        resp.close()
         uuid_sec = str(uuid.uuid4())
         time_sec = str(int(time.time() * 1000 % 1e5)).ljust(5, "0")
-        COOKIE_JAR["_uuid"] = f"{uuid_sec}{time_sec}infoc"
-        COOKIE_JAR["CURRENT_FNVAL"] = "4048"
-        COOKIE_JAR["blackside_state"] = "1"
-        logging.debug("B站请求 Cookie 环境初始化完成")
+        _uuid = f"{uuid_sec}{time_sec}infoc"
+        REQ_SESSION.cookies.set("_uuid", _uuid, domain=".bilibili.com")
+        REQ_SESSION.cookies.set("CURRENT_FNVAL", "4048", domain=".bilibili.com")
+        REQ_SESSION.cookies.set("blackside_state", "1", domain=".bilibili.com")
+        logging.debug("B站首页会话 Cookie 激活完成")
         return True
     except Exception as e:
-        logging.debug(f"请求 Cookie 环境初始化失败: {e}")
+        logging.warning(f"⚠️ 首页会话激活失败: {e}")
         return False
 
+
 def load_cookies_into_session():
-    """兼容旧函数名；实际把 bili_cookie.txt 解析到 COOKIE_JAR。"""
     try:
-        # 保留 activate_session_cookies() 生成的匿名 Cookie，再覆盖认证 Cookie。
         if not os.path.exists("bili_cookie.txt"):
             logging.error("❌ 未找到 bili_cookie.txt")
             return False
         with open("bili_cookie.txt", "r", encoding="utf-8") as f:
             cookie_str = f.read().strip()
         if not cookie_str:
-            logging.error("❌ bili_cookie.txt 为空")
             return False
-        count = 0
         for item in cookie_str.split(";"):
             item = item.strip()
             if not item or "=" not in item:
                 continue
             k, v = item.split("=", 1)
-            k, v = k.strip(), v.strip()
-            if not k:
-                continue
-            COOKIE_JAR[k] = v
-            count += 1
-        logging.info(f"[AUTH] cookie loaded ({count})")
-        return count > 0
+            REQ_SESSION.cookies.set(k.strip(), v.strip(), domain=".bilibili.com")
+        logging.info("[AUTH] cookie loaded")
+        return True
     except Exception as e:
         logging.error(f"❌ 加载 Cookie 异常: {e}")
         return False
+
+
+class DingTalkFilter(logging.Filter):
+    """注意：不要改成裸 "310000"——动态 ID 是 19 位数字，含 310000 的行会被整行丢掉。"""
+    def filter(self, record):
+        return "310000" not in record.getMessage()
+
 
 def init_logging():
     root = logging.getLogger()
     if root.hasHandlers():
         root.handlers.clear()
     formatter = logging.Formatter("[BILI] %(asctime)s [%(levelname)s] %(message)s")
+    filt = DingTalkFilter()
     handler = logging.handlers.RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=2,
         encoding="utf-8", delay=True
     )
     handler.setFormatter(formatter)
+    handler.addFilter(filt)
     root.addHandler(handler)
     if sys.stdout.isatty():
         stream = logging.StreamHandler(sys.stdout)
         stream.setFormatter(formatter)
+        stream.addFilter(filt)
         root.addHandler(stream)
+    # 第三方库日志静音，避免 LOG_LEVEL=DEBUG 时被 urllib3 连接日志刷屏
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
     root.setLevel(LOG_LEVEL)
     root.propagate = False
     logging.info("=" * 70)
-    logging.info("B站关注动态监控 v3.3.0（feed/all｜低漏报可靠优化版）")
+    logging.info("B站关注动态监控 v3.2.2（feed/all｜推送仅一张主图）")
     logging.info("=" * 70)
+
 
 def force_update_wbi_keys():
     try:
-        r = requests.get(
-            "https://api.bilibili.com/x/web-interface/nav",
-            headers=REQUEST_HEADERS,
-            cookies=COOKIE_JAR,
-            timeout=8,
-        )
-        try:
-            data = r.json()
-        finally:
-            r.close()
+        r = REQ_SESSION.get("https://api.bilibili.com/x/web-interface/nav", timeout=8)
+        data = r.json()
+        r.close()
         if data.get("code") not in (0, -101):
             return False
         img = data.get("data", {}).get("wbi_img", {}) or {}
@@ -406,6 +409,7 @@ def force_update_wbi_keys():
         logging.warning(f"WBI 刷新失败: {e}")
         return False
 
+
 def update_wbi_keys():
     if WBI_KEYS["img_key"] and time.time() - WBI_KEYS["last_update"] < WBI_REFRESH_INTERVAL:
         return True
@@ -415,8 +419,7 @@ def update_wbi_keys():
 def enc_wbi(params, img_key, sub_key):
     mixin_key = "".join((img_key + sub_key)[i] for i in mixinKeyEncTab)[:32]
     params = dict(params)
-    # 服务器时间存在偏差时，沿用当前项目已验证的 -120s 修正。
-    params["wts"] = int(time.time()) + int(WBI_TIME_OFFSET)
+    params["wts"] = int(time.time())
     params = dict(sorted(params.items()))
     filtered = {}
     for k, v in params.items():
@@ -428,6 +431,10 @@ def enc_wbi(params, img_key, sub_key):
     filtered["w_rid"] = hashlib.md5((query + mixin_key).encode()).hexdigest()
     return filtered
 
+
+# =========================================================
+# API 请求 / 风控
+# =========================================================
 def notify_system_once(title, message):
     key = f"{title}:{message[:120]}"
     now = time.time()
@@ -438,35 +445,23 @@ def notify_system_once(title, message):
 
 
 def safe_request(url, params=None, retries=REQUEST_RETRIES):
-    params = dict(params or {})
+    params = params or {}
     last = {"code": -500, "message": "unknown"}
-    for i in range(max(1, retries)):
+    for i in range(retries):
         try:
-            # 每次独立连接，符合当前项目基准；Connection: close 防长连接污染。
-            resp = requests.get(
-                url,
-                params=params,
-                headers=REQUEST_HEADERS,
-                cookies=COOKIE_JAR,
-                timeout=REQUEST_TIMEOUT,
-            )
-            status_code = int(getattr(resp, "status_code", 0) or 0)
+            resp = REQ_SESSION.get(url, params=params, timeout=REQUEST_TIMEOUT)
             try:
                 data = resp.json()
-            except Exception:
-                body = (resp.text or "")[:300]
-                data = {"code": -500, "message": f"invalid_json http={status_code} body={body}"}
             finally:
                 resp.close()
-
-            if not isinstance(data, dict):
-                data = {"code": -500, "message": "invalid_response"}
             last = data
             code = data.get("code")
 
             if code == -101:
                 STATE.consecutive_cookie_failures += 1
-                logging.error(f"❌ Cookie 验证失败 {STATE.consecutive_cookie_failures}/3")
+                logging.error(
+                    f"❌ Cookie 验证失败 {STATE.consecutive_cookie_failures}/3"
+                )
                 notify_system_once(
                     "❌ B站 Cookie 失效预警",
                     "Cookie 验证失败，请检查 bili_cookie.txt。"
@@ -478,23 +473,15 @@ def safe_request(url, params=None, retries=REQUEST_RETRIES):
 
             STATE.consecutive_cookie_failures = 0
 
-            rate_limited = code in (-799, -352, -509, -412) or status_code in (412, 429)
-            if rate_limited:
-                # 风控情况下最后一次也不再无意义等待；下一层扫描会自然重试。
-                if i >= retries - 1:
-                    logging.warning(
-                        f"⚠️ B站风控/限流最终失败 code={code} http={status_code}"
-                    )
-                    break
+            if code in (-799, -352, -509, -412) or resp.status_code in (412, 429):
                 wait = min(300.0, 15.0 * (2 ** i)) + random.uniform(3, 8)
                 logging.warning(
-                    f"⚠️ B站风控/限流 code={code} http={status_code}，退避 {wait:.1f}s"
+                    f"⚠️ B站风控/限流 code={code} http={resp.status_code}，退避 {wait:.1f}s"
                 )
-                if i == 0:
-                    force_update_wbi_keys()
+                force_update_wbi_keys()
                 notify_system_once(
                     "🚨 B站风控预警",
-                    f"code={code}, http={status_code}，已自动退避 {wait:.1f} 秒。"
+                    f"code={code}, http={resp.status_code}，已自动退避 {wait:.1f} 秒。"
                 )
                 time.sleep(wait)
                 continue
@@ -503,26 +490,22 @@ def safe_request(url, params=None, retries=REQUEST_RETRIES):
                 return data
 
             if i < retries - 1:
-                wait = min(30.0, 3.0 * (2 ** i)) + random.uniform(1, 3)
+                wait = 3.0 * (2 ** i) + random.uniform(1, 3)
                 logging.warning(f"[API重试] code={code} wait={wait:.1f}s url={url}")
                 time.sleep(wait)
             else:
                 return data
 
-        except requests.RequestException as e:
-            last = {"code": -500, "message": repr(e)}
-            if i < retries - 1:
-                wait = min(30.0, 3.0 * (2 ** i)) + random.uniform(1, 3)
-                logging.warning(f"[网络重试] {repr(e)} wait={wait:.1f}s")
-                time.sleep(wait)
         except Exception as e:
             last = {"code": -500, "message": repr(e)}
-            logging.error(f"[请求异常] {url}: {repr(e)}")
-            break
-
+            if i < retries - 1:
+                wait = 3.0 * (2 ** i) + random.uniform(1, 3)
+                logging.warning(f"[网络重试] {repr(e)} wait={wait:.1f}s")
+                time.sleep(wait)
     logging.error(f"❌ 请求最终失败: {url}")
     notify_system_once("❌ B站 API 请求失败", f"接口连续失败: {url}")
     return last
+
 
 def wbi_request(url, params):
     update_wbi_keys()
@@ -539,13 +522,12 @@ def wbi_request(url, params):
 # =========================================================
 def default_state():
     return {
-        "version": 7,
+        "version": 6,
         "feed": {
             "baseline": "",
             "last_snapshot_ids": [],
             "recent_snapshot_history": [],
             "recent_pushed_ids": [],
-            "discovered": {},
             "push_retry_after": {},
             "outbox": {},
             "last_refresh_time": 0,
@@ -615,7 +597,6 @@ def _sanitize_discovered(raw):
             "uid": str(v.get("uid", "") or ""),
             "refresh_seq": _safe_int(v.get("refresh_seq"), 0),
             "discovery_mode": str(v.get("discovery_mode", "") or ""),
-            "time_fallback": bool(v.get("time_fallback", False)),
             "status": str(v.get("status", "baseline") or "baseline"),
         }
         if cleaned[dyn_id]["status"] not in {"baseline", "queued", "retry", "sent"}:
@@ -701,7 +682,7 @@ def load_dynamic_state():
         state.setdefault("_meta", {})["dirty"] = True
 
     # v6: discovered 明确记录状态；旧状态仅补 baseline，不改变历史推送语义。
-    state["version"] = 7
+    state["version"] = 6
 
     for uid, info in list(state.get("uid_stats", {}).items()):
         if not isinstance(info, dict):
@@ -868,188 +849,168 @@ def is_allowed_dynamic(item):
         return True
 
 
-def _extract_rich_text(nodes):
-    parts = []
-    if not isinstance(nodes, list):
-        return ""
-    allowed = {
-        "RICH_TEXT_NODE_TYPE_TEXT",
-        "RICH_TEXT_NODE_TYPE_TOPIC",
-        "RICH_TEXT_NODE_TYPE_AT",
-        "RICH_TEXT_NODE_TYPE_EMOJI",
-        "RICH_TEXT_NODE_TYPE_LOTTERY",
-        "RICH_TEXT_NODE_TYPE_LINK",
-        "RICH_TEXT_NODE_TYPE_BV",
-        "RICH_TEXT_NODE_TYPE_AV",
-        "RICH_TEXT_NODE_TYPE_GOODS",
-    }
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        text = node.get("text")
-        ntype = str(node.get("type") or "")
-        if isinstance(text, str) and (not ntype or ntype in allowed):
-            parts.append(text)
-    return normalize_text("".join(parts))
-
-
-def _extract_paragraph_text(paragraphs):
-    if not isinstance(paragraphs, list):
-        return ""
-    parts = []
-    for paragraph in paragraphs:
-        if not isinstance(paragraph, dict):
-            continue
-        nodes = paragraph.get("text") or paragraph.get("rich_text_nodes") or paragraph.get("nodes")
-        if isinstance(nodes, list):
-            text = _extract_rich_text(nodes)
-            if text:
-                parts.append(text)
-        elif isinstance(nodes, str):
-            parts.append(nodes)
-    return normalize_text("\n".join(parts))
-
-
 def extract_dynamic_text(item):
     try:
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
         desc = dyn.get("desc") or {}
+        nodes = desc.get("rich_text_nodes") or []
+        if nodes:
+            text = "".join(
+                n.get("text", "") for n in nodes
+                if isinstance(n, dict) and n.get("type") in (
+                    "RICH_TEXT_NODE_TYPE_TEXT", "RICH_TEXT_NODE_TYPE_TOPIC",
+                    "RICH_TEXT_NODE_TYPE_AT", "RICH_TEXT_NODE_TYPE_EMOJI",
+                    "RICH_TEXT_NODE_TYPE_LOTTERY"
+                )
+            )
+            text = normalize_text(text)
+            if text:
+                return text
 
-        text = _extract_rich_text(desc.get("rich_text_nodes"))
-        if text:
-            return text
-
-        raw_desc_text = normalize_text(desc.get("text", ""))
         major = dyn.get("major") or {}
-        t = str(major.get("type") or "")
-
+        t = major.get("type", "")
         if t == "MAJOR_TYPE_ARCHIVE":
             a = major.get("archive") or {}
             title = normalize_text(a.get("title", ""))
             desc_text = normalize_text(a.get("desc", ""))
-            return "\n".join(x for x in (f"【视频】{title}" if title else "", desc_text) if x).strip()
-
+            return f"【视频】{title}\n{desc_text}".strip()
         if t == "MAJOR_TYPE_ARTICLE":
             a = major.get("article") or {}
             title = normalize_text(a.get("title", ""))
             desc_text = normalize_text(a.get("desc", ""))
-            return "\n".join(x for x in (f"【专栏】{title}" if title else "", desc_text) if x).strip()
-
+            return f"【专栏】{title}\n{desc_text}".strip()
         if t == "MAJOR_TYPE_OPUS":
             opus = major.get("opus") or {}
             title = normalize_text(opus.get("title", ""))
             summary = opus.get("summary") or {}
-            text = _extract_rich_text(summary.get("rich_text_nodes"))
-            if not text:
-                text = _extract_paragraph_text(summary.get("paragraphs"))
-            if not text:
-                text = _extract_paragraph_text(opus.get("paragraphs"))
-            if not text:
-                text = normalize_text(opus.get("desc", ""))
-            if title and text:
-                return f"【图文】{title}\n{text}".strip()
-            if title:
-                return f"【图文】{title}"
-            return text
-
+            nodes = summary.get("rich_text_nodes") or []
+            text = normalize_text("".join(n.get("text", "") for n in nodes if isinstance(n, dict)))
+            return f"【图文】{title}\n{text}".strip()
         if t == "MAJOR_TYPE_DRAW":
-            return raw_desc_text or normalize_text(desc.get("text", "")) or "【图片动态】"
-
+            return normalize_text(desc.get("text", "")) or "【图片动态】"
         if t == "MAJOR_TYPE_COMMON":
             common = major.get("common") or {}
             title = normalize_text(common.get("title", ""))
             desc_text = normalize_text(common.get("desc", ""))
-            return "\n".join(x for x in (f"【卡片】{title}" if title else "", desc_text) if x).strip()
-
+            return f"【卡片】{title}\n{desc_text}".strip()
         if t == "MAJOR_TYPE_LIVE":
             live = major.get("live") or {}
             title = normalize_text(live.get("title", ""))
-            desc_text = normalize_text(live.get("desc_second", "") or live.get("desc_first", ""))
-            return "\n".join(x for x in (f"【直播】{title}" if title else "", desc_text) if x).strip()
-
-        # 未知格式：只从明确正文描述字段兜底，不递归整棵 JSON，避免 UI 文案污染。
-        if raw_desc_text:
-            return raw_desc_text
-
-        for key in ("title", "desc", "description", "summary"):
-            value = major.get(key) if isinstance(major, dict) else None
-            if isinstance(value, str):
-                value = normalize_text(value)
-                if value:
-                    return value
-
-        return ""
+            desc_text = normalize_text(live.get("desc_second", ""))
+            return f"【直播】{title}\n{desc_text}".strip()
+        return normalize_text(desc.get("text", ""))
     except Exception:
         return ""
 
-def _normalize_image_url(url):
-    if not isinstance(url, str):
-        return ""
-    url = url.strip()
-    if url.startswith("//"):
-        url = "https:" + url
-    if not url.startswith(("http://", "https://")):
-        return ""
-    return url
+
+def collect_image_urls(obj, out=None, depth=0):
+    """兼容 draw/opus/archive/article/forward 等结构，收集全部图片 URL。"""
+    if out is None:
+        out = []
+    if obj is None or depth > 6:
+        return out
+    if isinstance(obj, str):
+        low = obj.lower()
+        if low.startswith(("http://", "https://")) and any(x in low for x in ("hdslb.com", "bfs/", ".jpg", ".png", ".jpeg", ".webp")):
+            if obj not in out:
+                out.append(obj)
+        return out
+    if isinstance(obj, dict):
+        priority_keys = (
+            "src", "url", "image", "image_url", "cover", "thumbnail", "pic", "picture",
+            "origin_url", "source_url", "jump_url"
+        )
+        for k in priority_keys:
+            v = obj.get(k)
+            if isinstance(v, str):
+                low = v.lower()
+                if low.startswith(("http://", "https://")) and ("hdslb.com" in low or "bfs/" in low):
+                    if v not in out:
+                        out.append(v)
+            elif isinstance(v, (dict, list)):
+                collect_image_urls(v, out, depth + 1)
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                collect_image_urls(v, out, depth + 1)
+        return out
+    if isinstance(obj, list):
+        for v in obj:
+            collect_image_urls(v, out, depth + 1)
+    return out
 
 
-def extract_images(item, _forward_depth=0):
-    """严格按动态正文字段提图；禁止递归整棵 JSON。"""
+def extract_images(item):
+    """只取一张主图：图集第一张或视频/专栏封面。Webhook 不允许塞整组图。"""
     urls = []
-
-    def add(url):
-        url = _normalize_image_url(url)
-        if url and url not in urls:
-            urls.append(url)
-
     try:
-        if not isinstance(item, dict):
-            return []
-
         modules = item.get("modules") or {}
         dyn = modules.get("module_dynamic") or {}
         major = dyn.get("major") or {}
-        major_type = str(major.get("type") or "")
 
-        if major_type == "MAJOR_TYPE_DRAW":
-            draw = major.get("draw") or {}
-            for obj in draw.get("items") or []:
-                if isinstance(obj, dict):
-                    add(obj.get("src"))
+        def _take(u):
+            if not u or not isinstance(u, str):
+                return False
+            if u.startswith("//"):
+                u = "https:" + u
+            if u.startswith(("http://", "https://")) and u not in urls:
+                urls.append(u)
+                return True
+            return False
 
-        elif major_type == "MAJOR_TYPE_OPUS":
+        # 优先明确主图字段，避免递归把头像/装饰图当主图
+        draw = major.get("draw") or {}
+        items_draw = draw.get("items") or []
+        if items_draw and isinstance(items_draw[0], dict):
+            _take(items_draw[0].get("src") or items_draw[0].get("url"))
+
+        if not urls:
             opus = major.get("opus") or {}
-            for obj in opus.get("pics") or []:
-                if isinstance(obj, str):
-                    add(obj)
-                elif isinstance(obj, dict):
-                    # opus.pics 是正文图片白名单字段，只取 url/src。
-                    add(obj.get("url") or obj.get("src"))
+            pics = opus.get("pics") or []
+            if pics and isinstance(pics[0], dict):
+                _take(pics[0].get("url") or pics[0].get("src"))
 
-        # ARCHIVE / ARTICLE / LIVE / COMMON 均不默认提图：
-        # cover、thumbnail、jump_url、source_url、头像等都不是正文图片。
+        if not urls:
+            for key in ("archive", "article"):
+                section = major.get(key) or {}
+                cover = section.get("cover")
+                if isinstance(cover, str):
+                    _take(cover)
+                elif isinstance(cover, list) and cover and isinstance(cover[0], str):
+                    _take(cover[0])
+                if urls:
+                    break
+                covers = section.get("covers")
+                if isinstance(covers, list) and covers and isinstance(covers[0], str):
+                    _take(covers[0])
+                if urls:
+                    break
 
-        # 转发动态：只递归进入“原动态”这个明确的数据节点，再按原动态自身规则提图。
-        if str(item.get("type") or "") == "DYNAMIC_TYPE_FORWARD" and _forward_depth < 1:
-            orig = item.get("orig")
-            if isinstance(orig, dict):
-                for u in extract_images(orig, _forward_depth + 1):
-                    add(u)
+        if not urls:
+            fallback = []
+            collect_image_urls(major, fallback)
+            if not fallback and item.get("type") == "DYNAMIC_TYPE_FORWARD":
+                orig = item.get("orig")
+                if isinstance(orig, dict):
+                    collect_image_urls(orig, fallback)
+            if fallback:
+                _take(fallback[0])
+    except Exception:
+        pass
 
-    except Exception as e:
-        logging.debug(f"[IMAGE] 提取异常 dyn_id={item.get('id_str', '-')}: {repr(e)}")
+    return urls[:MAX_PUSH_IMAGES]
 
-    return urls[:12]
 
-def _minimal_push_payload(item, err="", fallback_ts=0):
-    """解析彻底失败时仍生成最小消息，保证动态直达链接不因解析异常而消失。"""
-    item = item if isinstance(item, dict) else {}
-    modules = item.get("modules") or {}
-    author = modules.get("module_author") or {}
-    dyn_id = str(item.get("id_str") or "")
-    top_type = str(item.get("type") or "")
-    pub_ts = _safe_int(author.get("pub_ts"), 0) or _safe_int(fallback_ts, 0) or int(time.time())
+def _minimal_push_payload(item, err=""):
+    """[FIX-2] 解析彻底失败时的最小可推送载荷：保证「绝不因为解析问题而静默漏推」。"""
+    dyn_id = str(item.get("id_str") or "") if isinstance(item, dict) else ""
+    author = {}
+    top_type = ""
+    pub_ts = 0
+    if isinstance(item, dict):
+        top_type = str(item.get("type") or "")
+        author = (item.get("modules") or {}).get("module_author") or {}
+        pub_ts = _safe_int(author.get("pub_ts"), 0)
     return {
         "user": str(author.get("name") or "未知UP"),
         "uid": str(author.get("mid") or ""),
@@ -1062,6 +1023,7 @@ def _minimal_push_payload(item, err="", fallback_ts=0):
         "image_count": 0,
         "kind": "dynamic",
     }
+
 
 def format_dynamic_message(item):
     """[FIX-2] 全程兜底：任何解析异常都退化为最小载荷，而不是抛出导致漏推。"""
@@ -1091,16 +1053,18 @@ def format_dynamic_message(item):
             text = "（该动态无可提取正文）"
 
         images = extract_images(item)
+        cover = images[0] if images else ""
+        one = [cover] if cover else []
         return {
             "user": name,
             "uid": uid,
             "message": text,
             "time": ts_to_str(pub_ts),
             "link": f"https://t.bilibili.com/{dyn_id}",
-            "cover": images[0] if images else "",
-            "covers": images,
-            "images": images,
-            "image_count": len(images),
+            "cover": cover,
+            "covers": one,
+            "images": one,
+            "image_count": 1 if cover else 0,
             "kind": "dynamic",
         }
     except Exception as e:
@@ -1482,10 +1446,6 @@ def append_dead_letter(reason, tasks):
                 for line in lines:
                     f.write(line + "\n")
                 f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except Exception:
-                    pass
             _maybe_trim_text_file(DEAD_LETTER_FILE, DEAD_LETTER_MAX_BYTES)
     except Exception as e:
         logging.error(f"写死信文件失败: {e}")
@@ -1505,7 +1465,7 @@ def _sanitize_outbox(raw, emit_dead=False):
     now = time.time()
     candidates = []
     dead = []
-    max_age = OUTBOX_EXPIRE_SECONDS
+    max_age = 7 * 24 * 3600
     for k, v in raw.items():
         dyn_id = str(k).strip()
         if not dyn_id or not isinstance(v, dict):
@@ -1527,11 +1487,10 @@ def _sanitize_outbox(raw, emit_dead=False):
         task["attempt"] = attempt
         task["next_attempt"] = next_attempt
         task["discovery_mode"] = str(task.get("discovery_mode") or "")
-        task["time_fallback"] = bool(task.get("time_fallback", False))
         if created and (now - created) > max_age:
             dead.append(task)
             continue
-        if attempt > OUTBOX_MAX_ATTEMPTS:
+        if attempt > 50:
             dead.append(task)
             continue
         candidates.append(task)
@@ -1544,7 +1503,7 @@ def _sanitize_outbox(raw, emit_dead=False):
             f"🧹 outbox 超限，淘汰最旧 {len(overflow)} 条，保留最新 {OUTBOX_MAX} 条"
         )
     if dead and emit_dead:
-        by_attempt = [t for t in dead if _safe_int(t.get("attempt"), 0) > OUTBOX_MAX_ATTEMPTS]
+        by_attempt = [t for t in dead if _safe_int(t.get("attempt"), 0) > 50]
         by_age = [t for t in dead if t not in by_attempt and (
             _safe_float(t.get("created_at"), 0) and (now - _safe_float(t.get("created_at"), 0)) > max_age
         )]
@@ -1780,7 +1739,6 @@ def requeue_due_outbox(state):
         if is_recent_pushed(state, dyn_id) or dyn_id in SENT_ACK_IDS:
             outbox.pop(dyn_id, None)
             PENDING_PUSH_IDS.discard(str(dyn_id))
-            mark_state_dirty(state)
             continue
         next_attempt = _safe_float(task.get("next_attempt"), 0.0)
         if next_attempt > now:
@@ -1898,13 +1856,12 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         # [FIX-7] 没有 pub_ts 也不能静默丢弃：使用本次发现时间作为临时事件时间。
         # 这样动态仍会进入 outbox，并在消息里至少带上动态直达链接。
         time_fallback = False
-        raw_pub_ts = pub_ts
         if not pub_ts:
             st["no_pub_ts"] += 1
             time_fallback = True
             pub_ts = now_ts
-            logging.debug(
-                f"[TIME_FALLBACK] dyn_id={dyn_id} uid={uid} pub_ts缺失，使用发现时间继续判断"
+            logging.warning(
+                f"[TIME_FALLBACK] dyn_id={dyn_id} uid={uid} pub_ts缺失，使用发现时间继续处理"
             )
         if dyn_id in ack_ids:
             st["ack"] += 1
@@ -1924,17 +1881,10 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         downtime_new = last_ok > 0 and pub_ts > last_ok
         entry = discovered.get(dyn_id)
         entry_pub = _safe_int((entry or {}).get("pub_ts"), 0) if isinstance(entry, dict) else 0
-        entry_time_fallback = bool(isinstance(entry, dict) and entry.get("time_fallback"))
-        pub_changed = bool(entry_pub and raw_pub_ts and pub_ts > entry_pub)
+        pub_changed = bool(entry_pub and pub_ts > entry_pub)
 
         # 长停机恢复：只要发布时间晚于最后一次完整成功刷新，不受6小时历史窗限制。
-        # 对“启动基线阶段无 pub_ts”的历史动态，保持 baseline 边界，不能因每次
-        # fallback 到当前时间而被误判成新动态。
-        if time_fallback and entry_time_fallback and entry.get("status") == "baseline":
-            force_recover = False
-        else:
-            force_recover = recent or downtime_new or pub_changed
-
+        force_recover = recent or downtime_new or pub_changed
         if entry and not force_recover:
             st["already_discovered"] += 1
             dbg_skip(dyn_id, uid, pub_ts, entry, "already_discovered")
@@ -2028,7 +1978,6 @@ def enqueue_candidates(candidates, state, discovery_mode):
             discovered[dyn_id] = {
                 "first_seen": first_seen, "pub_ts": pub_ts, "uid": uid,
                 "refresh_seq": STATE.refresh_seq, "discovery_mode": discovery_mode,
-                "time_fallback": reason == "time_fallback",
                 "status": "queued",
             }
             update_uid_stats_after_enqueue(state, {"uid": uid, "dyn_id": dyn_id, "pub_ts": pub_ts, "first_seen": first_seen}, discovery_mode)
@@ -2341,11 +2290,11 @@ def initialize_state(target_uids):
             if not is_allowed_dynamic(item):
                 skipped_type += 1
                 continue
-            # 启动基线策略：
-            # - 无 pub_ts：登记为 baseline + time_fallback，防止历史无时间动态在后续
-            #   每轮都被“发现时间=现在”误判为新动态。
-            # - 近期动态/停机窗口动态：不登记，交给正式扫描恢复。
-            # - 其余历史动态：登记 baseline，避免冷启动历史洪水。
+            # 停机恢复策略：
+            # - 无 pub_ts：不登记（正式扫描会 skip_no_pub_ts）
+            # - 年龄 <= 强制窗口：不登记，主循环推送
+            # - 有 last_success_refresh：pub_ts 晚于它即视为停机期间新动态（不限 6 小时）
+            # - 无 last_success_refresh：仅恢复 STARTUP_RECOVER_MAX_AGE 内，避免全量历史误推
             age = (now_ts - pub_ts) if pub_ts > 0 else 0
             last_ok = _safe_float(feed.get("last_success_refresh"), 0.0)
             is_recent = pub_ts > 0 and age <= RECENT_FORCE_NEW_WINDOW
@@ -2353,27 +2302,9 @@ def initialize_state(target_uids):
                 is_downtime_new = pub_ts > 0 and pub_ts > last_ok
             else:
                 is_downtime_new = pub_ts > 0 and age <= STARTUP_RECOVER_MAX_AGE
-
-            if pub_ts <= 0:
-                if dyn_id not in discovered:
-                    discovered[dyn_id] = {
-                        "first_seen": now_ts,
-                        "pub_ts": 0,
-                        "uid": uid,
-                        "refresh_seq": 0,
-                        "discovery_mode": "baseline",
-                        "time_fallback": True,
-                        "status": "baseline",
-                    }
-                    registered += 1
-                else:
-                    skipped_recent += 1
-                continue
-
-            if is_recent or is_downtime_new:
+            if pub_ts <= 0 or is_recent or is_downtime_new:
                 skipped_recent += 1
                 continue
-
             if dyn_id not in discovered:
                 discovered[dyn_id] = {
                     "first_seen": now_ts,
@@ -2381,7 +2312,6 @@ def initialize_state(target_uids):
                     "uid": uid,
                     "refresh_seq": 0,
                     "discovery_mode": "baseline",
-                    "time_fallback": False,
                     "status": "baseline",
                 }
                 registered += 1
