@@ -1,6 +1,25 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# B站关注动态监控  v3.3.0（feed/all｜长期稳定优化版）
+# B站关注动态监控  v3.3.1（feed/all｜长期稳定优化版）
+# -----------------------------------------------------------------------------
+# 本版相对 v3.3.0 的改动：
+#   [FIX-15] 不推送「粉丝专属 / 充电专属」动态（需付费订阅才能看的内容）。
+#           背景：账号未开通充电，这类动态推过来也看不到正文，属于纯噪音。
+#           判定采用结构化枚举，不依赖正文文案，避免误判：
+#             a) major.type == MAJOR_TYPE_UPOWER_COMMON        → 充电相关主体
+#             b) major.type == MAJOR_TYPE_NONE 且 none.tips 含
+#                「专属 / 充电 / 解锁 / upower」              → 锁定态专属内容
+#             c) additional.type 以 ADDITIONAL_TYPE_UPOWER 开头 → 充电专属附件卡
+#             d) 防御性：basic / module_dynamic / item 层出现
+#                is_only_fans / is_upower_exclusive == true
+#           处理方式不是静默 continue：命中后登记 discovered(status=fans_only)
+#           并写 INFO 日志 + 每日 fans_only 计数，健康报告单列「专属已过滤」，
+#           既不漏报可见动态，也能自证过滤确实生效。
+#           注意：**未改动** FEED_FEATURES 请求参数（继续保留 listOnlyfans 等），
+#           因为去掉这些 flag 后服务端可能返回不带 UPOWER 标记的内容，
+#           反而会让本过滤失效；保留标记做客户端过滤才是确定性方案。
+#           转发动态本身是公开内容，照常推送；其原动态若为专属，正文/图片
+#           解析本就会得到空值（UPOWER_COMMON / NONE 均无正文可取），不会外泄锁定内容。
 # -----------------------------------------------------------------------------
 # 本版相对 v3.2.2 的长期稳定优化：
 #   [FIX-9] queue/Outbox 拥堵时不删除已持久化任务。
@@ -149,6 +168,30 @@ ALLOWED_TOP_LEVEL_TYPES = {
     "DYNAMIC_TYPE_ARTICLE", "DYNAMIC_TYPE_FORWARD", "DYNAMIC_TYPE_LIVE"
 }
 ALLOW_FORWARD_DYNAMIC = True
+
+# =========================================================
+# 粉丝专属 / 充电专属动态过滤（[FIX-15]）
+# ---------------------------------------------------------
+# 账号未开通充电，专属动态推过来也看不到正文，属纯噪音，直接不推。
+# 判定只用结构化枚举 + 锁定文案关键词，不做正文关键词匹配，避免误伤
+# UP 主正常讨论「充电」「专属」的普通动态。
+# 想恢复推送专属动态：把 SKIP_FANS_ONLY_DYNAMIC 改为 False 即可。
+# =========================================================
+SKIP_FANS_ONLY_DYNAMIC = True
+# major.type 命中即判定为专属（充电相关主体）
+FANS_ONLY_MAJOR_TYPES = {
+    "MAJOR_TYPE_UPOWER_COMMON",
+}
+# additional.type 前缀命中即判定为专属（充电专属抽奖等，前缀匹配可覆盖未来新增）
+FANS_ONLY_ADDITIONAL_PREFIXES = (
+    "ADDITIONAL_TYPE_UPOWER",
+)
+# major.type == MAJOR_TYPE_NONE 时的锁定文案关键词。
+# 注意：MAJOR_TYPE_NONE 也被普通「动态失效」复用，因此必须配合文案才判定，
+# 否则会把失效动态一并吞掉，违反「不能静默丢动态」原则。
+FANS_ONLY_TIPS_KEYWORDS = ("专属", "充电", "解锁", "upower")
+# 防御性布尔字段：文档未确认动态接口一定返回，但一旦出现且为 true 即判定为专属。
+FANS_ONLY_FLAG_KEYS = ("is_only_fans", "is_upower_exclusive")
 
 # =========================================================
 # 全局运行对象
@@ -396,7 +439,7 @@ def init_logging():
     root.setLevel(LOG_LEVEL)
     root.propagate = False
     logging.info("=" * 70)
-    logging.info("B站关注动态监控 v3.3.0（feed/all｜长期稳定优化版）")
+    logging.info("B站关注动态监控 v3.3.1（feed/all｜长期稳定优化版）")
     logging.info("=" * 70)
 
 
@@ -560,6 +603,7 @@ def default_state():
             "verify_recovered": 0,
             "deep_recovered": 0,
             "delayed_found": 0,
+            "fans_only": 0,
             "webhook_success": 0,
             "webhook_fail": 0,
             "api_fail": 0,
@@ -607,6 +651,7 @@ def _sanitize_discovered(raw):
                 "status": "baseline",
                 "time_missing": False,
                 "last_seen": _safe_int(v, 0),
+                "skip_reason": "",
             }
             continue
         cleaned[dyn_id] = {
@@ -618,8 +663,12 @@ def _sanitize_discovered(raw):
             "status": str(v.get("status", "baseline") or "baseline"),
             "time_missing": bool(v.get("time_missing", False)),
             "last_seen": _safe_int(v.get("last_seen"), _safe_int(v.get("first_seen"), 0)),
+            # [FIX-15] 过滤原因（目前仅 fans_only 使用），保留下来便于事后复核
+            "skip_reason": str(v.get("skip_reason", "") or ""),
         }
-        if cleaned[dyn_id]["status"] not in {"baseline", "queued", "retry", "sent", "deferred"}:
+        if cleaned[dyn_id]["status"] not in {
+            "baseline", "queued", "retry", "sent", "deferred", "fans_only"
+        }:
             cleaned[dyn_id]["status"] = "baseline"
     if len(cleaned) > SEEN_DYNAMIC_LIMIT:
         items = sorted(
@@ -773,6 +822,7 @@ def reset_daily_stats(state, date_str):
             "verify_recovered": 0,
             "deep_recovered": 0,
             "delayed_found": 0,
+            "fans_only": 0,
             "webhook_success": 0,
             "webhook_fail": 0,
             "api_fail": 0,
@@ -872,6 +922,70 @@ def is_allowed_dynamic(item):
             item.get("type") if isinstance(item, dict) else "-", repr(e),
         )
         return True
+
+
+def is_fans_only_dynamic(item):
+    """[FIX-15] 判断是否为「粉丝专属 / 充电专属（需付费订阅）」动态。
+
+    返回 (是否专属, 命中原因)。命中原因用于日志，便于事后核对该不该被过滤。
+
+    判定顺序（全部为结构化枚举，不做正文关键词匹配）：
+      1. major.type == MAJOR_TYPE_UPOWER_COMMON
+      2. major.type == MAJOR_TYPE_NONE 且 major.none.tips 含专属关键词
+      3. additional.type 以 ADDITIONAL_TYPE_UPOWER 开头
+      4. basic / module_dynamic / item 层 is_only_fans 或 is_upower_exclusive 为 true
+
+    任何异常一律返回 (False, "")，即「放行」——宁可多推，也不因为判定异常
+    把正常动态吃掉（与 is_allowed_dynamic 的保守放行原则一致）。
+    """
+    if not SKIP_FANS_ONLY_DYNAMIC:
+        return False, ""
+    try:
+        if not isinstance(item, dict):
+            return False, ""
+        modules = item.get("modules") or {}
+        dyn = modules.get("module_dynamic") or {}
+        major = dyn.get("major") or {}
+
+        major_type = str(major.get("type") or "")
+        if major_type in FANS_ONLY_MAJOR_TYPES:
+            return True, f"major_type={major_type}"
+
+        if major_type == "MAJOR_TYPE_NONE":
+            none_obj = major.get("none") or {}
+            tips = str(none_obj.get("tips") or "")
+            low = tips.lower()
+            for kw in FANS_ONLY_TIPS_KEYWORDS:
+                if kw.lower() in low:
+                    return True, f"locked_tips={tips[:40]}"
+
+        additional = dyn.get("additional") or {}
+        add_type = str(additional.get("type") or "")
+        if add_type:
+            for prefix in FANS_ONLY_ADDITIONAL_PREFIXES:
+                if add_type.startswith(prefix):
+                    return True, f"additional_type={add_type}"
+
+        holders = (
+            ("basic", item.get("basic") or {}),
+            ("module_dynamic", dyn),
+            ("modules", modules),
+            ("item", item),
+        )
+        for holder_name, holder in holders:
+            if not isinstance(holder, dict):
+                continue
+            for key in FANS_ONLY_FLAG_KEYS:
+                if holder.get(key) is True:
+                    return True, f"{holder_name}.{key}=true"
+
+        return False, ""
+    except Exception as e:
+        logging.debug(
+            "[FANS_ONLY] check exception dyn_id=%s -> allow: %s",
+            item.get("id_str") if isinstance(item, dict) else "-", repr(e),
+        )
+        return False, ""
 
 
 def extract_dynamic_text(item):
@@ -1789,10 +1903,11 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         stats = {}
     st = {"seen": 0, "target": 0, "type_block": 0, "no_pub_ts": 0, "ack": 0,
           "already_pushed": 0, "pending_or_outbox": 0, "already_discovered": 0,
-          "too_old": 0, "new": 0, "deferred": 0}
+          "too_old": 0, "new": 0, "deferred": 0, "fans_only": 0}
     for k in st:
         stats.setdefault(k, 0)
     type_block_ids = []
+    fans_only_ids = []
 
     def dbg_skip(dyn_id, uid, pub_ts, entry, reason):
         """逐动态跳过原因诊断。仅 DEBUG 可见，INFO 运行零输出。"""
@@ -1827,6 +1942,40 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         stat["last_global_seen"] = now_ts
         if pub_ts:
             stat["last_pub_ts"] = max(_safe_int(stat.get("last_pub_ts"), 0), pub_ts)
+
+        # [FIX-15] 粉丝/充电专属动态：账号未开通充电，推了也看不到正文，直接不推。
+        # 注意这不是「静默」丢弃——登记 discovered(status=fans_only) + INFO 日志 +
+        # 每日计数，既能避免每轮重复评估，也让过滤量在健康报告里可核对。
+        fans_only, fans_reason = is_fans_only_dynamic(item)
+        if fans_only:
+            prev_entry = discovered.get(dyn_id)
+            prev_status = (
+                str((prev_entry or {}).get("status") or "")
+                if isinstance(prev_entry, dict) else ""
+            )
+            if prev_status != "fans_only":
+                st["fans_only"] += 1
+                fans_only_ids.append(f"{dyn_id}:{fans_reason}")
+                daily["fans_only"] = int(daily.get("fans_only", 0)) + 1
+                logging.info(
+                    f"[FILTER] skip fans_only dyn_id={dyn_id} uid={uid} "
+                    f"reason={fans_reason} mode={discovery_mode}"
+                )
+            discovered[dyn_id] = {
+                "first_seen": (_safe_int((prev_entry or {}).get("first_seen"), 0)
+                               if isinstance(prev_entry, dict) and prev_entry
+                               else now_ts),
+                "pub_ts": pub_ts,
+                "uid": uid,
+                "refresh_seq": STATE.refresh_seq,
+                "discovery_mode": discovery_mode,
+                "status": "fans_only",
+                "time_missing": pub_ts <= 0,
+                "last_seen": now_ts,
+                "skip_reason": fans_reason,
+            }
+            mark_state_dirty(state)
+            continue
 
         if not is_allowed_dynamic(item):
             st["type_block"] += 1
@@ -1902,6 +2051,12 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         logging.info(
             f"[FILTER SKIP] type_filtered count={len(type_block_ids)} "
             f"sample={','.join(type_block_ids[:5])} mode={discovery_mode}"
+        )
+    # [FIX-15] 专属动态过滤同样留痕，便于核对是不是误伤了正常动态
+    if fans_only_ids:
+        logging.info(
+            f"[FILTER SKIP] fans_only count={len(fans_only_ids)} "
+            f"sample={','.join(fans_only_ids[:5])} mode={discovery_mode}"
         )
     for k, v in st.items():
         stats[k] = stats.get(k, 0) + v
@@ -2129,7 +2284,8 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         f"type_block={stats.get('type_block', 0)} no_pub_ts={stats.get('no_pub_ts', 0)} "
         f"ack={stats.get('ack', 0)} pushed={stats.get('already_pushed', 0)} "
         f"pending={stats.get('pending_or_outbox', 0)} disc={stats.get('already_discovered', 0)} "
-        f"too_old={stats.get('too_old', 0)} time_fallback={stats.get('no_pub_ts', 0)}"
+        f"too_old={stats.get('too_old', 0)} time_fallback={stats.get('no_pub_ts', 0)} "
+        f"fans_only={stats.get('fans_only', 0)}"
     )
     if unique or not refresh_ok:
         logging.info(f"[SCAN] done mode={mode} pages={pages_done} {funnel} new={len(unique)} ok={refresh_ok}")
@@ -2158,6 +2314,7 @@ def format_health_report(state, target_uids, china_dt):
         f"二次确认追回：{daily.get('verify_recovered', 0)} 条",
         f"深扫追回：{daily.get('deep_recovered', 0)} 条",
         f"延迟动态：{daily.get('delayed_found', 0)} 条",
+        f"专属动态已过滤：{daily.get('fans_only', 0)} 条（未开通充电，不推送）",
         f"Webhook 成功：{daily.get('webhook_success', 0)}",
         f"Webhook 失败：{daily.get('webhook_fail', 0)}",
         f"Outbox 待发送：{len(outbox)}",
