@@ -1,6 +1,33 @@
 # -*- coding: utf-8 -*-
 # =============================================================================
-# B站关注动态监控  v3.3.1（feed/all｜长期稳定优化版）
+# B站关注动态监控  v3.3.2（feed/all｜长期稳定优化版）
+# -----------------------------------------------------------------------------
+# 本版相对 v3.3.1 的改动（只做口径修正与稳定性加固，不改动监控架构与投递语义）：
+#   [FIX-16] 状态落盘分级：snapshot / baseline / recent_snapshot_history 这类
+#           「纯边界」状态不再每轮即时落盘，改为按 STATE_BOUNDARY_SAVE_INTERVAL
+#           （300s）批量写盘；关键状态（discovered / outbox / ACK / 重试 / 统计）
+#           仍走 mark_state_dirty 立即落盘。稳态下写盘次数约降 90%
+#           （原来每 20~35s 一次「全量 JSON 序列化 + fsync」，128MB 小磁盘写放大明显）。
+#           代价：崩溃最多丢 5 分钟的 snapshot 边界更新，重启后可能多扫几页；
+#           不影响去重与投递（关键状态仍即时落盘）。
+#   [FIX-17] 扫描失败退避改为指数退避：原实现仅在连续失败 >=2 时抬到 35~60s，
+#           上限过低；现按 60→120→240→480→900s 递增（SCAN_BACKOFF_MAX），
+#           成功一次即回到 20~35s 正常节奏。避免 cookie 失效/被限流时持续高频打接口。
+#   [FIX-18] primary 连续不完整达 DEEP_SCAN_FORCE_AFTER_FAILURES（3）轮后，即使
+#           refresh_ok=False 也强制放行一次深扫——原来 partial_fail 会让深扫长期
+#           被跳过，恰好在最需要它追回延迟动态的时候失效。
+#   [FIX-19] 转发取图判据由 type==DYNAMIC_TYPE_FORWARD 改为「按 orig 是否存在」：
+#           「转发 + 自己补了图」的动态 type 是 DYNAMIC_TYPE_DRAW 且带 orig，
+#           旧判据会把原动态配图整段漏取。
+#   [FIX-20] 图片张数统一跟随 MAX_PUSH_IMAGES：format_dynamic_message 不再硬截
+#           1 张（原 cover=images[0] / one=[cover]），改常量即可全链路生效。
+#           默认 MAX_PUSH_IMAGES=1，行为与旧版完全一致。
+#   [FIX-21] 健康报告口径修正：
+#             - 「整体刷新」只统计 primary（原来把 verify/deep 也算进来，数字偏大），
+#               并新增「二次确认」轮次一行，三个口径不再混计；
+#             - funnel 中 time_fallback 独立计数（原来与 no_pub_ts 同源，恒相等）；
+#             - 「读取动态」改称「扫描条目（含确认/深扫重复计数）」，避免误读。
+#   未改动（按用户确认）：RUN_WEEKDAYS 工作日运行策略（周末不监控为有意设计）。
 # -----------------------------------------------------------------------------
 # 本版相对 v3.3.0 的改动：
 #   [FIX-15] 不推送「粉丝专属 / 充电专属」动态（需付费订阅才能看的内容）。
@@ -125,6 +152,13 @@ VERIFY_MAX_PAGES = 6
 DEEP_SCAN_INTERVAL = 300
 DEEP_SCAN_MAX_PAGES = 20
 DEEP_SCAN_STOP_STABLE_PAGES = 2
+# [FIX-18] primary 连续不完整达到该轮数后，即使 refresh_ok=False 也放行一次深扫，
+# 避免网络抖动造成的 partial_fail 长期挡住唯一能追回延迟动态的通道。
+DEEP_SCAN_FORCE_AFTER_FAILURES = 3
+
+# [FIX-17] 扫描失败指数退避（成功一次即恢复 20~35s 正常节奏）
+SCAN_BACKOFF_BASE = 60
+SCAN_BACKOFF_MAX = 900
 
 DYNAMIC_NEW_WINDOW = 6 * 3600        # 历史动态最大年龄
 RECENT_FORCE_NEW_WINDOW = 10 * 60    # 近 N 秒强制视为新（防污染漏报）
@@ -132,7 +166,14 @@ RECENT_FORCE_NEW_WINDOW = 10 * 60    # 近 N 秒强制视为新（防污染漏�
 # 有 last_success_refresh 时：凡 pub_ts > last_ok 均视为停机窗口内新动态（不设年龄上限）。
 STARTUP_RECOVER_MAX_AGE = 6 * 3600
 
-STATE_SAVE_INTERVAL = 60
+# [FIX-16] 落盘分三级，取代原来的单一 STATE_SAVE_INTERVAL=60：
+#   1) 关键状态（discovered / outbox / ACK / 重试 / 统计）→ mark_state_dirty，立即写；
+#   2) 纯边界（last_snapshot_ids / baseline / recent_snapshot_history）→ 标记
+#      boundary_dirty，最迟 STATE_BOUNDARY_SAVE_INTERVAL 内落盘；
+#   3) 谁都没标记（例如 API 连续失败、状态没变）→ 兜底 STATE_SAVE_MAX_INTERVAL。
+# 稳态（无新动态）下写盘次数由「每 20~35s 一次」降到「每 300s 一次」。
+STATE_BOUNDARY_SAVE_INTERVAL = 300
+STATE_SAVE_MAX_INTERVAL = 600
 STATE_BACKUP_INTERVAL = 600
 RECENT_SNAPSHOT_LIMIT = 400
 SEEN_DYNAMIC_LIMIT = 12000
@@ -359,10 +400,45 @@ def mark_state_dirty(state):
     state.setdefault("_meta", {})["dirty"] = True
 
 
+def mark_boundary_dirty(state):
+    """[FIX-16] 标记「纯边界」状态变化（last_snapshot_ids / baseline / history）。
+
+    这类状态丢失只影响停流边界的精度（重启后可能多扫几页），不影响去重与投递，
+    因此不即时落盘，由主循环按 STATE_BOUNDARY_SAVE_INTERVAL 批量写盘。
+    关键状态（discovered / outbox / ACK / 重试 / 统计）必须继续用 mark_state_dirty。
+    """
+    state.setdefault("_meta", {})["boundary_dirty"] = True
+
+
+def should_save_state(state, now):
+    """[FIX-16] 落盘判定，供主循环调用。
+
+    - 关键状态 dirty             → 立即落盘（新动态/outbox/ACK 不能等）
+    - 纯边界 boundary_dirty      → 最迟 STATE_BOUNDARY_SAVE_INTERVAL 内落盘
+    - 两者都没有（状态没变化）   → 兜底 STATE_SAVE_MAX_INTERVAL
+    正常退出时仍会无条件保存，所以崩溃窗口只影响边界精度，不影响投递。
+    """
+    meta = state.setdefault("_meta", {})
+    since_save = now - STATE.last_state_save
+    if meta.get("dirty"):
+        return True
+    if meta.get("boundary_dirty") and since_save >= STATE_BOUNDARY_SAVE_INTERVAL:
+        return True
+    return since_save >= STATE_SAVE_MAX_INTERVAL
+
+
 def random_main_interval():
-    if STATE.consecutive_failures >= 2:
-        return random.uniform(35.0, 60.0)
-    return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
+    """[FIX-17] 扫描失败退避：连续失败按 60→120→240→480→900s 指数递增。
+
+    原来的实现只在连续失败 >=2 时抬到 35~60s，上限过低：cookie 失效或被限流时
+    会长期以 60s 以内的频率持续打接口。成功一次即回到 20~35s 正常节奏。
+    """
+    failures = int(STATE.consecutive_failures or 0)
+    if failures <= 0:
+        return random.uniform(NORMAL_INTERVAL_MIN, NORMAL_INTERVAL_MAX)
+    delay = min(SCAN_BACKOFF_MAX, SCAN_BACKOFF_BASE * (2 ** (failures - 1)))
+    delay += random.uniform(0, min(20.0, delay * 0.15))
+    return delay
 
 
 # =========================================================
@@ -439,7 +515,7 @@ def init_logging():
     root.setLevel(LOG_LEVEL)
     root.propagate = False
     logging.info("=" * 70)
-    logging.info("B站关注动态监控 v3.3.1（feed/all｜长期稳定优化版）")
+    logging.info("B站关注动态监控 v3.3.2（feed/all｜长期稳定优化版）")
     logging.info("=" * 70)
 
 
@@ -798,7 +874,9 @@ def save_dynamic_state(state):
         atomic_write_json(DYNAMIC_STATE_FILE, state, make_backup=make_backup)
         if make_backup:
             STATE.last_backup_save = now_save
-        state.setdefault("_meta", {})["dirty"] = False
+        meta = state.setdefault("_meta", {})
+        meta["dirty"] = False
+        meta["boundary_dirty"] = False
 
 
 def reset_daily_stats(state, date_str):
@@ -1085,7 +1163,10 @@ def extract_images(item, include_forward_orig=True):
             for x in opus.get("pics") or []:
                 if isinstance(x, dict) and take(x.get("url")) and len(urls) >= MAX_PUSH_IMAGES:
                     break
-        if item.get("type") == "DYNAMIC_TYPE_FORWARD" and include_forward_orig and len(urls) < MAX_PUSH_IMAGES:
+        # [FIX-19] 取图判据由 type==DYNAMIC_TYPE_FORWARD 改为「按 orig 是否存在」：
+        # 「转发 + 自己补了图」的动态 type 是 DYNAMIC_TYPE_DRAW 且带 orig，
+        # 旧判据会让原动态配图整段漏取。
+        if include_forward_orig and len(urls) < MAX_PUSH_IMAGES:
             orig = item.get("orig")
             if isinstance(orig, dict):
                 for u in extract_images(orig, include_forward_orig=False):
@@ -1151,9 +1232,11 @@ def format_dynamic_message(item):
         if not text:
             text = "（该动态无可提取正文）"
 
-        images = extract_images(item)
+        # [FIX-20] 图片张数统一跟随 MAX_PUSH_IMAGES：原来这里把结果硬截成 1 张
+        # （cover=images[0]、one=[cover]），导致只改常量不生效。
+        # 默认 MAX_PUSH_IMAGES=1，行为与旧版完全一致。
+        images = extract_images(item)[:MAX_PUSH_IMAGES]
         cover = images[0] if images else ""
-        one = [cover] if cover else []
         return {
             "user": name,
             "uid": uid,
@@ -1161,9 +1244,9 @@ def format_dynamic_message(item):
             "time": ts_to_str(pub_ts),
             "link": f"https://t.bilibili.com/{dyn_id}",
             "cover": cover,
-            "covers": one,
-            "images": one,
-            "image_count": 1 if cover else 0,
+            "covers": list(images),
+            "images": list(images),
+            "image_count": len(images),
             "kind": "dynamic",
         }
     except Exception as e:
@@ -1903,7 +1986,10 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
         stats = {}
     st = {"seen": 0, "target": 0, "type_block": 0, "no_pub_ts": 0, "ack": 0,
           "already_pushed": 0, "pending_or_outbox": 0, "already_discovered": 0,
-          "too_old": 0, "new": 0, "deferred": 0, "fans_only": 0}
+          "too_old": 0, "new": 0, "deferred": 0, "fans_only": 0,
+          # [FIX-21] 与 no_pub_ts 区分：no_pub_ts 是「pub_ts 缺失条数」，
+          # time_fallback 是「真正按发现时间入队条数」，两者不再恒等。
+          "time_fallback": 0}
     for k in st:
         stats.setdefault(k, 0)
     type_block_ids = []
@@ -1995,6 +2081,7 @@ def process_feed_items(items, target_uids, state, refresh_seq, discovery_mode,
                 continue
             pub_ts = _safe_int((entry or {}).get("pub_ts"), 0) or now_ts
             if not entry:
+                st["time_fallback"] += 1
                 logging.warning(f"[TIME_FALLBACK] dyn_id={dyn_id} uid={uid} pub_ts缺失，首次发现按发现时间入队")
         if dyn_id in ack_ids:
             st["ack"] += 1
@@ -2143,7 +2230,10 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
     """一次完整的关注流刷新。成功返回后，才允许更新 baseline / snapshot。"""
     STATE.refresh_seq += 1
     refresh_seq = STATE.refresh_seq
-    state.setdefault("daily", {})["refreshes"] = int(state.setdefault("daily", {}).get("refreshes", 0)) + 1
+    # [FIX-21] 「整体刷新」只统计 primary 轮次；verify / deep 分别由 verify_rounds
+    # 与 deep_scans 计数（主循环里维护），避免三个口径混进同一个数字导致报告偏大。
+    if mode == "primary":
+        state.setdefault("daily", {})["refreshes"] = int(state.setdefault("daily", {}).get("refreshes", 0)) + 1
 
     all_new = []
     all_ids = []
@@ -2272,7 +2362,10 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
             history[:] = history[-20:]
         else:
             logging.warning(f"[SCAN] boundary_kept mode={mode} pages={pages_done}/{max_pages} partial={partial_fail} truncated={truncated}")
-        mark_state_dirty(state)
+        # [FIX-16] 边界（snapshot/baseline）变化用 boundary_dirty 批量落盘；
+        # 发现新动态等关键状态仍由 enqueue_candidates / update_uid_stats_after_enqueue
+        # 走 mark_state_dirty 即时落盘。
+        mark_boundary_dirty(state)
 
     # API 本轮可用：不因「页数上限」触发退避（否则 primary=5 且 has_more 会永远失败）
     refresh_ok = bool(pages_done > 0 and not partial_fail and completed)
@@ -2284,7 +2377,7 @@ def full_refresh(target_uids, state, mode="primary", max_pages=5, stop_at_snapsh
         f"type_block={stats.get('type_block', 0)} no_pub_ts={stats.get('no_pub_ts', 0)} "
         f"ack={stats.get('ack', 0)} pushed={stats.get('already_pushed', 0)} "
         f"pending={stats.get('pending_or_outbox', 0)} disc={stats.get('already_discovered', 0)} "
-        f"too_old={stats.get('too_old', 0)} time_fallback={stats.get('no_pub_ts', 0)} "
+        f"too_old={stats.get('too_old', 0)} time_fallback={stats.get('time_fallback', 0)} "
         f"fans_only={stats.get('fans_only', 0)}"
     )
     if unique or not refresh_ok:
@@ -2306,9 +2399,10 @@ def format_health_report(state, target_uids, china_dt):
         f"B站关注动态监控报告 {china_dt.strftime('%Y-%m-%d %H:%M')}",
         "━━━━━━━━━━━━━━━━━━━━",
         f"监控 UID：{len(target_uids)}",
-        f"整体刷新：{daily.get('refreshes', 0)} 次",
+        f"整体刷新：{daily.get('refreshes', 0)} 次（primary）",
+        f"二次确认：{daily.get('verify_rounds', 0)} 轮",
         f"深度刷新：{daily.get('deep_scans', 0)} 次",
-        f"读取动态：{daily.get('items_seen', 0)} 条",
+        f"扫描条目：{daily.get('items_seen', 0)} 条（含确认/深扫重复计数）",
         f"新动态：{daily.get('new_found', 0)} 条",
         f"首次刷新发现：{daily.get('primary_found', 0)} 条",
         f"二次确认追回：{daily.get('verify_recovered', 0)} 条",
@@ -2599,7 +2693,8 @@ def start_monitoring():
 
             # 工作时间外不刷动态，但维持心跳/列表/outbox
             if not is_in_monitor_window(cn):
-                if now - STATE.last_state_save >= STATE_SAVE_INTERVAL:
+                # [FIX-16] 窗口外（下班后/周末）同样走分级落盘判定
+                if should_save_state(state, now):
                     save_dynamic_state(state)
                     STATE.last_state_save = now
                 time.sleep(2.0)
@@ -2634,22 +2729,27 @@ def start_monitoring():
                         )
 
                     # 每5分钟整体深扫一次（primary 未成功/部分失败时跳过，降低压力）
-                    if (
-                        refresh_ok
-                        and now - STATE.last_deep_scan >= DEEP_SCAN_INTERVAL
-                        and IS_RUNNING
-                    ):
+                    # [FIX-18] 但连续不完整达到 DEEP_SCAN_FORCE_AFTER_FAILURES 轮后强制
+                    # 放行一次深扫：深扫是追回延迟动态的最后一道网，不能因为网络抖动
+                    # 导致的 partial_fail 长期失效。
+                    deep_due = (now - STATE.last_deep_scan >= DEEP_SCAN_INTERVAL) and IS_RUNNING
+                    force_deep = STATE.consecutive_failures >= DEEP_SCAN_FORCE_AFTER_FAILURES
+                    if deep_due and (refresh_ok or force_deep):
                         state.setdefault("daily", {})["deep_scans"] = int(
                             state.setdefault("daily", {}).get("deep_scans", 0)
                         ) + 1
                         STATE.last_deep_scan = now
+                        if not refresh_ok:
+                            logging.warning(
+                                f"⚠️ primary 连续不完整 {STATE.consecutive_failures} 轮，强制执行一次深扫追回"
+                            )
                         logging.debug("🔎 开始5分钟整体关注流深扫")
                         full_refresh(
                             target_uids, state, mode="deep",
                             max_pages=DEEP_SCAN_MAX_PAGES,
                             stop_at_snapshot=True,
                         )
-                    elif not refresh_ok and now - STATE.last_deep_scan >= DEEP_SCAN_INTERVAL:
+                    elif deep_due:
                         logging.warning("⚠️ primary 未完整成功，本轮跳过深扫以降低压力")
 
                     last_scan = time.time()
@@ -2665,7 +2765,8 @@ def start_monitoring():
                     next_interval = random_main_interval()
                     logging.error(f"[SCAN] exception={repr(e)} failures={STATE.consecutive_failures}")
 
-            if now - STATE.last_state_save >= STATE_SAVE_INTERVAL or state.get("_meta", {}).get("dirty"):
+            # [FIX-16] 落盘分级判定统一收在 should_save_state() 里（便于验证）
+            if should_save_state(state, now):
                 save_dynamic_state(state)
                 STATE.last_state_save = now
 
